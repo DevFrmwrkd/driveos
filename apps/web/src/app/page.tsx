@@ -237,9 +237,7 @@ function Placeholder({ title }: { title: string }) {
 }
 
 export default function App() {
-  const [route, setRoute] = useState<{ screen: string; params: any }>(() =>
-    typeof window === "undefined" ? { screen: "dashboard", params: {} } : routeFromHash(window.location.hash)
-  );
+  const [route, setRoute] = useState<{ screen: string; params: any }>({ screen: "dashboard", params: {} });
   const [push, toastNode] = useToast();
   const [dense, setDense] = useState(false);
   const pageRef = useRef<HTMLDivElement>(null);
@@ -422,8 +420,8 @@ function useDriveOSTweaks(setDense: (dense: boolean) => void) {
     const apply = (t: any) => {
       const root = document.documentElement;
       const accents: Record<string, string[]> = {
-        indigo: ["#6f7fa8", "#9aa9c8", "#52627f"],
-        cyan: ["#6f7fa8", "#9aa9c8", "#52627f"],
+        indigo: ["#6c7b9b", "#96a4bd", "#52607a"],
+        cyan: ["#6c7b9b", "#96a4bd", "#52607a"],
         purple: ["#756f91", "#9a94b4", "#5d5875"],
         blue: ["#667f9e", "#8fa6bf", "#4f637d"],
         emerald: ["#728b78", "#9aac9d", "#596e5f"],

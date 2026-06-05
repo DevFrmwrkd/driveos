@@ -27,47 +27,47 @@
   --tx-dim: #565d6c;
   --tx-faint: #3a3f4b;
 
-  /* ---- Accent (steel blue — brand + active state) ---- */
-  --accent: #6f7fa8;
-  --accent-hi: #9aa9c8;
-  --accent-lo: #52627f;
-  --accent-glow: rgba(111, 127, 168, 0.22);
-  --accent-soft: rgba(111, 127, 168, 0.13);
-  --accent-line: rgba(154, 169, 200, 0.28);
+  /* ---- Accent (steel blue: brand + active state) ---- */
+  --accent: #6c7b9b;
+  --accent-hi: #96a4bd;
+  --accent-lo: #52607a;
+  --accent-glow: rgba(108, 123, 155, 0.18);
+  --accent-soft: rgba(108, 123, 155, 0.12);
+  --accent-line: rgba(150, 164, 189, 0.24);
 
   /* ---- Status semantics ---- */
-  --ok: #8aa58d;
-  --ok-dim: #6f8f75;
-  --ok-soft: rgba(138, 165, 141, 0.12);
-  --ok-line: rgba(138, 165, 141, 0.26);
+  --ok: #7f987f;
+  --ok-dim: #6d836e;
+  --ok-soft: rgba(127, 152, 127, 0.11);
+  --ok-line: rgba(127, 152, 127, 0.23);
 
-  --warn: #c3a35f;
-  --warn-dim: #a9853d;
-  --warn-soft: rgba(195, 163, 95, 0.12);
-  --warn-line: rgba(195, 163, 95, 0.27);
+  --warn: #b59a63;
+  --warn-dim: #987d4b;
+  --warn-soft: rgba(181, 154, 99, 0.11);
+  --warn-line: rgba(181, 154, 99, 0.24);
 
-  --risk: #c97070;
-  --risk-dim: #af5656;
-  --risk-soft: rgba(201, 112, 112, 0.12);
-  --risk-line: rgba(201, 112, 112, 0.28);
+  --risk: #bd7370;
+  --risk-dim: #9f5b58;
+  --risk-soft: rgba(189, 115, 112, 0.11);
+  --risk-line: rgba(189, 115, 112, 0.24);
 
-  --cloud: #9aa9c8;
-  --cloud-soft: rgba(154, 169, 200, 0.11);
-  --cloud-line: rgba(154, 169, 200, 0.25);
+  --cloud: #96a4bd;
+  --cloud-soft: rgba(150, 164, 189, 0.10);
+  --cloud-line: rgba(150, 164, 189, 0.22);
 
   --auto: #9aa3b3;
   --auto-soft: rgba(154, 163, 179, 0.11);
   --auto-line: rgba(154, 163, 179, 0.23);
 
   /* ---- File-type palette ---- */
-  --ft-raw: var(--risk);
-  --ft-proxy: var(--accent);
-  --ft-cache: var(--warn);
-  --ft-export: var(--ok);
-  --ft-stock: var(--auto);
-  --ft-audio: var(--tx-mut);
-  --ft-gfx: var(--accent-hi);
-  --ft-unknown: var(--tx-dim);
+  --ft-raw: #8f97a6;
+  --ft-proxy: #6c7b9b;
+  --ft-cache: #8f8676;
+  --ft-export: #7f8e83;
+  --ft-stock: #777f8d;
+  --ft-audio: #656c78;
+  --ft-gfx: #818ca0;
+  --ft-unknown: #4c5360;
 
   /* ---- Type ---- */
   --font-sans: "Space Grotesk", system-ui, sans-serif;

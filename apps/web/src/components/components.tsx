@@ -228,7 +228,8 @@ export function Treemap({ data, height = 150, onClick }: TreemapProps) {
       return React.createElement("div", {
         key: i, className: "treemap-cell", onClick: () => onClick && onClick(d),
         style: { flex: `${d.value} 1 0`, minWidth: 40,
-          background: `linear-gradient(160deg, ${d.color}38, ${d.color}14)`, borderColor: `${d.color}40` } },
+          background: `linear-gradient(160deg, ${alphaColor(d.color, 14)}, ${alphaColor(d.color, 5)})`,
+          borderColor: alphaColor(d.color, 18) } },
         React.createElement("div", { style: { fontWeight: 700, fontSize: big ? 13 : 11, color: "var(--tx-hi)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, d.label),
         big && React.createElement("div", { className: "mono", style: { fontSize: 11, color: "var(--tx-mut)", marginTop: 2 } }, fmtTB(d.value)),
         React.createElement("div", { style: { position: "absolute", top: 8, right: 9, width: 7, height: 7, borderRadius: 2, background: d.color } }));
@@ -414,11 +415,14 @@ export function cardShell(
 
 // ---- Computed variable helper ----
 export function getVar(v: any): string {
-  if (typeof v === "string" && v.startsWith("var(")) {
-    const name = v.slice(4, -1).trim();
-    if (typeof window !== "undefined") {
-      return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || v;
-    }
-  }
   return v;
+}
+
+function alphaColor(color: string, opacity: number): string {
+  if (color.startsWith("var(")) return `color-mix(in srgb, ${color} ${opacity}%, transparent)`;
+  if (/^#[0-9a-f]{6}$/i.test(color)) {
+    const alpha = Math.round((opacity / 100) * 255).toString(16).padStart(2, "0");
+    return `${color}${alpha}`;
+  }
+  return color;
 }

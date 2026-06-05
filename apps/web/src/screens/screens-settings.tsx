@@ -34,7 +34,7 @@ import {
   cardShell,
   getVar
 } from "@/components";
-const h = React.createElement;
+const h: any = React.createElement;
 
 
 
