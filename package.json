@@ -1,0 +1,23 @@
+{
+  "name": "driveos-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace=apps/web",
+    "build:web": "npm run build --workspace=apps/web",
+    "start:web": "npm run start --workspace=apps/web",
+    "agent:build": "npm run build --workspace=apps/agent",
+    "agent:start": "npm start --workspace=apps/agent",
+    "convex:dev": "npx convex dev",
+    "convex:deploy": "npx convex deploy",
+    "test": "npm test --workspace=packages/shared && npm test --workspace=apps/agent"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "concurrently": "^8.2.2"
+  }
+}
