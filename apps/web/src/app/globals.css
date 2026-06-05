@@ -27,47 +27,47 @@
   --tx-dim: #565d6c;
   --tx-faint: #3a3f4b;
 
-  /* ---- Accent (indigo — brand + automation/active) ---- */
-  --accent: #6366f1;
-  --accent-hi: #818cf8;
-  --accent-lo: #4f46e5;
-  --accent-glow: rgba(99, 102, 241, 0.35);
-  --accent-soft: rgba(99, 102, 241, 0.14);
-  --accent-line: rgba(99, 102, 241, 0.4);
+  /* ---- Accent (steel blue — brand + active state) ---- */
+  --accent: #6f7fa8;
+  --accent-hi: #9aa9c8;
+  --accent-lo: #52627f;
+  --accent-glow: rgba(111, 127, 168, 0.22);
+  --accent-soft: rgba(111, 127, 168, 0.13);
+  --accent-line: rgba(154, 169, 200, 0.28);
 
   /* ---- Status semantics ---- */
-  --ok: #34d399;
-  --ok-dim: #10b981;
-  --ok-soft: rgba(52, 211, 153, 0.13);
-  --ok-line: rgba(52, 211, 153, 0.34);
+  --ok: #8aa58d;
+  --ok-dim: #6f8f75;
+  --ok-soft: rgba(138, 165, 141, 0.12);
+  --ok-line: rgba(138, 165, 141, 0.26);
 
-  --warn: #fbbf24;
-  --warn-dim: #f59e0b;
-  --warn-soft: rgba(251, 191, 36, 0.13);
-  --warn-line: rgba(251, 191, 36, 0.34);
+  --warn: #c3a35f;
+  --warn-dim: #a9853d;
+  --warn-soft: rgba(195, 163, 95, 0.12);
+  --warn-line: rgba(195, 163, 95, 0.27);
 
-  --risk: #fb7185;
-  --risk-dim: #ef4444;
-  --risk-soft: rgba(251, 113, 133, 0.13);
-  --risk-line: rgba(251, 113, 133, 0.36);
+  --risk: #c97070;
+  --risk-dim: #af5656;
+  --risk-soft: rgba(201, 112, 112, 0.12);
+  --risk-line: rgba(201, 112, 112, 0.28);
 
-  --cloud: #38bdf8;
-  --cloud-soft: rgba(56, 189, 248, 0.13);
-  --cloud-line: rgba(56, 189, 248, 0.34);
+  --cloud: #9aa9c8;
+  --cloud-soft: rgba(154, 169, 200, 0.11);
+  --cloud-line: rgba(154, 169, 200, 0.25);
 
-  --auto: #a855f7;
-  --auto-soft: rgba(168, 85, 247, 0.13);
-  --auto-line: rgba(168, 85, 247, 0.34);
+  --auto: #9aa3b3;
+  --auto-soft: rgba(154, 163, 179, 0.11);
+  --auto-line: rgba(154, 163, 179, 0.23);
 
   /* ---- File-type palette ---- */
-  --ft-raw: #fb7185;
-  --ft-proxy: #38bdf8;
-  --ft-cache: #fbbf24;
-  --ft-export: #34d399;
-  --ft-stock: #a855f7;
-  --ft-audio: #f472b6;
-  --ft-gfx: #818cf8;
-  --ft-unknown: #565d6c;
+  --ft-raw: var(--risk);
+  --ft-proxy: var(--accent);
+  --ft-cache: var(--warn);
+  --ft-export: var(--ok);
+  --ft-stock: var(--auto);
+  --ft-audio: var(--tx-mut);
+  --ft-gfx: var(--accent-hi);
+  --ft-unknown: var(--tx-dim);
 
   /* ---- Type ---- */
   --font-sans: "Space Grotesk", system-ui, sans-serif;
@@ -140,7 +140,7 @@ h1,h2,h3,h4 { margin: 0; color: var(--tx-hi); font-weight: 600; letter-spacing: 
   width: 100%;
   overflow: hidden;
   background:
-    radial-gradient(1200px 600px at 70% -10%, rgba(99,102,241,0.07), transparent 60%),
+    radial-gradient(1200px 600px at 70% -10%, rgba(111,127,168,0.035), transparent 60%),
     var(--bg-base);
 }
 .app.dense { --density: 0.84; }
@@ -285,9 +285,9 @@ h1,h2,h3,h4 { margin: 0; color: var(--tx-hi); font-weight: 600; letter-spacing: 
 }
 .btn.primary:hover { background: linear-gradient(180deg, var(--accent-hi), var(--accent-lo)); color:#fff; }
 .btn.ok { background: var(--ok-soft); color: var(--ok); border-color: var(--ok-line); }
-.btn.ok:hover { background: rgba(52,211,153,0.2); color: var(--ok); }
+.btn.ok:hover { background: rgba(138,165,141,0.18); color: var(--ok); }
 .btn.danger { background: var(--risk-soft); color: var(--risk); border-color: var(--risk-line); }
-.btn.danger:hover { background: rgba(251,113,133,0.22); color: var(--risk); }
+.btn.danger:hover { background: rgba(201,112,112,0.18); color: var(--risk); }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--tx-mut); }
 .btn.ghost:hover { background: rgba(255,255,255,0.05); color: var(--tx-hi); }
 .btn.icon { width: 36px; padding: 0; }
@@ -324,7 +324,7 @@ h1,h2,h3,h4 { margin: 0; color: var(--tx-hi); font-weight: 600; letter-spacing: 
 .bar-fill.ok { background: linear-gradient(90deg, var(--ok-dim), var(--ok)); }
 .bar-fill.warn { background: linear-gradient(90deg, var(--warn-dim), var(--warn)); }
 .bar-fill.risk { background: linear-gradient(90deg, var(--risk-dim), var(--risk)); }
-.bar-fill.cloud { background: linear-gradient(90deg, #0ea5e9, var(--cloud)); }
+.bar-fill.cloud { background: linear-gradient(90deg, var(--accent-lo), var(--cloud)); }
 .bar-multi { display: flex; height: 9px; border-radius: 99px; overflow: hidden; background: rgba(255,255,255,0.05); }
 .bar-multi > span { height: 100%; transition: width .5s ease; }
 

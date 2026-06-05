@@ -42,6 +42,36 @@ const NAV = [
 
 // route -> nav highlight (detail screens map back to their section)
 const ROUTE_NAV: Record<string, string> = { drive: "drives", project: "projects", wizard: "projects" };
+const DEFAULT_OWNER = "founder";
+
+function resolveOwnerId(record: any) {
+  const owner = record?.owner || record?.ownerId || DEFAULT_OWNER;
+  return (DB as any).teamById?.[owner] ? owner : DEFAULT_OWNER;
+}
+
+function resolveProjectStatus(status?: string) {
+  if (status === "ready_to_archive") return "ready";
+  return status || "active";
+}
+
+function resolveRisk(usedBytes = 0, capacityBytes = 1) {
+  const ratio = capacityBytes > 0 ? usedBytes / capacityBytes : 0;
+  if (ratio >= 0.9) return "high";
+  if (ratio >= 0.75) return "medium";
+  return "low";
+}
+
+function resolveDuplicateRisk(risk?: string) {
+  if (risk === "green") return "safe";
+  if (risk === "red") return "danger";
+  if (risk === "yellow") return "review";
+  return risk || "review";
+}
+
+function duplicateName(cluster: any) {
+  const match = String(cluster?.explanation || "").match(/duplicates? of "([^"]+)"/i);
+  return match?.[1] || "Duplicate cluster";
+}
 
 interface SidebarProps {
   route: { screen: string; params: any };
@@ -203,12 +233,20 @@ export default function App() {
       ...d,
       id: d._id,
       name: d.label,
-      capTB: d.capacityBytes / (1024 ** 4),
-      usedTB: d.usedBytes / (1024 ** 4),
-      dupTB: d.dupTB || 0.42,
-      cleanTB: d.cleanTB || 0.61,
+      owner: resolveOwnerId(d),
+      location: d.location || "Studio",
+      status: d.status || "online",
+      tier: d.tier || "hot",
+      bus: d.bus || d.filesystem || "Local volume",
+      model: d.model || d.mountPath || "Tracked drive",
+      capTB: (d.capacityBytes || 0) / (1024 ** 4),
+      usedTB: (d.usedBytes || 0) / (1024 ** 4),
+      projects: Array.isArray(d.projects) ? d.projects : [],
+      dupTB: d.dupTB || 0,
+      cleanTB: d.cleanTB || 0,
+      scans: d.scans || 0,
       lastSeen: "Just now",
-      risk: d.usedBytes / d.capacityBytes > 0.9 ? "high" : "low",
+      risk: d.risk || resolveRisk(d.usedBytes, d.capacityBytes),
     }));
     (DB as any).driveById = Object.fromEntries((DB as any).drives.map((d: any) => [d.id, d]));
   }
@@ -216,13 +254,19 @@ export default function App() {
     (DB as any).projects = convexProjects.map((p: any) => ({
       ...p,
       id: p._id,
-      sizeTB: p.totalBytes / (1024 ** 4),
-      dupTB: p.duplicateBytes / (1024 ** 4),
-      cleanTB: p.safeCleanupBytes / (1024 ** 4),
+      owner: resolveOwnerId(p),
+      status: resolveProjectStatus(p.status),
+      tier: p.tier || "hot",
+      show: p.showName || p.episode || p.template || "Tracked project",
+      template: p.template || "YouTube Show",
+      client: p.client || "Studio",
+      sizeTB: (p.totalBytes || 0) / (1024 ** 4),
+      dupTB: (p.duplicateBytes || 0) / (1024 ** 4),
+      cleanTB: (p.safeCleanupBytes || 0) / (1024 ** 4),
       modified: "Just now",
-      structure: p.storageHealthScore,
-      archiveReady: p.status === "archived" ? 100 : p.status === "ready" ? 80 : 30,
-      locations: ["cj-ssd"],
+      structure: p.storageHealthScore || 100,
+      archiveReady: p.status === "archived" ? 100 : p.status === "ready_to_archive" || p.status === "ready" ? 80 : 30,
+      locations: Array.isArray(p.locations) && p.locations.length > 0 ? p.locations : [],
     }));
     (DB as any).projectById = Object.fromEntries((DB as any).projects.map((p: any) => [p.id, p]));
   }
@@ -230,13 +274,18 @@ export default function App() {
     (DB as any).duplicates = convexDuplicates.map((d: any) => ({
       ...d,
       id: d._id,
-      sizeGB: d.totalBytes / (1024 ** 3),
-      copies: d.fileCount,
+      name: d.name || duplicateName(d),
+      type: d.fileType || "unknown",
+      sizeGB: (d.totalBytes || 0) / (1024 ** 3),
+      recoverGB: (d.wastedBytes || 0) / (1024 ** 3),
+      copies: d.fileCount || d.fileIds?.length || 0,
       kind: d.type,
-      risk: d.riskLevel,
-      project: "show-x",
+      risk: resolveDuplicateRisk(d.riskLevel),
+      project: d.projectIds?.[0] || "—",
+      owner: DEFAULT_OWNER,
       modified: "Just now",
-      locations: [],
+      fingerprint: d.hashKey || "",
+      locations: Array.isArray(d.locations) ? d.locations : [],
       rec: d.explanation,
     }));
   }
@@ -332,11 +381,11 @@ function useDriveOSTweaks(setDense: (dense: boolean) => void) {
     const apply = (t: any) => {
       const root = document.documentElement;
       const accents: Record<string, string[]> = {
-        indigo: ["#6366f1", "#818cf8", "#4f46e5"],
-        cyan:   ["#22d3ee", "#67e8f9", "#06b6d4"],
-        purple: ["#a855f7", "#c084fc", "#9333ea"],
-        blue:   ["#3b82f6", "#60a5fa", "#2563eb"],
-        emerald: ["#10b981", "#34d399", "#059669"],
+        indigo: ["#6f7fa8", "#9aa9c8", "#52627f"],
+        cyan: ["#6f7fa8", "#9aa9c8", "#52627f"],
+        purple: ["#756f91", "#9a94b4", "#5d5875"],
+        blue: ["#667f9e", "#8fa6bf", "#4f637d"],
+        emerald: ["#728b78", "#9aac9d", "#596e5f"],
       };
       if (t.accent && accents[t.accent]) {
         const [a, hi, lo] = accents[t.accent];

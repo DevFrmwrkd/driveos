@@ -241,7 +241,7 @@ const h = React.createElement;
           h("span", { className: "mono dim", style: { fontSize: 11, flexShrink: 0 } }, a.date + " · " + a.time))))));
   }
   function byName(name) { const m = DB.team.find((t) => t.name === name); return m ? m.id : "founder"; }
-  function auditColor(k) { return ({ quarantine: "#fbbf24", scan: "#6366f1", auto: "#a855f7", approve: "#34d399", create: "#38bdf8", restore: "#34d399" })[k] || "#868d9e"; }
+  function auditColor(k) { return ({ quarantine: "var(--warn)", scan: "var(--accent)", auto: "var(--auto)", approve: "var(--ok)", create: "var(--cloud)", restore: "var(--ok)" })[k] || "var(--tx-mut)"; }
   function auditIcon(k) { return ({ quarantine: "shield", scan: "refresh", auto: "cpu", approve: "check", create: "plus", restore: "rotate" })[k] || "activity"; }
   function qkpi(label, value, icon, color) {
     return h("div", { className: "card card-pad fade-up", style: { display: "flex", alignItems: "center", gap: 13 } },

@@ -221,7 +221,7 @@ function WarningsRail({ go, toast }) {
 function ActivityRail({ go }) {
   
   const rows = DB.driveEvents.map((e, i) => {
-    const d = DB.driveById[e.drive];
+    const d = DB.driveById[e.drive] || { id: e.drive, name: e.drive, status: "offline" };
     const meta = ({ connected: ["ok", "checkCircle"], scan: ["accent", "refresh"], offline: ["", "x"], cloud: ["cloud", "cloud"] })[e.event] || ["", "hdd"];
     const bg = meta[0] ? "var(--" + (meta[0] === "accent" ? "accent" : meta[0]) + "-soft)" : "var(--bg-surface)";
     const fg = meta[0] ? "var(--" + (meta[0] === "accent" ? "accent-hi" : meta[0]) + ")" : "var(--tx-dim)";

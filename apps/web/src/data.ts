@@ -1,10 +1,10 @@
 // ---- Team ----
 const team = [
-  { id: "cj",      name: "CJ Marlowe",     role: "Lead Editor",        initials: "CJ", color: "#6366f1", location: "Los Angeles", usedTB: 6.2, drives: 3 },
-  { id: "brandon", name: "Brandon Pike",   role: "Producer",           initials: "BP", color: "#34d399", location: "Los Angeles", usedTB: 21.4, drives: 4 },
-  { id: "mara",    name: "Mara Velez",     role: "Assistant Editor",   initials: "MV", color: "#fbbf24", location: "Los Angeles", usedTB: 3.1, drives: 2 },
-  { id: "kenji",   name: "Kenji Saito",    role: "Editor (Japan)",     initials: "KS", color: "#38bdf8", location: "Tokyo",       usedTB: 8.7, drives: 2 },
-  { id: "founder", name: "Devon Hart",     role: "Founder / Director", initials: "DH", color: "#a855f7", location: "Los Angeles", usedTB: 1.2, drives: 1 },
+  { id: "cj",      name: "CJ Marlowe",     role: "Lead Editor",        initials: "CJ", color: "#9aa9c8", location: "Los Angeles", usedTB: 6.2, drives: 3 },
+  { id: "brandon", name: "Brandon Pike",   role: "Producer",           initials: "BP", color: "#8aa58d", location: "Los Angeles", usedTB: 21.4, drives: 4 },
+  { id: "mara",    name: "Mara Velez",     role: "Assistant Editor",   initials: "MV", color: "#c3a35f", location: "Los Angeles", usedTB: 3.1, drives: 2 },
+  { id: "kenji",   name: "Kenji Saito",    role: "Editor (Japan)",     initials: "KS", color: "#9aa3b3", location: "Tokyo",       usedTB: 8.7, drives: 2 },
+  { id: "founder", name: "Devon Hart",     role: "Founder / Director", initials: "DH", color: "#6f7fa8", location: "Los Angeles", usedTB: 1.2, drives: 1 },
 ];
 const byId = (arr: any[]) => Object.fromEntries(arr.map((x) => [x.id, x]));
 const teamById = byId(team);
