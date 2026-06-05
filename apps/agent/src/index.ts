@@ -2,10 +2,15 @@
 
 import fs from "fs";
 import path from "path";
+import os from "os";
 import crypto from "crypto";
 import { Command } from "commander";
 import chokidar from "chokidar";
+import dotenv from "dotenv";
 import { classifyFile, calculateFileRisk } from "@driveos/shared";
+
+dotenv.config({ path: path.resolve(process.cwd(), "apps/web/.env.local") });
+dotenv.config({ path: path.resolve(process.cwd(), ".env.local") });
 
 interface DriveOSConfig {
   machineName: string;
@@ -44,17 +49,30 @@ interface FileMetadata {
   isProjectFile: boolean;
 }
 
-const CONFIG_PATH = "./driveos-config.json";
-const HASH_CACHE_PATH = "./driveos-hash-cache.json";
-const OFFLINE_LOG_PATH = "./driveos-agent-offline-log.txt";
 const AGENT_VERSION = "1.0.0";
 const ONE_MB = 1024 * 1024;
+const DEFAULT_CONVEX_URL = process.env.NEXT_PUBLIC_CONVEX_URL || process.env.DRIVEOS_CONVEX_URL || "https://determined-anaconda-827.convex.cloud";
+
+const LEGACY_CONFIG_PATH = path.resolve("./driveos-config.json");
+const LEGACY_HASH_CACHE_PATH = path.resolve("./driveos-hash-cache.json");
+
+function resolveAgentHome() {
+  if (process.env.DRIVEOS_AGENT_HOME) return path.resolve(process.env.DRIVEOS_AGENT_HOME);
+  if (process.platform === "darwin") return path.join(os.homedir(), "Library", "Application Support", "DriveOS Agent");
+  if (process.platform === "win32") return path.join(process.env.APPDATA || os.homedir(), "DriveOS Agent");
+  return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "driveos-agent");
+}
+
+const AGENT_HOME = resolveAgentHome();
+const CONFIG_PATH = path.join(AGENT_HOME, "driveos-config.json");
+const HASH_CACHE_PATH = path.join(AGENT_HOME, "driveos-hash-cache.json");
+const OFFLINE_LOG_PATH = path.join(AGENT_HOME, "driveos-agent-offline-log.txt");
 
 const DEFAULT_CONFIG: DriveOSConfig = {
   machineName: "CJ-Workstation",
   ownerId: "cj",
-  convexUrl: "http://localhost:3210",
-  quarantineRoot: "./.driveos_quarantine",
+  convexUrl: DEFAULT_CONVEX_URL,
+  quarantineRoot: path.join(AGENT_HOME, "quarantine"),
   scanRoots: ["./temp_test_drive"],
   minFileSizeBytes: ONE_MB,
   fullHash: false,
@@ -72,6 +90,14 @@ const IGNORED_FOLDERS = new Set([
   "TEMPORARY",
   "TMP",
 ]);
+
+const CLOUD_SYNC_MARKERS = [
+  { name: "iCloud Drive", markers: ["mobile documents", "icloud drive", `${path.sep}cloudstorage${path.sep}icloud`] },
+  { name: "Dropbox", markers: [`${path.sep}dropbox${path.sep}`, `${path.sep}cloudstorage${path.sep}dropbox`] },
+  { name: "Google Drive", markers: ["google drive", `${path.sep}cloudstorage${path.sep}google`] },
+  { name: "OneDrive", markers: ["onedrive", `${path.sep}cloudstorage${path.sep}onedrive`] },
+  { name: "Creative Cloud Files", markers: ["creative cloud files"] },
+];
 
 const PROJECT_FOLDER_TREE = [
   "00_ADMIN/CONTRACTS",
@@ -104,26 +130,85 @@ const PROJECT_FOLDER_TREE = [
   "09_ARCHIVE_MANIFEST",
 ];
 
+function ensureAgentHome() {
+  fs.mkdirSync(AGENT_HOME, { recursive: true });
+}
+
+function readJsonFile<T>(filePath: string): T | null {
+  if (!fs.existsSync(filePath)) return null;
+  return JSON.parse(fs.readFileSync(filePath, "utf-8")) as T;
+}
+
 function loadConfig(): DriveOSConfig {
-  if (fs.existsSync(CONFIG_PATH)) {
-    return { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")) };
-  }
+  const current = readJsonFile<Partial<DriveOSConfig>>(CONFIG_PATH);
+  if (current) return { ...DEFAULT_CONFIG, ...current };
+
+  const legacy = readJsonFile<Partial<DriveOSConfig>>(LEGACY_CONFIG_PATH);
+  if (legacy) return { ...DEFAULT_CONFIG, ...legacy };
+
   return DEFAULT_CONFIG;
 }
 
 function saveConfig(config: DriveOSConfig) {
+  ensureAgentHome();
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
 }
 
 function loadHashCache(): Record<string, HashCacheEntry> {
-  if (fs.existsSync(HASH_CACHE_PATH)) {
-    return JSON.parse(fs.readFileSync(HASH_CACHE_PATH, "utf-8"));
-  }
-  return {};
+  return readJsonFile<Record<string, HashCacheEntry>>(HASH_CACHE_PATH)
+    || readJsonFile<Record<string, HashCacheEntry>>(LEGACY_HASH_CACHE_PATH)
+    || {};
 }
 
 function saveHashCache(cache: Record<string, HashCacheEntry>) {
+  ensureAgentHome();
   fs.writeFileSync(HASH_CACHE_PATH, JSON.stringify(cache, null, 2), "utf-8");
+}
+
+function cloudSyncProvider(targetPath: string) {
+  const normalized = path.resolve(targetPath).toLowerCase();
+  for (const provider of CLOUD_SYNC_MARKERS) {
+    if (provider.markers.some((marker) => normalized.includes(marker.toLowerCase()))) return provider.name;
+  }
+  return null;
+}
+
+function enforceLocalStatePath(label: string, targetPath: string) {
+  const provider = cloudSyncProvider(targetPath);
+  if (!provider) return;
+  console.error(`[Safety Block] ${label} is inside ${provider}: ${path.resolve(targetPath)}`);
+  console.error("[Safety Block] DriveOS stores scanner state in the app data directory to avoid cloud-sync loops.");
+  process.exit(1);
+}
+
+function enforceTrackableRoot(label: string, targetPath: string, allowCloudRoot = false) {
+  const provider = cloudSyncProvider(targetPath);
+  if (!provider) return;
+  const resolved = path.resolve(targetPath);
+  if (!allowCloudRoot) {
+    console.error(`[Safety Block] ${label} appears to be inside ${provider}: ${resolved}`);
+    console.error("[Safety Block] Cloud-synced folders must be enabled explicitly with --allow-cloud-root.");
+    console.error("[Safety Block] DriveOS will scan metadata only and will not create cache/config files inside that folder.");
+    process.exit(1);
+  }
+  console.warn(`[Cloud Folder Warning] Tracking ${provider} path as metadata only: ${resolved}`);
+}
+
+function validateRuntimeConfig(config: DriveOSConfig) {
+  ensureAgentHome();
+  enforceLocalStatePath("Agent data directory", AGENT_HOME);
+  enforceLocalStatePath("Quarantine root", config.quarantineRoot);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function isFileStable(filePath: string, waitMs = 2000) {
+  const first = fs.statSync(filePath);
+  await sleep(waitMs);
+  const second = fs.statSync(filePath);
+  return first.size === second.size && first.mtimeMs === second.mtimeMs;
 }
 
 function resolveConvexHttpUrl(convexUrl: string) {
@@ -156,6 +241,7 @@ async function syncToConvex(endpoint: string, payload: any) {
     return body;
   } catch (err: any) {
     console.warn(`[Convex Offline Mode] ${endpoint} failed: ${err.message}`);
+    ensureAgentHome();
     fs.appendFileSync(
       OFFLINE_LOG_PATH,
       `[${new Date().toISOString()}] ${endpoint}: ${JSON.stringify(payload)}\n`,
@@ -360,6 +446,7 @@ function preserveOriginalPath(originalPath: string) {
 }
 
 async function executeQuarantineJob(job: any, config: DriveOSConfig) {
+  validateRuntimeConfig(config);
   const quarantineFiles = [];
   const timestamp = new Date().toISOString().split("T")[0];
 
@@ -445,6 +532,7 @@ program
   .option("--auth-token <token>", "Optional bearer token for Convex HTTP endpoints")
   .option("--min-size-mb <mb>", "Minimum file size to scan", "1")
   .option("--full-hash", "Calculate streaming SHA-256 hashes during scans")
+  .option("--allow-cloud-root", "Allow cloud-synced folders as scan roots with metadata-only warnings")
   .action((options) => {
     const scanRoots = options.roots
       ? String(options.roots).split(",").map((root) => root.trim()).filter(Boolean)
@@ -461,12 +549,23 @@ program
       fullHash: Boolean(options.fullHash),
     };
 
+    enforceLocalStatePath("Agent data directory", AGENT_HOME);
+    enforceLocalStatePath("Quarantine root", config.quarantineRoot);
+    for (const root of config.scanRoots) enforceTrackableRoot("Scan root", root, Boolean(options.allowCloudRoot));
+
     saveConfig(config);
     fs.mkdirSync(config.quarantineRoot, { recursive: true });
-    for (const root of config.scanRoots) fs.mkdirSync(root, { recursive: true });
+    for (const root of config.scanRoots) {
+      if (!fs.existsSync(root)) console.warn(`[Config Warning] Scan root does not exist yet: ${path.resolve(root)}`);
+    }
 
     console.log(`[Success] DriveOS Agent configured in ${CONFIG_PATH}`);
-    console.log(config);
+    console.log({
+      ...config,
+      authToken: config.authToken ? "[set]" : undefined,
+      appDataDir: AGENT_HOME,
+      hashCachePath: HASH_CACHE_PATH,
+    });
   });
 
 program
@@ -474,12 +573,14 @@ program
   .description("Install DriveOS scan/watch hooks into a mounted drive root")
   .requiredOption("-p, --path <dir>", "Mounted drive or folder root")
   .option("-n, --name <label>", "Drive label")
+  .option("--allow-cloud-root", "Allow hook metadata inside a cloud-synced folder")
   .action((options) => {
     const root = path.resolve(options.path);
     if (!fs.existsSync(root)) {
       console.error(`[Error] Target path does not exist: ${root}`);
       process.exit(1);
     }
+    enforceTrackableRoot("Drive hook target", root, Boolean(options.allowCloudRoot));
 
     const hookDir = path.join(root, ".driveos");
     fs.mkdirSync(hookDir, { recursive: true });
@@ -509,14 +610,17 @@ program
   .description("Recursively scan directory metadata and upload to Convex")
   .requiredOption("-p, --path <dir>", "Directory path to scan")
   .option("--full-hash", "Calculate streaming SHA-256 full hashes for this scan")
+  .option("--allow-cloud-root", "Allow scanning a cloud-synced folder as metadata-only")
   .action(async (options) => {
     const scanDir = path.resolve(options.path);
     if (!fs.existsSync(scanDir)) {
       console.error(`[Error] Target path does not exist: ${scanDir}`);
       process.exit(1);
     }
+    enforceTrackableRoot("Scan target", scanDir, Boolean(options.allowCloudRoot));
 
     const config = loadConfig();
+    validateRuntimeConfig(config);
     const hashCache = loadHashCache();
     const calculateFull = Boolean(options.fullHash || config.fullHash);
     const driveMetrics = getDriveMetrics(scanDir);
@@ -597,30 +701,39 @@ program
 
 program
   .command("watch")
-  .description("Live watch a folder or drive for additions, edits, or removals")
+  .description("Queue watched folder changes and upload metadata in safe batches")
   .requiredOption("-p, --path <dir>", "Directory path to watch")
+  .option("--interval-minutes <minutes>", "Batch upload interval; defaults to hourly", "60")
+  .option("--debounce-seconds <seconds>", "Wait for files to settle before queueing metadata", "8")
+  .option("--allow-cloud-root", "Allow watching a cloud-synced folder as metadata-only")
   .action((options) => {
     const watchDir = path.resolve(options.path);
     const config = loadConfig();
+    validateRuntimeConfig(config);
     const hashCache = loadHashCache();
     let queue: FileMetadata[] = [];
-    let timeout: NodeJS.Timeout | null = null;
+    const pending = new Map<string, NodeJS.Timeout>();
+    const intervalMs = Math.max(1, Number(options.intervalMinutes) || 60) * 60 * 1000;
+    const debounceMs = Math.max(1, Number(options.debounceSeconds) || 8) * 1000;
 
     if (!fs.existsSync(watchDir)) {
       console.error(`[Error] Target path does not exist: ${watchDir}`);
       process.exit(1);
     }
+    enforceTrackableRoot("Watch target", watchDir, Boolean(options.allowCloudRoot));
 
     async function processQueue() {
       if (queue.length === 0) return;
       const batch = queue;
       queue = [];
-      console.log(`[Watcher Debounce] Flushing ${batch.length} file change(s) to Convex`);
-      await syncToConvex("uploadBatch", {
-        scanSessionId: `watch-${config.machineName}`,
-        machineId: config.machineName,
-        files: batch,
-      });
+      console.log(`[Watcher Batch] Flushing ${batch.length} file change(s) to Convex`);
+      for (let i = 0; i < batch.length; i += 100) {
+        await syncToConvex("uploadBatch", {
+          scanSessionId: `watch-${config.machineName}`,
+          machineId: config.machineName,
+          files: batch.slice(i, i + 100),
+        });
+      }
       saveHashCache(hashCache);
     }
 
@@ -628,23 +741,46 @@ program
       try {
         const statObj = fs.statSync(filePath);
         if (!statObj.isFile() || statObj.size < config.minFileSizeBytes) return;
+        if (!(await isFileStable(filePath))) {
+          console.log(`[Watcher Stable Check] Skipping actively changing file until next event: ${filePath}`);
+          return;
+        }
         queue.push(await buildFileMetadata(filePath, statObj, hashCache, config.fullHash));
-        if (timeout) clearTimeout(timeout);
-        timeout = setTimeout(processQueue, 3000);
+        if (queue.length >= 500) await processQueue();
       } catch (err: any) {
         console.warn(`[Watcher Skip] ${filePath}: ${err.message}`);
       }
     }
 
-    console.log(`[Watcher Started] Live watching ${watchDir}`);
+    function schedule(filePath: string) {
+      const existing = pending.get(filePath);
+      if (existing) clearTimeout(existing);
+      pending.set(filePath, setTimeout(() => {
+        pending.delete(filePath);
+        void enqueue(filePath);
+      }, debounceMs));
+    }
+
+    const interval = setInterval(() => void processQueue(), intervalMs);
+    process.on("SIGINT", () => {
+      clearInterval(interval);
+      Promise.resolve(processQueue()).finally(() => process.exit(0));
+    });
+    process.on("SIGTERM", () => {
+      clearInterval(interval);
+      Promise.resolve(processQueue()).finally(() => process.exit(0));
+    });
+
+    console.log(`[Watcher Started] Watching ${watchDir}`);
+    console.log(`[Watcher Started] Upload interval: ${Math.round(intervalMs / 60000)} minute(s); debounce: ${Math.round(debounceMs / 1000)} second(s)`);
     chokidar
       .watch(watchDir, {
         ignored: (candidate) => shouldIgnoreDirectory(path.basename(candidate)),
         persistent: true,
         ignoreInitial: true,
       })
-      .on("add", enqueue)
-      .on("change", enqueue)
+      .on("add", schedule)
+      .on("change", schedule)
       .on("unlink", (filePath) => {
         console.log(`[Watcher File Removed] ${filePath}`);
       });
@@ -655,9 +791,12 @@ program
   .description("Create automated folder tree structure and write project_manifest.json")
   .requiredOption("-i, --projectId <id>", "Project ID from backend")
   .requiredOption("-r, --root <dir>", "Root directory to build project")
+  .option("--allow-cloud-root", "Allow creating project folders inside a cloud-synced root")
   .action(async (options) => {
     const root = path.resolve(options.root);
+    enforceTrackableRoot("Project root", root, Boolean(options.allowCloudRoot));
     const config = loadConfig();
+    validateRuntimeConfig(config);
     const projectRes = await syncToConvex("getProject", { projectId: options.projectId });
     const project = projectRes.project || {};
     const { manifest, manifestPath } = writeProjectStructure(root, project, options.projectId);
@@ -680,6 +819,7 @@ program
   .description("Poll Convex backend for pending cleanup and folder-creation actions and execute them")
   .action(async () => {
     const config = loadConfig();
+    validateRuntimeConfig(config);
     console.log(`[Agent Queue] Polling pending actions for machine "${config.machineName}"`);
 
     const jobs = await syncToConvex("pollPendingJobs", { machineId: config.machineName });
@@ -704,6 +844,7 @@ program
   .requiredOption("-j, --jobId <id>", "Cleanup job ID")
   .action(async (options) => {
     const config = loadConfig();
+    validateRuntimeConfig(config);
     const res = await syncToConvex("getJob", { jobId: options.jobId });
     if (!res.job || res.offline) {
       console.error(`[Error] Job not found or Convex is offline: ${options.jobId}`);
@@ -741,8 +882,10 @@ program
   .requiredOption("-i, --projectId <id>", "Project ID from backend")
   .option("-r, --root <dir>", "Project root path; defaults to backend project.rootPath")
   .option("--full-hash", "Calculate streaming SHA-256 full hashes for manifest entries")
+  .option("--allow-cloud-root", "Allow writing manifest inside a cloud-synced project root")
   .action(async (options) => {
     const config = loadConfig();
+    validateRuntimeConfig(config);
     const projectRes = await syncToConvex("getProject", { projectId: options.projectId });
     const project = projectRes.project || {};
     const root = path.resolve(options.root || project.rootPath || "");
@@ -751,6 +894,7 @@ program
       console.error("[Error] Project root is required and must exist. Pass --root or set project.rootPath in Convex.");
       process.exit(1);
     }
+    enforceTrackableRoot("Manifest root", root, Boolean(options.allowCloudRoot));
 
     const hashCache = loadHashCache();
     const files: any[] = [];
