@@ -36,6 +36,10 @@ import {
 } from "@/components";
 const h: any = React.createElement;
 
+type ScreenProps = Record<string, any>;
+type WizardForm = Record<string, any> & { rules: Record<string, boolean> };
+type WizardSet = (key: string, value: any) => void;
+
 
 
 /* ============================================================
@@ -47,7 +51,7 @@ const h: any = React.createElement;
 
   const STEPS = ["Project basics", "Storage setup", "Folder template", "Rules", "Confirm"];
 
-  function FolderTree({ template, clientSlug }) {
+  function FolderTree({ template, clientSlug }: ScreenProps) {
     const root = "/" + (clientSlug || "CLIENT_Show_ProjectName") + "_2026-06-05/";
     return h("div", { className: "tree", style: { background: "var(--bg-input)", borderRadius: "var(--r)", padding: "14px 16px", border: "1px solid var(--line)", maxHeight: 420, overflowY: "auto" } },
       h("div", { className: "tree-row" }, h(Icon, { name: "folder", size: 13, style: { color: "var(--accent-hi)" } }), h("span", { className: "hi" }, root)),
@@ -56,15 +60,15 @@ const h: any = React.createElement;
         h("span", { className: "tree-new", style: { color: f.lvl ? "var(--tx-mut)" : "var(--tx)", fontWeight: f.lvl ? 400 : 500 } }, f.name)))));
   }
 
-  function CreateWizard({ go, toast }) {
+  function CreateWizard({ go, toast }: ScreenProps) {
     const [step, setStep] = React.useState(0);
     const [done, setDone] = React.useState(false);
-    const [form, setForm] = React.useState({
+    const [form, setForm] = React.useState<WizardForm>({
       client: "", show: "", name: "", owner: "cj", due: "", status: "active",
       drive: "cj-ssd", root: "/Projects", tier: "hot", cloud: true, template: "youtube",
       rules: { rawKeep: true, proxyDelete: true, cacheDelete: true, finalKeep: true, licenseKeep: true },
     });
-    const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+    const set: WizardSet = (k, v) => setForm((f) => ({ ...f, [k]: v }));
     const clientSlug = (form.client && form.name) ? (form.client.replace(/\s+/g, "_") + "_" + (form.show ? form.show.split(" ")[0] + "_" : "") + form.name.replace(/\s+/g, "_")) : "";
 
     if (done) return h(SuccessScreen, { form, go });
@@ -103,30 +107,30 @@ const h: any = React.createElement;
             : h("button", { className: "btn primary lg", onClick: () => { setDone(true); toast("Project created", "checkCircle", "ok"); } }, h(Icon, { name: "zap", size: 16 }), "Create Project"))));
   }
 
-  function Field({ label, children, hint }) {
+  function Field({ label, children, hint }: ScreenProps) {
     return h("div", null, h("label", { className: "field-label" }, label), children, hint && h("div", { className: "dim", style: { fontSize: 11, marginTop: 5 } }, hint));
   }
 
-  function Step0({ form, set }) {
+  function Step0({ form, set }: ScreenProps) {
     return h("div", null,
       h(StepHead, { n: "01", title: "Project basics", desc: "Who is this for and what are we building?" }),
       h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 } },
-        h(Field, { label: "Client" }, h("input", { className: "input", placeholder: "e.g. Northwind", value: form.client, onChange: (e) => set("client", e.target.value) })),
-        h(Field, { label: "Show / Campaign" }, h("input", { className: "input", placeholder: "e.g. Show X (YouTube)", value: form.show, onChange: (e) => set("show", e.target.value) })),
-        h(Field, { label: "Episode / Project name" }, h("input", { className: "input", placeholder: "e.g. Ep. 215", value: form.name, onChange: (e) => set("name", e.target.value) })),
-        h(Field, { label: "Owner / Editor" }, h("select", { className: "select", style: { width: "100%" }, value: form.owner, onChange: (e) => set("owner", e.target.value) }, DB.team.map((m) => h("option", { key: m.id, value: m.id }, m.name + " — " + m.role)))),
-        h(Field, { label: "Due date" }, h("input", { className: "input", type: "date", value: form.due, onChange: (e) => set("due", e.target.value) })),
-        h(Field, { label: "Initial status" }, h("div", { style: { paddingTop: 2 } }, h(Seg, { value: form.status, onChange: (v) => set("status", v), options: [{ value: "active", label: "Active" }, { value: "review", label: "Review" }] })))));
+        h(Field, { label: "Client" }, h("input", { className: "input", placeholder: "e.g. Northwind", value: form.client, onChange: (e: React.ChangeEvent<HTMLInputElement>) => set("client", e.target.value) })),
+        h(Field, { label: "Show / Campaign" }, h("input", { className: "input", placeholder: "e.g. Show X (YouTube)", value: form.show, onChange: (e: React.ChangeEvent<HTMLInputElement>) => set("show", e.target.value) })),
+        h(Field, { label: "Episode / Project name" }, h("input", { className: "input", placeholder: "e.g. Ep. 215", value: form.name, onChange: (e: React.ChangeEvent<HTMLInputElement>) => set("name", e.target.value) })),
+        h(Field, { label: "Owner / Editor" }, h("select", { className: "select", style: { width: "100%" }, value: form.owner, onChange: (e: React.ChangeEvent<HTMLSelectElement>) => set("owner", e.target.value) }, DB.team.map((m) => h("option", { key: m.id, value: m.id }, m.name + " — " + m.role)))),
+        h(Field, { label: "Due date" }, h("input", { className: "input", type: "date", value: form.due, onChange: (e: React.ChangeEvent<HTMLInputElement>) => set("due", e.target.value) })),
+        h(Field, { label: "Initial status" }, h("div", { style: { paddingTop: 2 } }, h(Seg, { value: form.status, onChange: (v: string) => set("status", v), options: [{ value: "active", label: "Active" }, { value: "review", label: "Review" }] })))));
   }
 
-  function Step1({ form, set }) {
+  function Step1({ form, set }: ScreenProps) {
     return h("div", null,
       h(StepHead, { n: "02", title: "Storage setup", desc: "Where does the project live, and how is it tiered?" }),
       h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18, marginBottom: 20 } },
         h(Field, { label: "Drive", hint: DB.driveById[form.drive] ? fmtTB(DB.driveById[form.drive].capTB - DB.driveById[form.drive].usedTB) + " free" : "" },
-          h("select", { className: "select", style: { width: "100%" }, value: form.drive, onChange: (e) => set("drive", e.target.value) },
+          h("select", { className: "select", style: { width: "100%" }, value: form.drive, onChange: (e: React.ChangeEvent<HTMLSelectElement>) => set("drive", e.target.value) },
             DB.drives.filter((d) => d.status !== "cloud" && d.status !== "uninit").map((d) => h("option", { key: d.id, value: d.id }, d.name)))),
-        h(Field, { label: "Root folder" }, h("input", { className: "input mono", value: form.root, onChange: (e) => set("root", e.target.value) }))),
+        h(Field, { label: "Root folder" }, h("input", { className: "input mono", value: form.root, onChange: (e: React.ChangeEvent<HTMLInputElement>) => set("root", e.target.value) }))),
       h(Field, { label: "Storage tier" },
         h("div", { style: { display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, marginTop: 4 } },
           [["hot", "Hot", "Live editing SSD", "risk"], ["warm", "Warm", "Near-line RAID", "warn"], ["cloud", "Cloud", "Shared delivery", "cloud"]].map(([k, label, desc, c]) =>
@@ -136,10 +140,10 @@ const h: any = React.createElement;
       h("div", { className: "spread", style: { marginTop: 20, padding: "14px 16px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
         h("div", { className: "row", style: { gap: 11 } }, h(Icon, { name: "cloud", size: 18, style: { color: "var(--cloud)" } }),
           h("div", null, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 13 } }, "Create matching cloud folder"), h("div", { className: "muted", style: { fontSize: 12 } }, "Mirror the structure in Google Drive for delivery + off-site copy."))),
-        h(Toggle, { on: form.cloud, onChange: (v) => set("cloud", v) })));
+        h(Toggle, { on: form.cloud, onChange: (v: boolean) => set("cloud", v) })));
   }
 
-  function Step2({ form, set, clientSlug }) {
+  function Step2({ form, set, clientSlug }: ScreenProps) {
     return h("div", null,
       h(StepHead, { n: "03", title: "Folder template", desc: "Pick a structure — the tree previews live on the right." }),
       h("div", { style: { display: "grid", gridTemplateColumns: "300px 1fr", gap: 22 } },
@@ -153,8 +157,8 @@ const h: any = React.createElement;
           h(FolderTree, { template: form.template, clientSlug }))));
   }
 
-  function Step3({ form, set }) {
-    const rules = [
+  function Step3({ form, set }: ScreenProps) {
+    const rules: Array<[string, string, string, string, string]> = [
       ["rawKeep", "Raw footage — never auto-delete", "RAW is always protected. Manual removal only, with confirmation.", "shield", "ok"],
       ["proxyDelete", "Proxies — deletable after delivery", "Generated proxies can be quarantined once the project ships.", "layers", "warn"],
       ["cacheDelete", "Cache — deletable anytime after confirmation", "Premiere / DaVinci cache is regenerable on next open.", "cpu", "warn"],
@@ -168,11 +172,11 @@ const h: any = React.createElement;
           h("div", { className: "row", style: { gap: 12 } },
             h("span", { style: { width: 34, height: 34, borderRadius: 9, display: "grid", placeItems: "center", flexShrink: 0, background: "var(--" + c + "-soft)", color: "var(--" + c + ")" } }, h(Icon, { name: icon, size: 16 })),
             h("div", null, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 13 } }, title), h("div", { className: "muted", style: { fontSize: 11.5 } }, desc))),
-          h(Toggle, { on: form.rules[k], onChange: (v) => set("rules", { ...form.rules, [k]: v }) })))));
+          h(Toggle, { on: form.rules[k], onChange: (v: boolean) => set("rules", { ...form.rules, [k]: v }) })))));
   }
 
-  function Step4({ form, clientSlug }) {
-    const owner = DB.teamById[form.owner], drive = DB.driveById[form.drive];
+  function Step4({ form, clientSlug }: ScreenProps) {
+    const owner = DB.teamById[form.owner] || { name: "Unknown" }, drive = DB.driveById[form.drive];
     return h("div", null,
       h(StepHead, { n: "05", title: "Confirm & create", desc: "Review the setup. DriveOS will scaffold folders, a manifest, and a watcher." }),
       h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 22 } },
@@ -188,22 +192,22 @@ const h: any = React.createElement;
         h("div", null, h("div", { className: "eyebrow", style: { marginBottom: 8 } }, "Will be created"), h(FolderTree, { template: form.template, clientSlug }))));
   }
 
-  function confirmRow(label, value) {
+  function confirmRow(label: React.ReactNode, value: React.ReactNode) {
     return h("div", { className: "spread", style: { padding: "11px 14px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
       h("span", { className: "muted", style: { fontSize: 12.5 } }, label), h("span", { className: "hi", style: { fontWeight: 600, fontSize: 13, textAlign: "right" } }, value));
   }
-  function StepHead({ n, title, desc }) {
+  function StepHead({ n, title, desc }: ScreenProps) {
     return h("div", { style: { marginBottom: 22 } },
       h("div", { className: "row", style: { gap: 10, marginBottom: 4 } }, h("span", { className: "mono", style: { fontSize: 12, color: "var(--accent-hi)", fontWeight: 700 } }, n), h("h3", { style: { fontSize: 17 } }, title)),
       h("div", { className: "muted", style: { fontSize: 13 } }, desc));
   }
-  function Toggle({ on, onChange }) {
+  function Toggle({ on, onChange }: ScreenProps) {
     return h("div", { onClick: () => onChange(!on), style: { width: 42, height: 24, borderRadius: 99, flexShrink: 0, cursor: "pointer", background: on ? "var(--accent)" : "var(--bg-elevated)", border: "1px solid " + (on ? "var(--accent-lo)" : "var(--line-strong)"), position: "relative", transition: "background .15s" } },
       h("span", { style: { position: "absolute", top: 2, left: on ? 20 : 2, width: 18, height: 18, borderRadius: 99, background: "#fff", transition: "left .15s", boxShadow: "0 1px 3px rgba(0,0,0,.4)" } }));
   }
 
   // ---- Success ----
-  function SuccessScreen({ form, go }) {
+  function SuccessScreen({ form, go }: ScreenProps) {
     const steps = [
       ["Folder structure created", "27 folders scaffolded", "folder"],
       ["Archive manifest created", "09_ARCHIVE_MANIFEST/manifest.json", "fingerprint"],

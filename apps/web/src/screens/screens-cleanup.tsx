@@ -36,6 +36,11 @@ import {
 } from "@/components";
 const h: any = React.createElement;
 
+type ScreenProps = Record<string, any>;
+type CleanupPreviewState = any | null;
+type RecState = "quarantined" | "ignored" | null;
+type QuarantineItem = any;
+
 
 
 /* ============================================================
@@ -51,8 +56,8 @@ const h: any = React.createElement;
     { risk: "danger", label: "Do not delete", desc: "Protected. Flagged for manual review only.", icon: "lock" },
   ];
 
-  function RecCard({ r, go, toast, onPreview }) {
-    const [state, setState] = React.useState(null);
+  function RecCard({ r, go, toast, onPreview }: ScreenProps) {
+    const [state, setState] = React.useState<RecState>(null);
     if (state === "quarantined")
       return h("div", { className: "card", style: { borderColor: "var(--ok-line)", background: "var(--ok-soft)" } },
         h("div", { className: "card-pad row", style: { gap: 11 } }, h(Icon, { name: "checkCircle", size: 18, style: { color: "var(--ok)" } }),
@@ -81,16 +86,17 @@ const h: any = React.createElement;
             r.risk !== "danger" && h("button", { className: "btn sm primary", onClick: () => setState("quarantined") }, h(Icon, { name: "shield", size: 13 }), "Quarantine"),
             h("button", { className: "btn sm ghost", onClick: () => setState("ignored") }, "Ignore")))));
   }
-  function catIcon(cat) {
-    return ({ "Cache": "cpu", "Proxies": "layers", "Duplicate stock": "globe", "Review exports": "download", "Abandoned copies": "box", "Duplicate downloads": "copy", "Unknown": "alert" })[cat] || "broom";
+  function catIcon(cat: string) {
+    const icons: Record<string, string> = { "Cache": "cpu", "Proxies": "layers", "Duplicate stock": "globe", "Review exports": "download", "Abandoned copies": "box", "Duplicate downloads": "copy", "Unknown": "alert" };
+    return icons[cat] || "broom";
   }
 
-  function CleanupScreen({ go, toast }) {
-    const [preview, setPreview] = React.useState(null);
+  function CleanupScreen({ go, toast }: ScreenProps) {
+    const [preview, setPreview] = React.useState<CleanupPreviewState>(null);
     const [cat, setCat] = React.useState("all");
     const cats = [...new Set(DB.cleanup.map((c) => c.cat))];
     const filtered = cat === "all" ? DB.cleanup : DB.cleanup.filter((c) => c.cat === cat);
-    const byRisk = (rk) => filtered.filter((c) => c.risk === rk);
+    const byRisk = (rk: string) => filtered.filter((c) => c.risk === rk);
     const safeT = DB.cleanup.filter((c) => c.risk === "safe").reduce((s, c) => s + c.recoverTB, 0);
     const revT = DB.cleanup.filter((c) => c.risk === "review").reduce((s, c) => s + c.recoverTB, 0);
 
@@ -138,14 +144,14 @@ const h: any = React.createElement;
       preview && h(CleanupPreviewModal, { r: preview, onClose: () => setPreview(null), toast, go }));
   }
 
-  function recoverBar(label, val, max, kind) {
+  function recoverBar(label: React.ReactNode, val: number, max: number, kind: string) {
     return h("div", null,
       h("div", { className: "spread", style: { fontSize: 12, marginBottom: 5 } }, h("span", { className: "hi", style: { fontWeight: 600 } }, label), h("span", { className: "mono", style: { color: "var(--" + kind + ")" } }, fmtTB(val))),
       h(Bar, { value: val, max, kind, height: 7 }));
   }
 
   // ---- Cleanup Preview Modal ----
-  function CleanupPreviewModal({ r, onClose, toast, go }) {
+  function CleanupPreviewModal({ r, onClose, toast, go }: ScreenProps) {
     const [approved, setApproved] = React.useState(false);
     const sampleFiles = [
       { path: "/Show_X/06_RENDERS_CACHE/Premiere Pro Video Previews/", size: "182 GB", type: "cache" },
@@ -185,12 +191,12 @@ const h: any = React.createElement;
             h("span", { className: "mono", style: { fontSize: 11.5, color: "var(--tx)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, f.path)),
           h("span", { className: "mono", style: { fontSize: 11.5, color: "var(--tx-mut)", flexShrink: 0, marginLeft: 10 } }, f.size)))));
   }
-  function previewStat(label, value, icon, color) {
+  function previewStat(label: React.ReactNode, value: React.ReactNode, icon: string, color = "") {
     return h("div", { style: { padding: "12px 13px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
       h("div", { className: "row", style: { gap: 6, marginBottom: 5 } }, h(Icon, { name: icon, size: 13, style: { color: color || "var(--tx-dim)" } }), h("span", { className: "eyebrow", style: { fontSize: 9 } }, label)),
       h("div", { className: "stat-num", style: { fontSize: 17, color: color || "var(--tx-hi)" } }, value));
   }
-  function verifyBox(label, ok, note) {
+  function verifyBox(label: React.ReactNode, ok: boolean, note: React.ReactNode) {
     return h("div", { style: { padding: "11px 13px", borderRadius: "var(--r)", background: "var(--ok-soft)", border: "1px solid var(--ok-line)", display: "flex", gap: 10 } },
       h(Icon, { name: "checkCircle", size: 16, style: { color: "var(--ok)", flexShrink: 0, marginTop: 1 } }),
       h("div", null, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 12.5 } }, label), h("div", { className: "muted", style: { fontSize: 11 } }, note)));
@@ -199,11 +205,11 @@ const h: any = React.createElement;
   // ============================================================
   //  QUARANTINE
   // ============================================================
-  function QuarantineScreen({ go, toast }) {
-    const [items, setItems] = React.useState(DB.quarantine);
+  function QuarantineScreen({ go, toast }: ScreenProps) {
+    const [items, setItems] = React.useState<QuarantineItem[]>(DB.quarantine);
     const totalGB = items.reduce((s, q) => s + q.sizeGB, 0);
-    const restore = (id) => { setItems((x) => x.filter((q) => q.id !== id)); toast("File restored to original location", "rotate", "accent"); };
-    const purge = (id) => { setItems((x) => x.filter((q) => q.id !== id)); toast("Permanently deleted", "trash", "risk"); };
+    const restore = (id: any) => { setItems((x) => x.filter((q) => q.id !== id)); toast("File restored to original location", "rotate", "accent"); };
+    const purge = (id: any) => { setItems((x) => x.filter((q) => q.id !== id)); toast("Permanently deleted", "trash", "risk"); };
 
     return h("div", { className: "page-inner" },
       h(PageHead, { eyebrow: "Maintenance", title: "Quarantine", desc: "A safe deletion buffer. Files stay restorable for 30 days before they can be permanently removed.",
@@ -240,10 +246,16 @@ const h: any = React.createElement;
           h("div", { style: { flex: 1, minWidth: 0 } }, h("div", { style: { fontSize: 12.5, color: "var(--tx)" } }, h("b", { className: "hi" }, a.who), " — ", a.action)),
           h("span", { className: "mono dim", style: { fontSize: 11, flexShrink: 0 } }, a.date + " · " + a.time))))));
   }
-  function byName(name) { const m = DB.team.find((t) => t.name === name); return m ? m.id : "founder"; }
-  function auditColor(k) { return ({ quarantine: "var(--warn)", scan: "var(--accent)", auto: "var(--auto)", approve: "var(--ok)", create: "var(--cloud)", restore: "var(--ok)" })[k] || "var(--tx-mut)"; }
-  function auditIcon(k) { return ({ quarantine: "shield", scan: "refresh", auto: "cpu", approve: "check", create: "plus", restore: "rotate" })[k] || "activity"; }
-  function qkpi(label, value, icon, color) {
+  function byName(name: string) { const m = DB.team.find((t) => t.name === name); return m ? m.id : "founder"; }
+  function auditColor(k: string) {
+    const colors: Record<string, string> = { quarantine: "var(--warn)", scan: "var(--accent)", auto: "var(--auto)", approve: "var(--ok)", create: "var(--cloud)", restore: "var(--ok)" };
+    return colors[k] || "var(--tx-mut)";
+  }
+  function auditIcon(k: string) {
+    const icons: Record<string, string> = { quarantine: "shield", scan: "refresh", auto: "cpu", approve: "check", create: "plus", restore: "rotate" };
+    return icons[k] || "activity";
+  }
+  function qkpi(label: React.ReactNode, value: React.ReactNode, icon: string, color: string) {
     return h("div", { className: "card card-pad fade-up", style: { display: "flex", alignItems: "center", gap: 13 } },
       h("div", { style: { width: 38, height: 38, borderRadius: 10, display: "grid", placeItems: "center", flexShrink: 0, background: "var(--bg-surface)", color, border: "1px solid var(--line)" } }, h(Icon, { name: icon, size: 18 })),
       h("div", null, h("div", { className: "stat-num", style: { fontSize: 21, color } }, value), h("div", { className: "eyebrow", style: { fontSize: 9.5, marginTop: 1 } }, label)));

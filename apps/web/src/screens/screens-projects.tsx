@@ -37,6 +37,9 @@ import {
 } from "@/components";
 const h: any = React.createElement;
 
+type ScreenProps = Record<string, any>;
+type AnyRecord = Record<string, any>;
+
 
 
 /* ============================================================
@@ -46,15 +49,17 @@ const h: any = React.createElement;
 
   
 
-  function structKind(s) { return s >= 85 ? "ok" : s >= 65 ? "warn" : "risk"; }
+  function structKind(s: number) { return s >= 85 ? "ok" : s >= 65 ? "warn" : "risk"; }
 
   // ---- Project card ----
-  function ProjectCard({ p, go }) {
-    const st = PROJ_STATUS[p.status], tier = TIER_META[p.tier];
+  function ProjectCard({ p, go }: ScreenProps) {
+    const st = (PROJ_STATUS as AnyRecord)[p.status] || { cls: "", label: p.status || "Unknown" };
+    const tier = (TIER_META as AnyRecord)[p.tier] || { color: "--tx-dim", label: p.tier || "Unknown" };
+    const owner = (DB.teamById as AnyRecord)[p.owner] || { name: p.owner || "Unknown" };
     return h("div", { className: "card fade-up", onClick: () => go("project", { id: p.id }),
       style: { cursor: "pointer", transition: "border-color .14s" },
-      onMouseEnter: (e) => (e.currentTarget.style.borderColor = "var(--line-strong)"),
-      onMouseLeave: (e) => (e.currentTarget.style.borderColor = "var(--line)") },
+      onMouseEnter: (e: React.MouseEvent<HTMLDivElement>) => (e.currentTarget.style.borderColor = "var(--line-strong)"),
+      onMouseLeave: (e: React.MouseEvent<HTMLDivElement>) => (e.currentTarget.style.borderColor = "var(--line)") },
       h("div", { className: "card-pad", style: { paddingBottom: 14 } },
         h("div", { className: "spread", style: { marginBottom: 13, alignItems: "flex-start" } },
           h("div", { style: { minWidth: 0 } },
@@ -64,7 +69,7 @@ const h: any = React.createElement;
         h("div", { className: "row", style: { gap: 7, marginBottom: 15 } },
           h("span", { className: "tag" }, h("span", { style: { width: 7, height: 7, borderRadius: 2, background: getVar(tier.color) } }), tier.label, " storage"),
           h(Avatar, { id: p.owner, size: 20 }),
-          h("span", { className: "muted", style: { fontSize: 11.5 } }, DB.teamById[p.owner].name.split(" ")[0])),
+          h("span", { className: "muted", style: { fontSize: 11.5 } }, owner.name.split(" ")[0])),
         h("div", { className: "spread", style: { alignItems: "flex-end", marginBottom: 14 } },
           h("div", null, h("div", { className: "stat-num", style: { fontSize: 26 } }, fmtTB(p.sizeTB)),
             h("div", { className: "eyebrow", style: { fontSize: 9, marginTop: 1 } }, "Total Size")),
@@ -75,7 +80,7 @@ const h: any = React.createElement;
         healthCell("Structure", p.structure, structKind(p.structure)),
         healthCell("Archive Ready", p.archiveReady, p.archiveReady >= 80 ? "ok" : p.archiveReady >= 40 ? "warn" : "risk", true)));
   }
-  function healthCell(label, val, kind, right) {
+  function healthCell(label: React.ReactNode, val: number, kind: string, right = false) {
     return h("div", { style: { padding: "12px 16px", borderRight: right ? "none" : "1px solid var(--line)" } },
       h("div", { className: "spread", style: { marginBottom: 6 } },
         h("span", { className: "eyebrow", style: { fontSize: 9 } }, label),
@@ -84,7 +89,7 @@ const h: any = React.createElement;
   }
 
   // ---- Overview ----
-  function ProjectsScreen({ go }) {
+  function ProjectsScreen({ go }: ScreenProps) {
     const [status, setStatus] = React.useState("all");
     const [tier, setTier] = React.useState("all");
     const [owner, setOwner] = React.useState("all");
@@ -113,9 +118,9 @@ const h: any = React.createElement;
         h(Seg, { value: status, onChange: setStatus, options: [
           { value: "all", label: "All" }, { value: "active", label: "Active" }, { value: "review", label: "Review" },
           { value: "delivered", label: "Delivered" }, { value: "ready", label: "Ready" }, { value: "archived", label: "Archived" }] }),
-        h("select", { className: "select", value: tier, onChange: (e) => setTier(e.target.value) },
-          h("option", { value: "all" }, "All tiers"), ["hot", "warm", "cloud", "cold"].map((t) => h("option", { key: t, value: t }, TIER_META[t].label))),
-        h("select", { className: "select", value: owner, onChange: (e) => setOwner(e.target.value) },
+        h("select", { className: "select", value: tier, onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setTier(e.target.value) },
+          h("option", { value: "all" }, "All tiers"), ["hot", "warm", "cloud", "cold"].map((t) => h("option", { key: t, value: t }, ((TIER_META as AnyRecord)[t] || { label: t }).label))),
+        h("select", { className: "select", value: owner, onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setOwner(e.target.value) },
           h("option", { value: "all" }, "All editors"), DB.team.map((m) => h("option", { key: m.id, value: m.id }, m.name)))),
 
       list.length === 0
@@ -123,7 +128,7 @@ const h: any = React.createElement;
         : h("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))", gap: "var(--gap)" } },
             list.map((p) => h(ProjectCard, { key: p.id, p, go }))));
   }
-  function pkpi(label, value, kind) {
+  function pkpi(label: React.ReactNode, value: React.ReactNode, kind: string) {
     const color = kind ? "var(--" + (kind === "accent" ? "accent-hi" : kind) + ")" : "var(--tx-hi)";
     return h("div", { className: "card card-pad fade-up" },
       h("div", { className: "stat-num", style: { fontSize: 24, color } }, value),
@@ -133,8 +138,8 @@ const h: any = React.createElement;
   // ============================================================
   //  PROJECT DETAIL
   // ============================================================
-  function projectTree(p) {
-    const base = DB.projectFolders[p.id];
+  function projectTree(p: any) {
+    const base = (DB.projectFolders as AnyRecord)[p.id];
     if (base) return base;
     // synthesize: mark some missing based on structure score
     return DB.folderTemplate.filter((f) => f.lvl === 0).map((f, i) => ({
@@ -143,13 +148,15 @@ const h: any = React.createElement;
     }));
   }
 
-  function ProjectDetail({ params, go, toast }) {
-    const p = DB.projectById[params.id];
-    const [modal, setModal] = React.useState(null);
+  function ProjectDetail({ params, go, toast }: ScreenProps) {
+    const p = (DB.projectById as AnyRecord)[params.id];
+    const [modal, setModal] = React.useState<"archive" | null>(null);
     if (!p) return h("div", { className: "page-inner" }, h("div", { className: "muted" }, "Project not found."));
-    const st = PROJ_STATUS[p.status], tier = TIER_META[p.tier];
+    const st = (PROJ_STATUS as AnyRecord)[p.status] || { cls: "", label: p.status || "Unknown" };
+    const tier = (TIER_META as AnyRecord)[p.tier] || { color: "--tx-dim", label: p.tier || "Unknown" };
+    const owner = (DB.teamById as AnyRecord)[p.owner] || { name: p.owner || "Unknown" };
     const tree = projectTree(p);
-    const missing = tree.filter((f) => f.status === "missing");
+    const missing = tree.filter((f: any) => f.status === "missing");
 
     const head = h(PageHead, {
       eyebrow: p.client + " · " + p.show,
@@ -165,7 +172,7 @@ const h: any = React.createElement;
     const metaRow = h("div", { className: "row", style: { gap: 9, marginBottom: 18, marginTop: -10, flexWrap: "wrap" } },
       h("span", { className: "badge " + st.cls }, st.label),
       h("span", { className: "tag" }, h("span", { style: { width: 7, height: 7, borderRadius: 2, background: getVar(tier.color) } }), tier.label, " storage"),
-      h("span", { className: "row", style: { gap: 6 } }, h(Avatar, { id: p.owner, size: 22 }), h("span", { className: "muted", style: { fontSize: 12.5 } }, DB.teamById[p.owner].name)),
+      h("span", { className: "row", style: { gap: 6 } }, h(Avatar, { id: p.owner, size: 22 }), h("span", { className: "muted", style: { fontSize: 12.5 } }, owner.name)),
       h("span", { className: "tag" }, h(Icon, { name: "clock", size: 12 }), "Modified " + p.modified),
       h("span", { className: "tag" }, h(Icon, { name: "layers", size: 12 }), p.template + " template"));
 
@@ -180,12 +187,12 @@ const h: any = React.createElement;
     // copies
     const copies = cardShell("Copies & Redundancy", "layers", "var(--tx-mut)", null,
       h("div", { className: "card-pad", style: { display: "flex", flexDirection: "column", gap: 11 } },
-        copyRow("Local working copy", p.locations.some((l) => ["hot", "warm"].includes((DB.driveById[l] || {}).tier)), "hdd"),
+        copyRow("Local working copy", p.locations.some((l: string) => ["hot", "warm"].includes(((DB.driveById as AnyRecord)[l] || {}).tier)), "hdd"),
         copyRow("Cloud copy", p.locations.includes("gdrive"), "cloud"),
-        copyRow("Archive copy", p.locations.some((l) => (DB.driveById[l] || {}).tier === "cold"), "archive"),
+        copyRow("Archive copy", p.locations.some((l: string) => ((DB.driveById as AnyRecord)[l] || {}).tier === "cold"), "archive"),
         h("div", { className: "divider", style: { margin: "4px 0" } }),
         h("div", { style: { fontSize: 11.5, color: "var(--tx-mut)" } }, "Stored on ", h("b", { className: "hi" }, p.locations.length + " volumes"), ": ",
-          p.locations.map((l, i) => h("span", { key: l, className: "mono", style: { color: "var(--tx)" } }, (DB.driveById[l] || { name: l }).name, i < p.locations.length - 1 ? " · " : "")))));
+          p.locations.map((l: string, i: number) => h("span", { key: l, className: "mono", style: { color: "var(--tx)" } }, ((DB.driveById as AnyRecord)[l] || { name: l }).name, i < p.locations.length - 1 ? " · " : "")))));
 
     // folder tree
     const treeCard = cardShell("Folder Structure", "folder", "var(--tx-mut)",
@@ -193,7 +200,7 @@ const h: any = React.createElement;
       h("div", { className: "card-pad" },
         h("div", { className: "tree" }, h("div", { className: "tree-row" }, h(Icon, { name: "folder", size: 13, style: { color: "var(--accent-hi)" } }),
           h("span", { className: "hi" }, "/" + p.client.replace(/\s+/g, "_") + "_" + p.name.split(" ")[0] + "/")),
-          h("div", { className: "tree-indent" }, tree.map((f, i) => h("div", { key: i, className: "tree-row" },
+          h("div", { className: "tree-indent" }, tree.map((f: any, i: number) => h("div", { key: i, className: "tree-row" },
             h(Icon, { name: f.status === "missing" ? "x" : "folder", size: 13, style: { color: f.status === "missing" ? "var(--risk)" : f.status === "warn" ? "var(--warn)" : "var(--tx-mut)" } }),
             h("span", { className: f.status === "missing" ? "tree-missing" : "" }, f.name),
             f.status !== "missing" && h("span", { className: "mono dim", style: { marginLeft: "auto", fontSize: 11 } }, f.sizeGB >= 1000 ? (f.sizeGB / 1000).toFixed(1) + " TB" : f.sizeGB + " GB"),
@@ -225,12 +232,12 @@ const h: any = React.createElement;
           dupStat("Shared w/ others", fmtTB(p.dupTB * 0.6), "var(--auto)")),
         inProj.length ? inProj.map((d) => h("div", { key: d.id, className: "spread", style: { padding: "10px 12px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
           h("div", { className: "row", style: { gap: 9, minWidth: 0 } }, h(FileTypePill, { type: d.type }), h("span", { className: "mono hi", style: { fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, d.name)),
-          h("div", { className: "row", style: { gap: 8, flexShrink: 0 } }, h(Badge, { kind: RISK_META[d.risk].cls }, d.copies + "×"), h("span", { className: "mono", style: { fontSize: 12, color: "var(--tx-hi)" } }, d.sizeGB + " GB"))))
+          h("div", { className: "row", style: { gap: 8, flexShrink: 0 } }, h(Badge, { kind: ((RISK_META as AnyRecord)[d.risk] || { cls: "" }).cls }, d.copies + "×"), h("span", { className: "mono", style: { fontSize: 12, color: "var(--tx-hi)" } }, d.sizeGB + " GB"))))
           : h("div", { className: "muted", style: { fontSize: 12.5, padding: "4px 2px" } }, "No internal duplicates detected.")));
 
     // recommended actions
     const recs = [
-      { t: "Create missing folders", d: missing.length ? missing.map((m) => m.name).join(", ") : "Structure complete", risk: "safe", icon: "plus", disabled: !missing.length },
+      { t: "Create missing folders", d: missing.length ? missing.map((m: any) => m.name).join(", ") : "Structure complete", risk: "safe", icon: "plus", disabled: !missing.length },
       { t: "Delete generated proxies", d: "After delivery approval · " + fmtTB(p.cleanTB * 0.5), risk: "review", icon: "trash" },
       { t: "Quarantine old review exports", d: "v1–v6 superseded · 1.5 TB studio-wide", risk: "review", icon: "shield" },
       { t: "Copy final exports to cloud", d: "Ensure off-site delivery copy", risk: "safe", icon: "cloud" },
@@ -252,17 +259,17 @@ const h: any = React.createElement;
       modal === "archive" && h(ArchiveChecklistModal, { p, onClose: () => setModal(null), toast, go }));
   }
 
-  function sumCell(label, value, icon, color) {
+  function sumCell(label: React.ReactNode, value: React.ReactNode, icon: string, color = "") {
     return h("div", null,
       h("div", { className: "row", style: { gap: 7, marginBottom: 6 } }, h(Icon, { name: icon, size: 14, style: { color: color || "var(--tx-dim)" } }), h("span", { className: "eyebrow", style: { fontSize: 9.5 } }, label)),
       h("div", { className: "stat-num", style: { fontSize: 22, color: color || "var(--tx-hi)" } }, value));
   }
-  function copyRow(label, present, icon) {
+  function copyRow(label: React.ReactNode, present: boolean, icon: string) {
     return h("div", { className: "spread", style: { padding: "11px 13px", borderRadius: "var(--r)", background: present ? "var(--ok-soft)" : "var(--risk-soft)", border: "1px solid var(--" + (present ? "ok" : "risk") + "-line)" } },
       h("div", { className: "row", style: { gap: 10 } }, h(Icon, { name: icon, size: 16, style: { color: present ? "var(--ok)" : "var(--risk)" } }), h("span", { className: "hi", style: { fontWeight: 600, fontSize: 13 } }, label)),
       h("span", { className: "badge " + (present ? "ok" : "risk") }, present ? "Verified" : "Missing"));
   }
-  function dupStat(label, value, color) {
+  function dupStat(label: React.ReactNode, value: React.ReactNode, color: string) {
     return h("div", { style: { flex: 1, padding: "11px 13px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
       h("div", { className: "eyebrow", style: { fontSize: 9, marginBottom: 4 } }, label),
       h("div", { className: "stat-num", style: { fontSize: 18, color } }, value));

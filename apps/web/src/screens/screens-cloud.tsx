@@ -36,6 +36,8 @@ import {
 } from "@/components";
 const h: any = React.createElement;
 
+type ScreenProps = Record<string, any>;
+
 
 
 /* ============================================================
@@ -45,7 +47,7 @@ const h: any = React.createElement;
 
   const C = DB.cloud;
 
-  function CloudScreen({ go, toast }) {
+  function CloudScreen({ go, toast }: ScreenProps) {
     const p = pct(C.usedTB, C.capTB);
     const cloudProjects = DB.projects.filter((pr) => pr.locations.includes("gdrive"));
 
@@ -100,22 +102,22 @@ const h: any = React.createElement;
               h(Bar, { value: f.sizeGB, max: C.largeCloud[0].sizeGB, kind: "cloud", height: 5 })))))) ));
   }
 
-  function syncRec(title, why, risk, icon, cta, toast) {
+  function syncRec(title: React.ReactNode, why: React.ReactNode, risk: string, icon: string, cta: string, toast: (...args: any[]) => void) {
     return h("div", { className: "spread", style: { padding: "11px 13px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
       h("div", { className: "row", style: { gap: 11, minWidth: 0 } },
         h("span", { style: { width: 30, height: 30, borderRadius: 8, display: "grid", placeItems: "center", flexShrink: 0, background: "var(--" + risk + "-soft)", color: "var(--" + risk + ")" } }, h(Icon, { name: icon, size: 15 })),
         h("div", { style: { minWidth: 0 } }, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 12.5 } }, title), h("div", { className: "muted", style: { fontSize: 11.5 } }, why))),
       h("button", { className: "btn sm", style: { flexShrink: 0 }, onClick: () => toast(cta + " queued", icon, "cloud") }, cta));
   }
-  function ckpi(label, value, icon, color) {
+  function ckpi(label: React.ReactNode, value: React.ReactNode, icon: string, color: string) {
     return h("div", { className: "card card-pad fade-up", style: { display: "flex", alignItems: "center", gap: 13 } },
       h("div", { style: { width: 38, height: 38, borderRadius: 10, display: "grid", placeItems: "center", flexShrink: 0, background: "var(--bg-surface)", color, border: "1px solid var(--line)" } }, h(Icon, { name: icon, size: 18 })),
       h("div", null, h("div", { className: "stat-num", style: { fontSize: 21, color } }, value), h("div", { className: "eyebrow", style: { fontSize: 9.5, marginTop: 1 } }, label)));
   }
-  function compareCard(title, icon, color, items, note, noteKind, go, risky) {
+  function compareCard(title: string, icon: string, color: string, items: any[], note: React.ReactNode, noteKind: string, go: (...args: any[]) => void, risky = false) {
     return cardShell(title, icon, color, h(Badge, { square: true }, items.length + " items"),
       h("div", null,
-        h("div", { style: { padding: "6px 0" } }, items.map((f, i) => h("div", { key: i, className: "spread", style: { padding: "11px 18px", borderBottom: "1px solid var(--line-faint)" } },
+        h("div", { style: { padding: "6px 0" } }, items.map((f: any, i: number) => h("div", { key: i, className: "spread", style: { padding: "11px 18px", borderBottom: "1px solid var(--line-faint)" } },
           h("div", { className: "row", style: { gap: 9, minWidth: 0 } },
             risky && f.risk === "high" && h(Icon, { name: "alert", size: 14, style: { color: "var(--risk)", flexShrink: 0 } }),
             h("span", { className: "mono", style: { fontSize: 11.5, color: "var(--tx)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, f.name)),

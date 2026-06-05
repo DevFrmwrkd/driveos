@@ -35,6 +35,8 @@ import {
   getVar
 } from "@/components";
 const h: any = React.createElement;
+type ScreenProps = Record<string, any>;
+type ToggleMap = Record<string, boolean>;
 
 
 
@@ -58,17 +60,17 @@ const h: any = React.createElement;
     { id: "audit", label: "Audit Log", icon: "list" },
   ];
 
-  function Toggle({ on, onChange }) {
+  function Toggle({ on, onChange }: { on: boolean; onChange: (next: boolean) => void }) {
     return h("div", { onClick: () => onChange(!on), style: { width: 42, height: 24, borderRadius: 99, flexShrink: 0, cursor: "pointer", background: on ? "var(--accent)" : "var(--bg-elevated)", border: "1px solid " + (on ? "var(--accent-lo)" : "var(--line-strong)"), position: "relative", transition: "background .15s" } },
       h("span", { style: { position: "absolute", top: 2, left: on ? 20 : 2, width: 18, height: 18, borderRadius: 99, background: "#fff", transition: "left .15s", boxShadow: "0 1px 3px rgba(0,0,0,.4)" } }));
   }
-  function Row({ title, desc, control }) {
+  function Row({ title, desc, control }: ScreenProps) {
     return h("div", { className: "spread", style: { padding: "15px 0", borderBottom: "1px solid var(--line-faint)" } },
       h("div", { style: { minWidth: 0, paddingRight: 20 } }, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 13.5 } }, title), desc && h("div", { className: "muted", style: { fontSize: 12, marginTop: 3 } }, desc)),
       h("div", { style: { flexShrink: 0 } }, control));
   }
 
-  function SettingsScreen({ go, toast }) {
+  function SettingsScreen({ go, toast }: ScreenProps) {
     const [sec, setSec] = React.useState("team");
     return h("div", { className: "page-inner" },
       h(PageHead, { eyebrow: "System", title: "Settings", desc: "Configure team, agents, templates, rules, and the safety behavior of DriveOS." }),
@@ -91,13 +93,13 @@ const h: any = React.createElement;
           sec === "audit" && h(AuditSettings, null))));
   }
 
-  function Panel({ title, desc, action, children }) {
+  function Panel({ title, desc, action, children }: ScreenProps) {
     return h("div", { className: "card" },
       h("div", { className: "card-head" }, h("div", null, h("div", { className: "card-title" }, title), desc && h("div", { className: "muted", style: { fontSize: 12, marginTop: 2 } }, desc)), action && h("div", { className: "right" }, action)),
       h("div", { className: "card-pad" }, children));
   }
 
-  function TeamSettings({ toast }) {
+  function TeamSettings({ toast }: ScreenProps) {
     return h(Panel, { title: "Team Members", desc: "People with access to DriveOS and their storage footprint.", action: h("button", { className: "btn sm primary", onClick: () => toast("Invite sent", "user", "accent") }, h(Icon, { name: "plus", size: 14 }), "Invite") },
       h("table", { className: "tbl" },
         h("thead", null, h("tr", null, ["Member", "Role", "Location", "Drives", "Storage", "Access"].map((c, i) => h("th", { key: i, className: i === 3 || i === 4 ? "num" : "" }, c)))),
@@ -123,12 +125,12 @@ const h: any = React.createElement;
         h("div", { key: i, className: "spread", style: { padding: "13px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
           h("div", { className: "row", style: { gap: 12 } },
             h("div", { style: { width: 36, height: 36, borderRadius: 9, display: "grid", placeItems: "center", flexShrink: 0, background: a.status === "online" ? "var(--ok-soft)" : "var(--bg-panel-2)", color: a.status === "online" ? "var(--ok)" : "var(--tx-dim)" } }, h(Icon, { name: "cpu", size: 17 })),
-            h("div", null, h("div", { className: "hi mono", style: { fontWeight: 600, fontSize: 13 } }, a.name),
-              h("div", { className: "muted", style: { fontSize: 11.5 } }, a.os + " · " + DB.teamById[a.user].name + " · " + a.drives + " drives"))),
+              h("div", null, h("div", { className: "hi mono", style: { fontWeight: 600, fontSize: 13 } }, a.name),
+              h("div", { className: "muted", style: { fontSize: 11.5 } }, a.os + " · " + ((DB.teamById as Record<string, any>)[a.user]?.name || a.user) + " · " + a.drives + " drives"))),
           h("div", { className: "row", style: { gap: 10 } }, h("span", { className: "mono dim", style: { fontSize: 11 } }, "agent v" + a.v), h(StatusBadge, { status: a.status }))))));
   }
 
-  function TemplateSettings({ toast }) {
+  function TemplateSettings({ toast }: ScreenProps) {
     return h(Panel, { title: "Folder Templates", desc: "Structures used by the Create Project wizard.", action: h("button", { className: "btn sm primary", onClick: () => toast("New template", "plus", "accent") }, h(Icon, { name: "plus", size: 14 }), "New Template") },
       h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 } }, DB.templates.filter((t) => t.id !== "custom").map((t) =>
         h("div", { key: t.id, className: "spread", style: { padding: "14px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
@@ -137,7 +139,7 @@ const h: any = React.createElement;
   }
 
   function RuleSettings() {
-    const [rules, setRules] = React.useState({ raw: true, proxy: true, cache: true, finals: true, license: true, abandoned: false });
+    const [rules, setRules] = React.useState<ToggleMap>({ raw: true, proxy: true, cache: true, finals: true, license: true, abandoned: false });
     const items = [
       ["raw", "Protect RAW footage", "Never auto-delete original camera files", "shield"],
       ["proxy", "Auto-quarantine proxies after delivery", "Once a project is Delivered", "layers"],
@@ -147,7 +149,7 @@ const h: any = React.createElement;
       ["abandoned", "Flag abandoned project copies", "No edits in 60+ days with archive copy present", "box"],
     ];
     return h(Panel, { title: "Cleanup Rules", desc: "Global defaults applied across all projects. Per-project overrides are set in the wizard." },
-      items.map(([k, t, d]) => h(Row, { key: k, title: t, desc: d, control: h(Toggle, { on: rules[k], onChange: (v) => setRules((r) => ({ ...r, [k]: v })) }) })));
+      items.map(([k, t, d]) => h(Row, { key: k, title: t, desc: d, control: h(Toggle, { on: rules[k], onChange: (v: boolean) => setRules((r: ToggleMap) => ({ ...r, [k]: v })) }) })));
   }
 
   function ClassifySettings() {
@@ -167,7 +169,7 @@ const h: any = React.createElement;
           h("button", { className: "btn sm ghost icon" }, h(Icon, { name: "settings", size: 14 }))))));
   }
 
-  function CloudSettings({ toast }) {
+  function CloudSettings({ toast }: ScreenProps) {
     return h(Panel, { title: "Cloud Integrations", desc: "Connected cloud storage providers." },
       h("div", { className: "spread", style: { padding: "15px 16px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--cloud-line)" } },
         h("div", { className: "row", style: { gap: 13 } }, h("div", { style: { width: 42, height: 42, borderRadius: 11, display: "grid", placeItems: "center", background: "var(--cloud-soft)", color: "var(--cloud)", border: "1px solid var(--cloud-line)" } }, h(Icon, { name: "cloud", size: 20 })),
@@ -181,7 +183,7 @@ const h: any = React.createElement;
       h("div", { style: { display: "flex", flexDirection: "column", gap: 11 } }, DB.tiers.map((t) =>
         h("div", { key: t.key, className: "spread", style: { padding: "14px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
           h("div", { className: "row", style: { gap: 12 } }, h("span", { style: { width: 12, height: 12, borderRadius: 3, background: getVar(t.color), flexShrink: 0 } }),
-            h("div", null, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 13.5 } }, TIER_META[t.key].label + " — " + t.label.split("— ")[1]), h("div", { className: "muted", style: { fontSize: 11.5 } }, t.desc))),
+            h("div", null, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 13.5 } }, ((TIER_META as Record<string, any>)[t.key]?.label || t.key) + " — " + t.label.split("— ")[1]), h("div", { className: "muted", style: { fontSize: 11.5 } }, t.desc))),
           h("div", { className: "row", style: { gap: 14 } }, h("span", { className: "mono dim", style: { fontSize: 11.5 } }, fmtTB(t.usedTB) + " / " + t.capTB + " TB"), h("div", { style: { width: 90 } }, h(Bar, { value: t.usedTB, max: t.capTB, kind: tierKind(pct(t.usedTB, t.capTB)), height: 6 })))))));
   }
 
@@ -191,7 +193,7 @@ const h: any = React.createElement;
     const [autoSafe, setAutoSafe] = React.useState(true);
     return h(Panel, { title: "Quarantine & Safe Delete", desc: "The safety net. Quarantine is always the primary action — permanent deletion is protected." },
       h(Row, { title: "Quarantine retention period", desc: "How long files stay restorable before they can be purged.", control: h("div", { className: "row", style: { gap: 12 } },
-        h("input", { type: "range", min: 7, max: 90, step: 1, value: days, onChange: (e) => setDays(+e.target.value), style: { width: 160, accentColor: getVar("var(--accent)") } }),
+        h("input", { type: "range", min: 7, max: 90, step: 1, value: days, onChange: (e: React.ChangeEvent<HTMLInputElement>) => setDays(+e.target.value), style: { width: 160, accentColor: getVar("var(--accent)") } }),
         h("span", { className: "mono hi", style: { fontWeight: 600, width: 60 } }, days + " days")) }),
       h(Row, { title: "Auto-quarantine safe categories", desc: "Let the agent quarantine regenerable cache without approval.", control: h(Toggle, { on: autoSafe, onChange: setAutoSafe }) }),
       h(Row, { title: "Require confirmation for permanent delete", desc: "Force a typed confirmation before any purge.", control: h(Toggle, { on: confirm, onChange: setConfirm }) }),
@@ -201,10 +203,10 @@ const h: any = React.createElement;
   }
 
   function NotifSettings() {
-    const [n, setN] = React.useState({ full: true, single: true, archive: true, weekly: true, agent: false });
+    const [n, setN] = React.useState<ToggleMap>({ full: true, single: true, archive: true, weekly: true, agent: false });
     const items = [["full", "Drive over 90% full", "Alert when any working drive is nearly full"], ["single", "Single-copy file detected", "Files with no archive or cloud backup"], ["archive", "Project ready to archive", "When a delivered project passes readiness checks"], ["weekly", "Weekly storage digest", "Health summary every Monday"], ["agent", "Agent went offline", "When a machine stops reporting"]];
     const rows = items.map(([k, t, d]) => {
-      const control = h(Toggle, { on: n[k], onChange: (v) => setN((x) => ({ ...x, [k]: v })) });
+      const control = h(Toggle, { on: n[k], onChange: (v: boolean) => setN((x: ToggleMap) => ({ ...x, [k]: v })) });
       return h(Row, { key: k, title: t, desc: d, control });
     });
     return h(Panel, { title: "Notifications", desc: "What DriveOS alerts you about." }, rows);

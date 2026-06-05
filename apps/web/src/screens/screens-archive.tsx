@@ -35,6 +35,8 @@ import {
   getVar
 } from "@/components";
 const h: any = React.createElement;
+type ScreenProps = Record<string, any>;
+type ArchiveModalState = { p: any } | null;
 
 
 
@@ -53,12 +55,12 @@ const h: any = React.createElement;
   ];
 
   // ---- Archive Checklist Modal ----
-  function ArchiveChecklistModal({ p, onClose, toast, go }) {
-    const initial = CHECKLIST.map((_, i) => i < 5 || (p && p.archiveReady > 80 && i < 9));
+  function ArchiveChecklistModal({ p, onClose, toast, go }: ScreenProps) {
+    const initial = CHECKLIST.map((_, i: number) => i < 5 || (p && p.archiveReady > 80 && i < 9));
     const [done, setDone] = React.useState(initial);
     const complete = done.filter(Boolean).length;
     const allDone = complete === CHECKLIST.length;
-    const toggle = (i) => setDone((d) => d.map((x, j) => j === i ? !x : x));
+    const toggle = (i: number) => setDone((d: boolean[]) => d.map((x: boolean, j: number) => j === i ? !x : x));
 
     const footer = [
       h("div", { key: "p", className: "row", style: { gap: 10, marginRight: "auto" } },
@@ -80,7 +82,7 @@ const h: any = React.createElement;
   }
 
   // ---- Archive drive card ----
-  function ArchiveDriveCard({ d, go }) {
+  function ArchiveDriveCard({ d, go }: ScreenProps) {
     const verified = d.id === "vault-a" ? "47 days ago" : d.id === "brandon-arc" ? "6 days ago" : "21 days ago";
     return h("div", { className: "card fade-up", onClick: () => go("drive", { id: d.id }), style: { cursor: "pointer" } },
       h("div", { className: "card-pad" },
@@ -98,8 +100,8 @@ const h: any = React.createElement;
           h("span", { className: "mono dim" }, verified))));
   }
 
-  function ArchiveScreen({ go, toast }) {
-    const [modal, setModal] = React.useState(null);
+  function ArchiveScreen({ go, toast }: ScreenProps) {
+    const [modal, setModal] = React.useState<ArchiveModalState>(null);
     const ready = DB.projects.filter((p) => p.status === "ready" || (p.status === "delivered" && p.archiveReady >= 80));
     const archiveDrives = DB.drives.filter((d) => d.tier === "cold");
 
@@ -113,7 +115,7 @@ const h: any = React.createElement;
       h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "var(--gap)", marginBottom: "var(--gap)" } },
         akpi("Ready to Archive", ready.length, "archive", "var(--auto)"),
         akpi("Archive Drives", archiveDrives.length, "server", "var(--tx-hi)"),
-        akpi("Cold Storage", fmtTB(DB.tiers.find((t) => t.key === "cold").usedTB), "database", "var(--tx-hi)"),
+        akpi("Cold Storage", fmtTB((DB.tiers.find((t) => t.key === "cold") || { usedTB: 0 }).usedTB), "database", "var(--tx-hi)"),
         akpi("At-risk Projects", 2, "alert", "var(--risk)")),
 
       // ready to archive
@@ -129,8 +131,8 @@ const h: any = React.createElement;
       modal && h(ArchiveChecklistModal, { p: modal.p, onClose: () => setModal(null), toast, go }));
   }
 
-  function ReadyCard({ p, go, onStart }) {
-    const risks = [];
+  function ReadyCard({ p, go, onStart }: ScreenProps) {
+    const risks: string[] = [];
     if (p.id === "show-x-old") risks.push("Only one copy exists");
     if (p.archiveReady < 90) risks.push("Cloud copy not verified");
     if (p.structure < 60) risks.push("Project files incomplete");
@@ -156,7 +158,7 @@ const h: any = React.createElement;
           h("button", { className: "btn sm", onClick: () => go("project", { id: p.id }) }, "Open"))));
   }
 
-  function akpi(label, value, icon, color) {
+  function akpi(label: React.ReactNode, value: React.ReactNode, icon: string, color: string) {
     return h("div", { className: "card card-pad fade-up", style: { display: "flex", alignItems: "center", gap: 13 } },
       h("div", { style: { width: 38, height: 38, borderRadius: 10, display: "grid", placeItems: "center", flexShrink: 0, background: "var(--bg-surface)", color, border: "1px solid var(--line)" } }, h(Icon, { name: icon, size: 18 })),
       h("div", null, h("div", { className: "stat-num", style: { fontSize: 21, color } }, value), h("div", { className: "eyebrow", style: { fontSize: 9.5, marginTop: 1 } }, label)));

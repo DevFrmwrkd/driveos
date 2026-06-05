@@ -3,7 +3,7 @@
 import React, { ReactNode, createContext, useContext } from "react";
 import { ConvexProvider, ConvexReactClient } from "convex/react";
 
-const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL || "http://localhost:3001";
+const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL || "https://determined-anaconda-827.convex.cloud";
 const convexClient = new ConvexReactClient(convexUrl);
 
 const ConvexContext = createContext<{ isLive: boolean; client: ConvexReactClient }>({

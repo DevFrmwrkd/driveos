@@ -36,6 +36,9 @@ import {
 } from "@/components";
 const h: any = React.createElement;
 
+type ScreenProps = Record<string, any>;
+type AnyRecord = Record<string, any>;
+
 
 
 /* ============================================================
@@ -43,23 +46,23 @@ const h: any = React.createElement;
    ============================================================ */
 
 
-function miniStat(label, value, color) {
+function miniStat(label: React.ReactNode, value: React.ReactNode, color: string) {
   return h("div", { style: { background: "var(--bg-surface)", border: "1px solid var(--line)", borderRadius: "var(--r-sm)", padding: "9px 11px" } },
     h("div", { className: "row", style: { gap: 6, marginBottom: 3 } },
       h("span", { style: { width: 7, height: 7, borderRadius: 2, background: color, flexShrink: 0 } }),
       h("span", { style: { fontSize: 10.5, color: "var(--tx-dim)", fontFamily: "var(--font-mono)", letterSpacing: ".02em", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, label)),
     h("div", { className: "stat-num", style: { fontSize: 16 } }, value));
 }
-function recoverTile(label, value, icon, color, onClick) {
+function recoverTile(label: React.ReactNode, value: React.ReactNode, icon: string, color: string, onClick: () => void) {
   return h("div", { onClick, style: { flex: 1, background: "var(--bg-surface)", border: "1px solid var(--line)", borderRadius: "var(--r)", padding: "12px 13px", cursor: "pointer", transition: "border-color .12s" },
-    onMouseEnter: (e) => (e.currentTarget.style.borderColor = "var(--line-strong)"), onMouseLeave: (e) => (e.currentTarget.style.borderColor = "var(--line)") },
+    onMouseEnter: (e: React.MouseEvent<HTMLDivElement>) => (e.currentTarget.style.borderColor = "var(--line-strong)"), onMouseLeave: (e: React.MouseEvent<HTMLDivElement>) => (e.currentTarget.style.borderColor = "var(--line)") },
     h("div", { className: "row", style: { gap: 7, marginBottom: 7 } },
       h(Icon, { name: icon, size: 14, style: { color } }),
       h("span", { style: { fontSize: 11, color: "var(--tx-mut)" } }, label)),
     h("div", { className: "stat-num", style: { fontSize: 19 } }, value));
 }
-function drivePips(drives) {
-  return drives.slice(0, 10).map((d, i) => h("span", { key: i, title: d.name,
+function drivePips(drives: any[]) {
+  return drives.slice(0, 10).map((d: any, i: number) => h("span", { key: i, title: d.name,
     style: { width: 7, height: 14, borderRadius: 2, background: d.status === "online" ? "var(--ok)" : d.status === "cloud" ? "var(--cloud)" : d.status === "uninit" ? "var(--warn)" : "var(--tx-faint)" } }));
 }
 
@@ -93,7 +96,7 @@ function HealthCard() {
 }
 
 // ---- Storage map ----
-function StorageMapCard({ go }) {
+function StorageMapCard({ go }: ScreenProps) {
   
   const ftData = DB.fileTypes.map((f) => ({ label: f.label, value: f.tb, color: getVar(f.color) }));
   const legend = h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "8px 18px" } },
@@ -124,7 +127,7 @@ function TiersCard() {
 }
 
 // ---- Cloud mini ----
-function CloudMiniCard({ go }) {
+function CloudMiniCard({ go }: ScreenProps) {
   const right = h("button", { className: "btn sm ghost", onClick: () => go("cloud") }, "Open", h(Icon, { name: "chevR", size: 13 }));
   const body = h("div", { className: "card-pad", style: { display: "flex", flexDirection: "column", gap: 14 } },
     h("div", { className: "spread", style: { alignItems: "flex-end" } },
@@ -140,7 +143,7 @@ function CloudMiniCard({ go }) {
 }
 
 // ---- Offenders ----
-function OffendersCard({ go }) {
+function OffendersCard({ go }: ScreenProps) {
   const offenders = [...DB.projects].sort((a, b) => b.sizeTB - a.sizeTB).slice(0, 5);
   const rows = offenders.map((p) => h("div", { key: p.id, onClick: () => go("project", { id: p.id }), className: "offender-row", style: { padding: "9px 18px", cursor: "pointer" } },
     h("div", { style: { flex: 1, minWidth: 0 } },
@@ -153,7 +156,7 @@ function OffendersCard({ go }) {
 }
 
 // ---- Duplicate & cleanup ----
-function DupCleanupCard({ go }) {
+function DupCleanupCard({ go }: ScreenProps) {
   return h("div", { className: "card card-pad fade-up", style: { display: "flex", flexDirection: "column", gap: 14 } },
     h("div", { className: "spread" }, h("div", { className: "card-title" }, "Duplicate & Cleanup"),
       h(Badge, { kind: "ok", icon: "shieldCheck" }, "Safe to recover")),
@@ -168,7 +171,7 @@ function DupCleanupCard({ go }) {
 }
 
 // ---- Ready to archive ----
-function ReadyArchiveCard({ go }) {
+function ReadyArchiveCard({ go }: ScreenProps) {
   const list = DB.projects.filter((p) => p.status === "ready" || p.archiveReady >= 80);
   const rows = list.map((p) => h("div", { key: p.id, className: "offender-row spread", onClick: () => go("project", { id: p.id }), style: { padding: "10px 18px", cursor: "pointer" } },
     h("div", { style: { minWidth: 0 } },
@@ -194,7 +197,7 @@ function TeamCard() {
 }
 
 // ---- Right rail ----
-function WarningCard({ w, go, toast }) {
+function WarningCard({ w, go, toast }: ScreenProps) {
   const handle = () => {
     const [type, id] = w.target.split(":");
     if (type === "drive") go("drive", { id });
@@ -211,18 +214,18 @@ function WarningCard({ w, go, toast }) {
           w.action, h(Icon, { name: "arrowR", size: 13 })))));
 }
 
-function WarningsRail({ go, toast }) {
+function WarningsRail({ go, toast }: ScreenProps) {
   
   const body = h("div", { style: { padding: 12, display: "flex", flexDirection: "column", gap: 8, maxHeight: 440, overflowY: "auto" } },
     DB.warnings.map((w) => h(WarningCard, { key: w.id, w, go, toast })));
   return cardShell("Active Warnings", "alert", "var(--risk)", h(Badge, { kind: "risk" }, DB.warnings.length), body);
 }
 
-function ActivityRail({ go }) {
+function ActivityRail({ go }: ScreenProps) {
   
   const rows = DB.driveEvents.map((e, i) => {
-    const d = DB.driveById[e.drive] || { id: e.drive, name: e.drive, status: "offline" };
-    const meta = ({ connected: ["ok", "checkCircle"], scan: ["accent", "refresh"], offline: ["", "x"], cloud: ["cloud", "cloud"] })[e.event] || ["", "hdd"];
+    const d = (DB.driveById as AnyRecord)[e.drive] || { id: e.drive, name: e.drive, status: "offline" };
+    const meta = ({ connected: ["ok", "checkCircle"], scan: ["accent", "refresh"], offline: ["", "x"], cloud: ["cloud", "cloud"] } as Record<string, string[]>)[e.event] || ["", "hdd"];
     const bg = meta[0] ? "var(--" + (meta[0] === "accent" ? "accent" : meta[0]) + "-soft)" : "var(--bg-surface)";
     const fg = meta[0] ? "var(--" + (meta[0] === "accent" ? "accent-hi" : meta[0]) + ")" : "var(--tx-dim)";
     return h("div", { key: i, className: "row", onClick: () => go("drive", { id: e.drive }),
@@ -238,7 +241,7 @@ function ActivityRail({ go }) {
 }
 
 // ============================================================
-function Dashboard({ go, toast }) {
+function Dashboard({ go, toast }: ScreenProps) {
   const actions = [
     { label: "Scan Drive", icon: "refresh", onClick: () => toast("Scan started on CJ Working SSD", "refresh", "accent") },
     { label: "Create Project", icon: "plus", primary: true, onClick: () => go("wizard") },

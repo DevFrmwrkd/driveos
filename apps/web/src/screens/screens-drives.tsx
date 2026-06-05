@@ -36,6 +36,9 @@ import {
 } from "@/components";
 const h: any = React.createElement;
 
+type ScreenProps = Record<string, any>;
+type AnyRecord = Record<string, any>;
+
 
 
 /* ============================================================
@@ -45,11 +48,11 @@ const h: any = React.createElement;
 
   
 
-  const TIER_LABEL = { hot: "Hot", warm: "Warm", cloud: "Cloud", cold: "Cold" };
-  const driveIcon = (d) => d.status === "cloud" ? "cloud" : "hdd";
+  const TIER_LABEL: Record<string, string> = { hot: "Hot", warm: "Warm", cloud: "Cloud", cold: "Cold" };
+  const driveIcon = (d: any) => d.status === "cloud" ? "cloud" : "hdd";
 
   // ---- Capacity meter ----
-  function CapMeter({ d, height = 8 }) {
+  function CapMeter({ d, height = 8 }: ScreenProps) {
     const p = pct(d.usedTB, d.capTB);
     return h("div", null,
       h("div", { className: "spread", style: { fontSize: 11.5, marginBottom: 5 } },
@@ -62,12 +65,12 @@ const h: any = React.createElement;
   }
 
   // ---- Drive card ----
-  function DriveCard({ d, go }) {
+  function DriveCard({ d, go }: ScreenProps) {
     const owner = DB.teamById[d.owner] || DB.teamById.founder || { name: "Studio" };
     return h("div", { className: "card fade-up", onClick: () => go("drive", { id: d.id }),
       style: { cursor: "pointer", display: "flex", flexDirection: "column", transition: "border-color .14s, transform .1s" },
-      onMouseEnter: (e) => (e.currentTarget.style.borderColor = "var(--line-strong)"),
-      onMouseLeave: (e) => (e.currentTarget.style.borderColor = "var(--line)") },
+      onMouseEnter: (e: React.MouseEvent<HTMLDivElement>) => (e.currentTarget.style.borderColor = "var(--line-strong)"),
+      onMouseLeave: (e: React.MouseEvent<HTMLDivElement>) => (e.currentTarget.style.borderColor = "var(--line)") },
       h("div", { className: "card-pad", style: { paddingBottom: 14 } },
         h("div", { className: "spread", style: { marginBottom: 14 } },
           h("div", { className: "row", style: { gap: 11, minWidth: 0 } },
@@ -82,7 +85,7 @@ const h: any = React.createElement;
         d.status === "uninit"
           ? h("div", { style: { padding: "16px 0", textAlign: "center" } },
               h("div", { className: "muted", style: { fontSize: 12.5, marginBottom: 12 } }, "New " + fmtTB(d.capTB) + " drive detected. Not yet tracked."),
-              h("button", { className: "btn primary sm", onClick: (e) => { e.stopPropagation(); go("drive", { id: d.id }); } }, h(Icon, { name: "zap", size: 14 }), "Initialize Drive"))
+              h("button", { className: "btn primary sm", onClick: (e: React.MouseEvent<HTMLButtonElement>) => { e.stopPropagation(); go("drive", { id: d.id }); } }, h(Icon, { name: "zap", size: 14 }), "Initialize Drive"))
           : h(CapMeter, { d })),
       d.status !== "uninit" && h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", borderTop: "1px solid var(--line)" } },
         miniCell("Projects", d.projects.length, "var(--tx-hi)"),
@@ -94,14 +97,14 @@ const h: any = React.createElement;
           h("span", { className: "dim", style: { fontSize: 11.5 } }, "· " + d.location)),
         h(RiskBadge, { risk: d.risk })));
   }
-  function miniCell(label, value, color) {
+  function miniCell(label: React.ReactNode, value: React.ReactNode, color: string) {
     return h("div", { style: { padding: "11px 14px", borderRight: "1px solid var(--line)", textAlign: "center" } },
       h("div", { className: "eyebrow", style: { fontSize: 9, marginBottom: 3 } }, label),
       h("div", { className: "stat-num", style: { fontSize: 15, color } }, value));
   }
 
   // ---- Overview ----
-  function DrivesScreen({ go }) {
+  function DrivesScreen({ go }: ScreenProps) {
     const [owner, setOwner] = React.useState("all");
     const [loc, setLoc] = React.useState("all");
     const [status, setStatus] = React.useState("all");
@@ -131,9 +134,9 @@ const h: any = React.createElement;
 
       h("div", { className: "filter-bar" },
         h(Icon, { name: "filter", size: 15, style: { color: "var(--tx-dim)" } }),
-        h("select", { className: "select", value: owner, onChange: (e) => setOwner(e.target.value) },
+        h("select", { className: "select", value: owner, onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setOwner(e.target.value) },
           h("option", { value: "all" }, "All owners"), DB.team.map((m) => h("option", { key: m.id, value: m.id }, m.name))),
-        h("select", { className: "select", value: loc, onChange: (e) => setLoc(e.target.value) },
+        h("select", { className: "select", value: loc, onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setLoc(e.target.value) },
           h("option", { value: "all" }, "All locations"), locations.map((l) => h("option", { key: l, value: l }, l))),
         h(Seg, { value: status, onChange: setStatus, options: [
           { value: "all", label: "All" }, { value: "online", label: "Online" }, { value: "offline", label: "Offline" }, { value: "cloud", label: "Cloud" }, { value: "uninit", label: "New" }] }),
@@ -147,13 +150,13 @@ const h: any = React.createElement;
           : h(DriveTable, { list, go }));
   }
 
-  function DriveTable({ list, go }) {
+  function DriveTable({ list, go }: ScreenProps) {
     return h("div", { className: "card", style: { overflow: "hidden" } },
       h("table", { className: "tbl" },
         h("thead", null, h("tr", null,
           ["Drive", "Owner", "Location", "Status", "Capacity", "Used", "Risk", "Dupes", "Cleanup"].map((c, i) =>
             h("th", { key: i, className: i >= 4 && i !== 6 ? "num" : "" }, c)))),
-        h("tbody", null, list.map((d) => {
+        h("tbody", null, list.map((d: any) => {
           const p = pct(d.usedTB, d.capTB);
           const owner = DB.teamById[d.owner] || DB.teamById.founder || { name: "Studio" };
           return h("tr", { key: d.id, onClick: () => go("drive", { id: d.id }) },
@@ -173,7 +176,7 @@ const h: any = React.createElement;
         }))));
   }
 
-  function kpiMini(label, value, kind, icon) {
+  function kpiMini(label: React.ReactNode, value: React.ReactNode, kind: string, icon: string) {
     const color = kind ? "var(--" + (kind === "warn" ? "warn" : kind === "ok" ? "ok" : kind === "cloud" ? "cloud" : kind) + ")" : "var(--tx-hi)";
     return h("div", { className: "card card-pad fade-up", style: { display: "flex", alignItems: "center", gap: 13 } },
       h("div", { style: { width: 38, height: 38, borderRadius: 10, display: "grid", placeItems: "center", flexShrink: 0,
@@ -192,9 +195,9 @@ const h: any = React.createElement;
   // ============================================================
   //  DRIVE DETAIL
   // ============================================================
-  function driveFileTypes(d) {
+  function driveFileTypes(d: any) {
     // synthesize per-drive distribution scaled to usedTB
-    const weights = { raw: 0.5, proxy: 0.12, cache: 0.1, export: 0.09, stock: 0.08, audio: 0.05, gfx: 0.04, unknown: 0.02 };
+    const weights: Record<string, number> = { raw: 0.5, proxy: 0.12, cache: 0.1, export: 0.09, stock: 0.08, audio: 0.05, gfx: 0.04, unknown: 0.02 };
     return DB.fileTypes.map((f) => ({ label: f.label, value: +(d.usedTB * (weights[f.key] || 0.03)).toFixed(2), color: getVar(f.color), key: f.key }));
   }
   const FOLDERS = [
@@ -203,8 +206,8 @@ const h: any = React.createElement;
     { name: "04_ASSETS/STOCK_FOOTAGE", type: "stock", w: 0.08 }, { name: "07_EXPORTS/FINAL", type: "export", w: 0.07 },
   ];
 
-  function DriveDetail({ params, go, toast }) {
-    const d = DB.driveById[params.id];
+  function DriveDetail({ params, go, toast }: ScreenProps) {
+    const d = (DB.driveById as AnyRecord)[params.id];
     if (!d) return h("div", { className: "page-inner" }, h("div", { className: "muted" }, "Drive not found."));
     const owner = DB.teamById[d.owner] || DB.teamById.founder || { name: "Studio" };
     const ft = driveFileTypes(d);
@@ -234,14 +237,14 @@ const h: any = React.createElement;
       stripCell("Safe Cleanup", fmtTB(d.cleanTB), "broom", "var(--ok)"));
 
     const projBreakdown = cardShell("Storage by Project", "folder", "var(--tx-mut)", null,
-      h("div", { style: { padding: "8px 0" } }, d.projects.map((pid) => {
-        const pr = DB.projectById[pid] || { name: pid, sizeTB: d.usedTB / d.projects.length, client: "—" };
+      h("div", { style: { padding: "8px 0" } }, d.projects.map((pid: string) => {
+        const pr = (DB.projectById as AnyRecord)[pid] || { name: pid, sizeTB: d.usedTB / d.projects.length, client: "—" };
         const share = pr.sizeTB;
-        return h("div", { key: pid, className: "offender-row", onClick: () => DB.projectById[pid] && go("project", { id: pid }), style: { padding: "10px 18px", cursor: DB.projectById[pid] ? "pointer" : "default" } },
+        return h("div", { key: pid, className: "offender-row", onClick: () => (DB.projectById as AnyRecord)[pid] && go("project", { id: pid }), style: { padding: "10px 18px", cursor: (DB.projectById as AnyRecord)[pid] ? "pointer" : "default" } },
           h("div", { className: "spread", style: { marginBottom: 5 } },
             h("span", { className: "hi", style: { fontWeight: 600, fontSize: 13 } }, pr.name),
             h("span", { className: "mono", style: { fontSize: 12, color: "var(--tx)" } }, fmtTB(share))),
-          h(Bar, { value: share, max: Math.max(...d.projects.map((x) => (DB.projectById[x] || { sizeTB: 1 }).sizeTB)), height: 5 }));
+          h(Bar, { value: share, max: Math.max(...d.projects.map((x: string) => ((DB.projectById as AnyRecord)[x] || { sizeTB: 1 }).sizeTB)), height: 5 }));
       })));
 
     const typeCard = cardShell("File-Type Breakdown", "pieChart", "var(--tx-mut)", h(Badge, { square: true }, fmtTB(d.usedTB)),
@@ -317,14 +320,14 @@ const h: any = React.createElement;
       scans);
   }
 
-  function stripCell(label, value, icon, color) {
+  function stripCell(label: React.ReactNode, value: React.ReactNode, icon: string, color = "") {
     return h("div", null,
       h("div", { className: "row", style: { gap: 6, marginBottom: 5 } }, h(Icon, { name: icon, size: 13, style: { color: color || "var(--tx-dim)" } }),
         h("span", { className: "eyebrow", style: { fontSize: 9.5 } }, label)),
       h("div", { className: "stat-num", style: { fontSize: 19, color: color || "var(--tx-hi)" } }, value));
   }
 
-  function UninitDrive({ d, go, toast }) {
+  function UninitDrive({ d, go, toast }: ScreenProps) {
     const [step, setStep] = React.useState(0);
     const owner = DB.teamById[d.owner] || DB.teamById.founder || { name: "Studio" };
     return h("div", { className: "page-inner" },

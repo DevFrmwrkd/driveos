@@ -35,6 +35,8 @@ import {
   getVar
 } from "@/components";
 const h: any = React.createElement;
+type ScreenProps = Record<string, any>;
+type RoleMeta = Record<string, [string, string, string]>;
 
 
 
@@ -45,15 +47,15 @@ const h: any = React.createElement;
 
   const S = DB.searchSample;
 
-  const ROLE_META = { working: ["ok", "Working copy", "hdd"], duplicate: ["warn", "Stale duplicate", "copy"], archive: ["auto", "Archive copy", "archive"] };
+  const ROLE_META: RoleMeta = { working: ["ok", "Working copy", "hdd"], duplicate: ["warn", "Stale duplicate", "copy"], archive: ["auto", "Archive copy", "archive"] };
 
-  function SearchScreen({ go, toast }) {
+  function SearchScreen({ go, toast }: ScreenProps) {
     const [q, setQ] = React.useState("A001_C004");
-    const ref = React.useRef(null);
+    const ref = React.useRef<HTMLInputElement | null>(null);
     React.useEffect(() => { if (ref.current) ref.current.focus(); }, []);
 
     const ql = q.trim().toLowerCase();
-    const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
     const showSample = ql && norm("A001_C004").includes(norm(q)) && norm(q).length > 1;
     const projHits = ql ? DB.projects.filter((p) => [p.name, p.client, p.show].filter(Boolean).join(" ").toLowerCase().includes(ql)) : [];
     const driveHits = ql ? DB.drives.filter((d) => [d.name, d.model, d.id].filter(Boolean).join(" ").toLowerCase().includes(ql)) : [];
@@ -65,13 +67,13 @@ const h: any = React.createElement;
       h("div", { className: "card fade-up", style: { marginBottom: "var(--gap)" } },
         h("div", { className: "row", style: { padding: "4px 8px 4px 18px", gap: 12 } },
           h(Icon, { name: "search", size: 20, style: { color: "var(--tx-mut)" } }),
-          h("input", { ref, className: "input", style: { border: "none", background: "transparent", height: 56, fontSize: 18, fontFamily: "var(--font-mono)" }, placeholder: "A001_C004, hash, project name…", value: q, onChange: (e) => setQ(e.target.value) }),
+          h("input", { ref, className: "input", style: { border: "none", background: "transparent", height: 56, fontSize: 18, fontFamily: "var(--font-mono)" }, placeholder: "A001_C004, hash, project name…", value: q, onChange: (e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value) }),
           q && h("button", { className: "btn ghost icon", onClick: () => setQ("") }, h(Icon, { name: "x", size: 18 })))),
 
       // quick chips
       !ql && h("div", null,
         h("div", { className: "eyebrow", style: { marginBottom: 10 } }, "Try searching"),
-        h("div", { className: "chip-row" }, ["A001_C004", "Show X", "CJ Working SSD", "city_timelapse", "xxh64:9f3a"].map((s) =>
+        h("div", { className: "chip-row" }, ["A001_C004", "Show X", "CJ Working SSD", "city_timelapse", "xxh64:9f3a"].map((s: string) =>
           h("button", { key: s, className: "tag", style: { cursor: "pointer", height: 30, padding: "0 12px" }, onClick: () => setQ(s) }, h(Icon, { name: "search", size: 12 }), s)))),
 
       // sample file result
@@ -96,7 +98,7 @@ const h: any = React.createElement;
         h("div", { className: "card" }, h("div", { className: "empty" }, h("div", { className: "empty-ico" }, h(Icon, { name: "search", size: 24 })), h("h3", null, "No matches for “" + q + "”"), h("div", { className: "muted" }, "Try a filename, project, drive, or a fingerprint hash."))));
   }
 
-  function FileResult({ go, toast }) {
+  function FileResult({ go, toast }: ScreenProps) {
     return h("div", { style: { display: "flex", flexDirection: "column", gap: "var(--gap)" } },
       // file header card
       h("div", { className: "card fade-up" },
@@ -131,10 +133,10 @@ const h: any = React.createElement;
         xref("Cloud Copy", "Exists · Google Drive", "cloud", "var(--cloud)", () => go("cloud")),
         xref("Archive Copy", "Verified · Brandon Arc 01", "archive", "var(--auto)", () => go("archive"))));
   }
-  function meta(label, value) {
+  function meta(label: React.ReactNode, value: React.ReactNode) {
     return h("span", { className: "muted" }, label + ": ", h("b", { className: "hi", style: { fontWeight: 600 } }, value));
   }
-  function xref(label, value, icon, color, onClick) {
+  function xref(label: React.ReactNode, value: React.ReactNode, icon: string, color: string, onClick: () => void) {
     return h("div", { className: "card card-pad fade-up", onClick, style: { cursor: "pointer", display: "flex", alignItems: "center", gap: 12 } },
       h("div", { style: { width: 38, height: 38, borderRadius: 10, display: "grid", placeItems: "center", flexShrink: 0, background: "var(--bg-surface)", color, border: "1px solid var(--line)" } }, h(Icon, { name: icon, size: 18 })),
       h("div", { style: { minWidth: 0 } }, h("div", { className: "eyebrow", style: { fontSize: 9, marginBottom: 2 } }, label), h("div", { className: "hi", style: { fontWeight: 600, fontSize: 12.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, value)));

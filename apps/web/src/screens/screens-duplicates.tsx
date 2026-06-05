@@ -36,6 +36,9 @@ import {
 } from "@/components";
 const h: any = React.createElement;
 
+type ScreenProps = Record<string, any>;
+type AnyRecord = Record<string, any>;
+
 
 
 /* ============================================================
@@ -45,9 +48,9 @@ const h: any = React.createElement;
 
   
 
-  const KIND_LABEL = { exact: "Exact match", likely: "Likely duplicate", samename: "Same name, diff. content", stock: "Stock duplicated across projects" };
+  const KIND_LABEL: Record<string, string> = { exact: "Exact match", likely: "Likely duplicate", samename: "Same name, diff. content", stock: "Stock duplicated across projects" };
 
-  function fmtDuplicateSize(gb) {
+  function fmtDuplicateSize(gb: number) {
     if (gb >= 1000) return fmtGB(gb);
     if (gb >= 10) return Math.round(gb) + " GB";
     if (gb >= 1) return gb.toFixed(1) + " GB";
@@ -56,17 +59,17 @@ const h: any = React.createElement;
     return Math.max(1, Math.round(mb * 1024)) + " KB";
   }
 
-  function ClusterCard({ c, go, toast }) {
-    const [roles, setRoles] = React.useState(() => c.locations.map((l) => l.role));
-    const [resolved, setResolved] = React.useState(null);
-    const keepCount = roles.filter((r) => r === "keep").length;
-    const quarCount = roles.filter((r) => r === "quarantine").length;
-    const recover = c.locations.reduce((s, l, i) => s + (roles[i] === "quarantine" ? c.sizeGB : 0), 0);
-    const riskMeta = RISK_META[c.risk] || RISK_META.review;
+  function ClusterCard({ c, go, toast }: ScreenProps) {
+    const [roles, setRoles] = React.useState<string[]>(() => c.locations.map((l: any) => l.role));
+    const [resolved, setResolved] = React.useState<string | null>(null);
+    const keepCount = roles.filter((r: string) => r === "keep").length;
+    const quarCount = roles.filter((r: string) => r === "quarantine").length;
+    const recover = c.locations.reduce((s: number, l: any, i: number) => s + (roles[i] === "quarantine" ? c.sizeGB : 0), 0);
+    const riskMeta = (RISK_META as AnyRecord)[c.risk] || RISK_META.review;
 
-    const cycle = (i) => {
+    const cycle = (i: number) => {
       const order = ["keep", "quarantine", "review"];
-      setRoles((r) => r.map((x, j) => j === i ? order[(order.indexOf(x) + 1) % order.length] : x));
+      setRoles((r) => r.map((x: string, j: number) => j === i ? order[(order.indexOf(x) + 1) % order.length] : x));
     };
 
     if (resolved) {
@@ -98,9 +101,9 @@ const h: any = React.createElement;
             h("span", { className: "muted" }, "Modified ", c.modified)))),
       // locations
       h("div", { style: { borderTop: "1px solid var(--line)" } },
-        c.locations.map((l, i) => {
+        c.locations.map((l: any, i: number) => {
           const role = roles[i];
-          const drive = DB.driveById[l.drive] || { name: l.drive, status: "offline" };
+          const drive = (DB.driveById as AnyRecord)[l.drive] || { name: l.drive, status: "offline" };
           const rc = role === "keep" ? "ok" : role === "quarantine" ? "warn" : "cloud";
           return h("div", { key: i, className: "spread", style: { padding: "11px 18px", borderBottom: i < c.locations.length - 1 ? "1px solid var(--line-faint)" : "none", background: role === "quarantine" ? "var(--warn-soft)" : "transparent" } },
             h("div", { className: "row", style: { gap: 11, minWidth: 0, flex: 1 } },
@@ -128,7 +131,7 @@ const h: any = React.createElement;
             h(Icon, { name: "shield", size: 13 }), "Quarantine " + quarCount))));
   }
 
-  function DuplicateCenter({ go, toast }) {
+  function DuplicateCenter({ go, toast }: ScreenProps) {
     const [kind, setKind] = React.useState("all");
     const [risk, setRisk] = React.useState("all");
     const [scope, setScope] = React.useState("all");
@@ -137,8 +140,8 @@ const h: any = React.createElement;
       (kind === "all" || c.kind === kind) &&
       (risk === "all" || c.risk === risk) &&
       (scope === "all" ||
-        (scope === "drives" && new Set(c.locations.map((l) => l.drive)).size > 1) ||
-        (scope === "cloud" && c.locations.some((l) => (DB.driveById[l.drive] || {}).status === "cloud")) ||
+        (scope === "drives" && new Set(c.locations.map((l: any) => l.drive)).size > 1) ||
+        (scope === "cloud" && c.locations.some((l: any) => ((DB.driveById as AnyRecord)[l.drive] || {}).status === "cloud")) ||
         (scope === "project" && c.project !== "—")));
 
     const totalRecover = DB.duplicates.reduce((s, c) => s + c.recoverGB, 0);
@@ -164,7 +167,7 @@ const h: any = React.createElement;
           { value: "all", label: "All" }, { value: "exact", label: "Exact" }, { value: "likely", label: "Likely" }, { value: "samename", label: "Same name" }, { value: "stock", label: "Stock" }] }),
         h(Seg, { value: risk, onChange: setRisk, options: [
           { value: "all", label: "Any risk" }, { value: "safe", label: "Safe" }, { value: "review", label: "Review" }, { value: "danger", label: "Protected" }] }),
-        h("select", { className: "select", value: scope, onChange: (e) => setScope(e.target.value) },
+        h("select", { className: "select", value: scope, onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setScope(e.target.value) },
           h("option", { value: "all" }, "All locations"),
           h("option", { value: "drives" }, "Across drives"),
           h("option", { value: "project" }, "Inside a project"),
@@ -175,7 +178,7 @@ const h: any = React.createElement;
         : h("div", { style: { display: "flex", flexDirection: "column", gap: "var(--gap)" } }, list.map((c) => h(ClusterCard, { key: c.id, c, go, toast }))));
   }
 
-  function sumBox(label, value, color, icon) {
+  function sumBox(label: React.ReactNode, value: React.ReactNode, color: string, icon: string) {
     return h("div", { className: "card-pad", style: { borderLeft: "1px solid var(--line)", display: "flex", flexDirection: "column", justifyContent: "center", gap: 5 } },
       h("div", { className: "row", style: { gap: 7 } }, h(Icon, { name: icon, size: 14, style: { color } }), h("span", { className: "eyebrow", style: { fontSize: 9.5 } }, label)),
       h("div", { className: "stat-num", style: { fontSize: 22, color } }, value));
