@@ -192,7 +192,7 @@ export default function App() {
   // Convex real-time data sync layer
   const convexDrives = useQuery(api.drives.list);
   const convexProjects = useQuery(api.projects.list);
-  const convexDuplicates = useQuery(api.duplicateClusters.list);
+  const convexDuplicates = useQuery(api.duplicates.list);
   const convexRecommendations = useQuery(api.recommendations.list);
   const convexQuarantine = useQuery(api.cleanup.listQuarantine);
   const convexAudit = useQuery(api.audit.list);

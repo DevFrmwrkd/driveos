@@ -67,7 +67,7 @@ export const generateRecommendations = mutation({
 
     // B) Recommendation: Clean Proxies for Delivered Projects (Safe Cleanup)
     const deliveredProjects = allProjects.filter((p) => p.status === "delivered" || p.status === "archived");
-    const deliveredProjectIds = deliveredProjects.map((p) => p._id);
+    const deliveredProjectIds = deliveredProjects.map((p) => String(p._id));
     const deliveredProxies = proxyFiles.filter((f) => f.projectId && deliveredProjectIds.includes(f.projectId));
 
     if (deliveredProxies.length > 0) {

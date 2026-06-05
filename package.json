@@ -11,13 +11,17 @@
     "build:web": "npm run build --workspace=apps/web",
     "start:web": "npm run start --workspace=apps/web",
     "agent:build": "npm run build --workspace=apps/agent",
+    "agent:help": "node apps/agent/dist/index.js --help",
     "agent:start": "npm start --workspace=apps/agent",
     "convex:dev": "npx convex dev",
     "convex:deploy": "npx convex deploy",
     "test": "npm test --workspace=packages/shared && npm test --workspace=apps/agent"
   },
   "devDependencies": {
-    "typescript": "^5.0.0",
-    "concurrently": "^8.2.2"
+    "concurrently": "^8.2.2",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "convex": "^1.40.0"
   }
 }

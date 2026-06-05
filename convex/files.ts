@@ -10,19 +10,34 @@ export const list = query({
     riskLevel: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    let q = ctx.db.query("files");
-
     if (args.projectId) {
-      q = q.withIndex("by_project", (q) => q.eq("projectId", args.projectId));
-    } else if (args.driveId) {
-      q = q.withIndex("by_drive", (q) => q.eq("driveId", args.driveId));
-    } else if (args.classification) {
-      q = q.withIndex("by_classification", (q) => q.eq("classification", args.classification));
-    } else if (args.riskLevel) {
-      q = q.withIndex("by_riskLevel", (q) => q.eq("riskLevel", args.riskLevel));
+      return await ctx.db
+        .query("files")
+        .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+        .take(args.limit || 50);
+    }
+    if (args.driveId) {
+      return await ctx.db
+        .query("files")
+        .withIndex("by_drive", (q) => q.eq("driveId", args.driveId))
+        .take(args.limit || 50);
+    }
+    if (args.classification) {
+      const classification = args.classification;
+      return await ctx.db
+        .query("files")
+        .withIndex("by_classification", (q) => q.eq("classification", classification))
+        .take(args.limit || 50);
+    }
+    if (args.riskLevel) {
+      const riskLevel = args.riskLevel;
+      return await ctx.db
+        .query("files")
+        .withIndex("by_riskLevel", (q) => q.eq("riskLevel", riskLevel))
+        .take(args.limit || 50);
     }
 
-    return await q.take(args.limit || 50);
+    return await ctx.db.query("files").take(args.limit || 50);
   },
 });
 

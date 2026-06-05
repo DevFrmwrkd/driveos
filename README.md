@@ -81,6 +81,17 @@ The agent is now compiled and ready to execute. You can run commands locally ins
 node apps/agent/dist/index.js --help
 ```
 
+To expose the CLI as `driveos-agent` on this machine:
+```bash
+npm link --workspace=apps/agent
+```
+
+To install lightweight scan/watch hooks directly into a mounted hard drive:
+```bash
+driveos-agent install-drive --path "/Volumes/CJ_Working" --name "CJ Working"
+```
+This writes a `.driveos/` folder on the drive with a drive manifest plus `scan.sh` and `watch.sh` helpers. It does not upload media; the agent only syncs metadata and hashes.
+
 ---
 
 ## 💻 CLI Agent Reference Commands
@@ -109,6 +120,12 @@ Run a persistent background watcher on a directory. It debounces file additions 
 node apps/agent/dist/index.js watch --path "./temp_test_drive"
 ```
 
+### 🧷 `install-drive` — Add Drive-Level Hooks
+Install reusable scan/watch launch scripts on a mounted disk:
+```bash
+node apps/agent/dist/index.js install-drive --path "/Volumes/CJ_Working"
+```
+
 ### 🧙 `create-project` — Create Standardized Studio Structure
 Instantly build the approved directory tree for an active edit workspace:
 ```bash
@@ -131,6 +148,21 @@ This scaffolds:
 Assistant editors can queue cleanup requests from the Web UI. The agent polls Convex, executing approved actions locally (creating project trees, moving duplicate files to quarantine, or restoring them):
 ```bash
 node apps/agent/dist/index.js run-jobs
+```
+
+### 🧾 `manifest` — Generate Archive Manifest
+Create a project archive manifest without deleting or moving files:
+```bash
+node apps/agent/dist/index.js manifest \
+  --projectId "your-project-id" \
+  --root "./temp_test_drive/Show_X_Ep214"
+```
+
+### ♻️ `quarantine` / `restore` — Execute Approved Safety Jobs
+Run an approved quarantine job or restore a quarantined file:
+```bash
+node apps/agent/dist/index.js quarantine --jobId "cleanup-job-id"
+node apps/agent/dist/index.js restore --quarantineId "quarantine-item-id"
 ```
 
 ---

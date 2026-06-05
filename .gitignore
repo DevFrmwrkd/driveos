@@ -22,3 +22,4 @@ temp_test_drive/
 .DS_Store
 Thumbs.db
 ._*
+.vercel

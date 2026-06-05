@@ -15,6 +15,37 @@ export const listQuarantine = query({
   },
 });
 
+export const getJob = query({
+  args: { jobId: v.string() },
+  handler: async (ctx, args) => {
+    const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
+    if (!id) return null;
+
+    const job = await ctx.db.get(id);
+    if (!job) return null;
+
+    const files = [];
+    for (const fId of job.affectedFileIds) {
+      const fileId = ctx.db.normalizeId("files", fId);
+      if (fileId) {
+        const file = await ctx.db.get(fileId);
+        if (file) files.push(file);
+      }
+    }
+
+    return { ...job, files };
+  },
+});
+
+export const getQuarantineItem = query({
+  args: { quarantineId: v.string() },
+  handler: async (ctx, args) => {
+    const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
+    if (!id) return null;
+    return await ctx.db.get(id);
+  },
+});
+
 export const createJob = mutation({
   args: {
     recommendationId: v.optional(v.string()),
@@ -237,6 +268,39 @@ export const updateJobStatus = mutation({
       entityType: "cleanupJob",
       entityId: id,
       message: `Cleanup job ${job.action} status changed to ${args.status}`,
+      createdAt: timestamp,
+    });
+  },
+});
+
+export const markQuarantineRestored = mutation({
+  args: { quarantineId: v.string() },
+  handler: async (ctx, args) => {
+    const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
+    if (!id) return;
+
+    const item = await ctx.db.get(id);
+    if (!item) return;
+
+    const timestamp = Date.now();
+    await ctx.db.patch(id, {
+      status: "restored",
+      restoredAt: timestamp,
+    });
+
+    const fileId = ctx.db.normalizeId("files", item.fileId);
+    if (fileId) {
+      await ctx.db.patch(fileId, {
+        deletedAt: undefined,
+        lastSeenAt: timestamp,
+      });
+    }
+
+    await ctx.db.insert("auditLogs", {
+      action: "quarantine_restore",
+      entityType: "quarantineItem",
+      entityId: id,
+      message: `Restored quarantined file ${item.originalPath}`,
       createdAt: timestamp,
     });
   },

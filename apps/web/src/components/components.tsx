@@ -186,7 +186,7 @@ export function Sparkline({ data, width = 120, height = 34, color = "var(--accen
   const pts = data.map((v, i) => [ (i / (data.length - 1)) * width, height - ((v - min) / range) * (height - 6) - 3 ]);
   const line = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
   const area = line + ` L${width} ${height} L0 ${height} Z`;
-  const gid = "sg" + Math.random().toString(36).slice(2, 7);
+  const gid = "sg" + React.useId().replace(/:/g, "");
   return React.createElement("svg", { className: "spark", width, height, viewBox: `0 0 ${width} ${height}` },
     fill && React.createElement("defs", null, React.createElement("linearGradient", { id: gid, x1: 0, y1: 0, x2: 0, y2: 1 },
       React.createElement("stop", { offset: "0%", stopColor: color, stopOpacity: 0.3 }),
