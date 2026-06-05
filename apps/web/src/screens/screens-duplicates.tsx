@@ -47,12 +47,22 @@ const h = React.createElement;
 
   const KIND_LABEL = { exact: "Exact match", likely: "Likely duplicate", samename: "Same name, diff. content", stock: "Stock duplicated across projects" };
 
+  function fmtDuplicateSize(gb) {
+    if (gb >= 1000) return fmtGB(gb);
+    if (gb >= 10) return Math.round(gb) + " GB";
+    if (gb >= 1) return gb.toFixed(1) + " GB";
+    const mb = gb * 1024;
+    if (mb >= 1) return Math.round(mb) + " MB";
+    return Math.max(1, Math.round(mb * 1024)) + " KB";
+  }
+
   function ClusterCard({ c, go, toast }) {
     const [roles, setRoles] = React.useState(() => c.locations.map((l) => l.role));
     const [resolved, setResolved] = React.useState(null);
     const keepCount = roles.filter((r) => r === "keep").length;
     const quarCount = roles.filter((r) => r === "quarantine").length;
     const recover = c.locations.reduce((s, l, i) => s + (roles[i] === "quarantine" ? c.sizeGB : 0), 0);
+    const riskMeta = RISK_META[c.risk] || RISK_META.review;
 
     const cycle = (i) => {
       const order = ["keep", "quarantine", "review"];
@@ -64,7 +74,7 @@ const h = React.createElement;
         h("div", { className: "card-pad row", style: { gap: 12 } },
           h(Icon, { name: "checkCircle", size: 20, style: { color: "var(--ok)" } }),
           h("div", { style: { flex: 1 } }, h("div", { className: "hi", style: { fontWeight: 600 } }, c.name + " · " + resolved),
-            h("div", { className: "muted", style: { fontSize: 12 } }, resolved === "Quarantined" ? "Moved " + quarCount + " copies to quarantine · recovered " + recover + " GB" : "Marked as intentional redundancy")),
+            h("div", { className: "muted", style: { fontSize: 12 } }, resolved === "Quarantined" ? "Moved " + quarCount + " copies to quarantine · recovered " + fmtDuplicateSize(recover) : "Marked as intentional redundancy")),
           h("button", { className: "btn sm ghost", onClick: () => setResolved(null) }, "Undo")));
     }
 
@@ -77,12 +87,12 @@ const h = React.createElement;
           h("div", { className: "spread" },
             h("div", { className: "row", style: { gap: 9, minWidth: 0 } },
               h("span", { className: "mono hi", style: { fontSize: 14, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, c.name),
-              h(Badge, { kind: RISK_META[c.risk].cls, icon: c.risk === "danger" ? "lock" : c.risk === "safe" ? "shieldCheck" : "info" }, RISK_META[c.risk].label)),
+              h(Badge, { kind: riskMeta.cls, icon: c.risk === "danger" ? "lock" : c.risk === "safe" ? "shieldCheck" : "info" }, riskMeta.label)),
             h("div", { className: "row", style: { gap: 8, flexShrink: 0 } },
-              h("span", { className: "stat-num", style: { fontSize: 18 } }, c.sizeGB + " GB"),
+              h("span", { className: "stat-num", style: { fontSize: 18 } }, fmtDuplicateSize(c.sizeGB)),
               h("span", { className: "muted", style: { fontSize: 12 } }, "× " + c.copies))),
           h("div", { className: "row", style: { gap: 14, marginTop: 6, fontSize: 11.5, flexWrap: "wrap" } },
-            h("span", { className: "tag" }, KIND_LABEL[c.kind]),
+            h("span", { className: "tag" }, KIND_LABEL[c.kind] || "Duplicate cluster"),
             h("span", { className: "muted" }, h(Icon, { name: "fingerprint", size: 12, style: { verticalAlign: "-2px", marginRight: 4 } }), c.fingerprint),
             c.project !== "—" && h("span", { className: "muted" }, "Project: ", h("b", { className: "hi" }, (DB.projectById[c.project] || {}).name || c.project)),
             h("span", { className: "muted" }, "Modified ", c.modified)))),
@@ -110,7 +120,7 @@ const h = React.createElement;
       h("div", { className: "spread", style: { padding: "13px 18px", borderTop: "1px solid var(--line)" } },
         h("div", { className: "row", style: { gap: 8 } },
           h("span", { className: "mono", style: { fontSize: 12, color: "var(--tx-mut)" } }, "Keep ", h("b", { style: { color: "var(--ok)" } }, keepCount), " · Quarantine ", h("b", { style: { color: "var(--warn)" } }, quarCount)),
-          recover > 0 && h(Badge, { kind: "ok" }, "Recover " + recover + " GB")),
+          recover > 0 && h(Badge, { kind: "ok" }, "Recover " + fmtDuplicateSize(recover))),
         h("div", { className: "row", style: { gap: 8 } },
           h("button", { className: "btn sm ghost", onClick: () => toast("Cluster ignored", "x", "accent") }, "Ignore"),
           h("button", { className: "btn sm", onClick: () => setResolved("Marked intentional") }, h(Icon, { name: "flag", size: 13 }), "Intentional"),
@@ -143,7 +153,7 @@ const h = React.createElement;
           h("div", { className: "eyebrow" }, "Total Duplicate Storage"),
           h("div", { className: "row", style: { alignItems: "baseline", gap: 8 } }, h("span", { className: "stat-num", style: { fontSize: 34 } }, "4.2"), h("span", { style: { fontSize: 16, color: "var(--tx-mut)", fontWeight: 600 } }, "TB")),
           h("div", { className: "muted", style: { fontSize: 12 } }, "across ", h("b", { className: "hi" }, "1,240 clusters"))),
-        sumBox("Safe to recover", fmtGB(totalRecover), "var(--ok)", "shieldCheck"),
+        sumBox("Safe to recover", fmtDuplicateSize(totalRecover), "var(--ok)", "shieldCheck"),
         sumBox("Needs review", "1.4 TB", "var(--warn)", "info"),
         sumBox("Protected", "0.3 TB", "var(--risk)", "lock")),
 

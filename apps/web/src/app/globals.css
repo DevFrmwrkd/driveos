@@ -494,6 +494,23 @@ textarea.input { height: auto; padding: 10px 12px; resize: vertical; font-family
   }
 }
 
+@media (max-width: 900px) {
+  .wizard-stepper {
+    align-items: stretch !important;
+    flex-direction: column !important;
+    gap: 8px !important;
+  }
+
+  .wizard-step {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .wizard-step-line {
+    display: none;
+  }
+}
+
 @media (max-width: 760px) {
   :root {
     --density: 0.92;
@@ -612,6 +629,11 @@ textarea.input { height: auto; padding: 10px 12px; resize: vertical; font-family
     margin-left: 0 !important;
   }
 
+  .search-box input {
+    height: 100%;
+    min-height: 34px;
+  }
+
   .page {
     height: auto;
     min-height: 0;
@@ -679,10 +701,20 @@ textarea.input { height: auto; padding: 10px 12px; resize: vertical; font-family
 
   .seg button {
     flex: 1 1 auto;
+    min-height: 32px;
   }
 
   .btn {
     min-width: 0;
+  }
+
+  .btn.sm {
+    height: 34px;
+  }
+
+  button.badge,
+  button.tag {
+    min-height: 32px;
   }
 
   .row,
@@ -699,7 +731,19 @@ textarea.input { height: auto; padding: 10px 12px; resize: vertical; font-family
   }
 
   .treemap {
-    min-height: 180px;
+    flex-wrap: wrap;
+    height: auto !important;
+    min-height: 0;
+  }
+
+  .treemap-cell {
+    flex: 1 1 calc(50% - 4px) !important;
+    min-width: 0 !important;
+    min-height: 78px;
+  }
+
+  .treemap-cell > div:first-child {
+    white-space: normal !important;
   }
 
   .card:has(.tbl) {
@@ -749,5 +793,30 @@ textarea.input { height: auto; padding: 10px 12px; resize: vertical; font-family
   .toast {
     min-width: 0;
     width: 100%;
+  }
+}
+
+@media (max-width: 360px) {
+  .brand {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+
+  .nav {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .topbar {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+
+  .page-inner {
+    padding: 12px;
+  }
+
+  .page-head-actions .btn {
+    flex-basis: 100%;
   }
 }

@@ -53,17 +53,17 @@ const h = React.createElement;
     const p = pct(d.usedTB, d.capTB);
     return h("div", null,
       h("div", { className: "spread", style: { fontSize: 11.5, marginBottom: 5 } },
-        h("span", { className: "mono", style: { color: "var(--tx-hi)" } }, fmtTB(d.usedTB), h("span", { className: "dim" }, " / " + d.capTB + " TB")),
+        h("span", { className: "mono", style: { color: "var(--tx-hi)" } }, fmtTB(d.usedTB), h("span", { className: "dim" }, " / " + fmtTB(d.capTB))),
         h("span", { className: "mono", style: { color: p >= 90 ? "var(--risk)" : p >= 75 ? "var(--warn)" : "var(--tx-mut)" } }, p + "%")),
       h(Bar, { value: d.usedTB, max: d.capTB, kind: d.status === "cloud" ? "cloud" : tierKind(p), height }),
       h("div", { className: "spread", style: { fontSize: 10.5, marginTop: 5, color: "var(--tx-dim)" } },
-        h("span", null, fmtTB(d.capTB - d.usedTB) + " free"),
+        h("span", null, fmtTB(Math.max(d.capTB - d.usedTB, 0)) + " free"),
         d.status !== "uninit" && h("span", { className: "mono" }, d.scans + " scans")));
   }
 
   // ---- Drive card ----
   function DriveCard({ d, go }) {
-    const owner = DB.teamById[d.owner];
+    const owner = DB.teamById[d.owner] || DB.teamById.founder || { name: "Studio" };
     return h("div", { className: "card fade-up", onClick: () => go("drive", { id: d.id }),
       style: { cursor: "pointer", display: "flex", flexDirection: "column", transition: "border-color .14s, transform .1s" },
       onMouseEnter: (e) => (e.currentTarget.style.borderColor = "var(--line-strong)"),
@@ -81,7 +81,7 @@ const h = React.createElement;
           h(StatusBadge, { status: d.status })),
         d.status === "uninit"
           ? h("div", { style: { padding: "16px 0", textAlign: "center" } },
-              h("div", { className: "muted", style: { fontSize: 12.5, marginBottom: 12 } }, "New " + d.capTB + " TB drive detected. Not yet tracked."),
+              h("div", { className: "muted", style: { fontSize: 12.5, marginBottom: 12 } }, "New " + fmtTB(d.capTB) + " drive detected. Not yet tracked."),
               h("button", { className: "btn primary sm", onClick: (e) => { e.stopPropagation(); go("drive", { id: d.id }); } }, h(Icon, { name: "zap", size: 14 }), "Initialize Drive"))
           : h(CapMeter, { d })),
       d.status !== "uninit" && h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", borderTop: "1px solid var(--line)" } },
@@ -126,7 +126,7 @@ const h = React.createElement;
         kpiMini("Online", online, "ok", "hdd"),
         kpiMini("Offline", DB.drives.filter((d) => d.status === "offline").length, "", "hdd"),
         kpiMini("Cloud", DB.drives.filter((d) => d.status === "cloud").length, "cloud", "cloud"),
-        kpiMini("Total Capacity", totalCap + " TB", "", "database"),
+        kpiMini("Total Capacity", fmtTB(totalCap), "", "database"),
         kpiMini("Total Used", fmtTB(totalUsed), "warn", "server")),
 
       h("div", { className: "filter-bar" },
@@ -155,14 +155,15 @@ const h = React.createElement;
             h("th", { key: i, className: i >= 4 && i !== 6 ? "num" : "" }, c)))),
         h("tbody", null, list.map((d) => {
           const p = pct(d.usedTB, d.capTB);
+          const owner = DB.teamById[d.owner] || DB.teamById.founder || { name: "Studio" };
           return h("tr", { key: d.id, onClick: () => go("drive", { id: d.id }) },
             h("td", null, h("div", { className: "row", style: { gap: 9 } },
               h(Icon, { name: driveIcon(d), size: 16, style: { color: "var(--tx-mut)" } }),
               h("span", { className: "hi", style: { fontWeight: 600 } }, d.name))),
-            h("td", null, h("div", { className: "row", style: { gap: 7 } }, h(Avatar, { id: d.owner, size: 20 }), DB.teamById[d.owner].name.split(" ")[0])),
+            h("td", null, h("div", { className: "row", style: { gap: 7 } }, h(Avatar, { id: d.owner, size: 20 }), owner.name.split(" ")[0])),
             h("td", { className: "muted" }, d.location),
             h("td", null, h(StatusBadge, { status: d.status })),
-            h("td", { className: "num" }, d.capTB + " TB"),
+            h("td", { className: "num" }, fmtTB(d.capTB)),
             h("td", { className: "num" }, h("div", { className: "row", style: { gap: 8, justifyContent: "flex-end" } },
               h("span", { style: { width: 46 } }, h(Bar, { value: d.usedTB, max: d.capTB, kind: d.status === "cloud" ? "cloud" : tierKind(p), height: 5 })),
               h("span", { style: { color: p >= 90 ? "var(--risk)" : "var(--tx)" } }, p + "%"))),
@@ -205,7 +206,7 @@ const h = React.createElement;
   function DriveDetail({ params, go, toast }) {
     const d = DB.driveById[params.id];
     if (!d) return h("div", { className: "page-inner" }, h("div", { className: "muted" }, "Drive not found."));
-    const owner = DB.teamById[d.owner];
+    const owner = DB.teamById[d.owner] || DB.teamById.founder || { name: "Studio" };
     const ft = driveFileTypes(d);
     const p = pct(d.usedTB, d.capTB);
 
@@ -325,14 +326,15 @@ const h = React.createElement;
 
   function UninitDrive({ d, go, toast }) {
     const [step, setStep] = React.useState(0);
+    const owner = DB.teamById[d.owner] || DB.teamById.founder || { name: "Studio" };
     return h("div", { className: "page-inner" },
       h("button", { className: "btn ghost sm", style: { marginBottom: 12 }, onClick: () => go("drives") }, h(Icon, { name: "chevL", size: 15 }), "All drives"),
-      h(PageHead, { eyebrow: DB.teamById[d.owner].name + " · " + d.location, title: d.name, desc: d.model + " · " + d.bus }),
+      h(PageHead, { eyebrow: owner.name + " · " + d.location, title: d.name, desc: d.model + " · " + d.bus }),
       h("div", { className: "card", style: { maxWidth: 640, margin: "0 auto" } },
         h("div", { className: "card-pad", style: { textAlign: "center", padding: 36 } },
           h("div", { style: { width: 64, height: 64, borderRadius: 16, margin: "0 auto 18px", display: "grid", placeItems: "center", background: "var(--warn-soft)", color: "var(--warn)", border: "1px solid var(--warn-line)" } }, h(Icon, { name: "hdd", size: 28 })),
           h("h3", { style: { fontSize: 19, marginBottom: 8 } }, "Drive not initialized"),
-          h("div", { className: "muted", style: { fontSize: 13.5, maxWidth: 380, margin: "0 auto 22px" } }, "This new " + d.capTB + " TB volume was detected by the Tokyo agent but isn't tracked yet. Initialize it to enable scanning, watching, and cleanup."),
+          h("div", { className: "muted", style: { fontSize: 13.5, maxWidth: 380, margin: "0 auto 22px" } }, "This new " + fmtTB(d.capTB) + " volume was detected by the Tokyo agent but isn't tracked yet. Initialize it to enable scanning, watching, and cleanup."),
           h("div", { style: { display: "flex", flexDirection: "column", gap: 10, maxWidth: 360, margin: "0 auto", textAlign: "left" } },
             ["Index existing files and compute hashes", "Apply studio storage tier and watch rules", "Enable duplicate + single-copy detection"].map((t, i) =>
               h("div", { key: i, className: "row", style: { gap: 10 } }, h("span", { className: "chk " + (step > i ? "on" : ""), style: { width: 18, height: 18 } }, h(Icon, { name: "check", size: 12, stroke: 3, style: { color: "#fff" } })), h("span", { style: { fontSize: 13 } }, t)))),
