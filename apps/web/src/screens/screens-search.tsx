@@ -55,8 +55,8 @@ const h = React.createElement;
     const ql = q.trim().toLowerCase();
     const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
     const showSample = ql && norm("A001_C004").includes(norm(q)) && norm(q).length > 1;
-    const projHits = ql ? DB.projects.filter((p) => (p.name + p.client + p.show).toLowerCase().includes(ql)) : [];
-    const driveHits = ql ? DB.drives.filter((d) => d.name.toLowerCase().includes(ql)) : [];
+    const projHits = ql ? DB.projects.filter((p) => [p.name, p.client, p.show].filter(Boolean).join(" ").toLowerCase().includes(ql)) : [];
+    const driveHits = ql ? DB.drives.filter((d) => [d.name, d.model, d.id].filter(Boolean).join(" ").toLowerCase().includes(ql)) : [];
 
     return h("div", { className: "page-inner", style: { maxWidth: 920 } },
       h(PageHead, { eyebrow: "System", title: "Search", desc: "Find any file, hash, project, drive, or folder across every tracked volume and the cloud." }),
@@ -80,12 +80,15 @@ const h = React.createElement;
       // project / drive matches
       (projHits.length > 0 || driveHits.length > 0) && !showSample && h("div", { style: { display: "flex", flexDirection: "column", gap: "var(--gap)" } },
         projHits.length > 0 && cardShell("Projects · " + projHits.length, "folder", "var(--tx-mut)", null,
-          h("div", { style: { padding: "6px 0" } }, projHits.map((p) => h("div", { key: p.id, className: "offender-row spread", onClick: () => go("project", { id: p.id }), style: { padding: "11px 18px", cursor: "pointer" } },
-            h("div", null, h("span", { className: "hi", style: { fontWeight: 600, fontSize: 13 } }, p.name), h("span", { className: "muted", style: { fontSize: 11.5, marginLeft: 8 } }, p.client)),
-            h(Badge, { kind: PROJ_STATUS[p.status].cls }, PROJ_STATUS[p.status].label))))),
+          h("div", { style: { padding: "6px 0" } }, projHits.map((p) => {
+            const status = PROJ_STATUS[p.status] || PROJ_STATUS.active;
+            return h("div", { key: p.id, className: "offender-row spread", onClick: () => go("project", { id: p.id }), style: { padding: "11px 18px", cursor: "pointer" } },
+              h("div", null, h("span", { className: "hi", style: { fontWeight: 600, fontSize: 13 } }, p.name || "Untitled project"), h("span", { className: "muted", style: { fontSize: 11.5, marginLeft: 8 } }, p.client || "No client")),
+              h(Badge, { kind: status.cls }, status.label));
+          }))),
         driveHits.length > 0 && cardShell("Drives · " + driveHits.length, "hdd", "var(--tx-mut)", null,
           h("div", { style: { padding: "6px 0" } }, driveHits.map((d) => h("div", { key: d.id, className: "offender-row spread", onClick: () => go("drive", { id: d.id }), style: { padding: "11px 18px", cursor: "pointer" } },
-            h("div", null, h("span", { className: "hi", style: { fontWeight: 600, fontSize: 13 } }, d.name), h("span", { className: "muted mono", style: { fontSize: 11, marginLeft: 8 } }, d.model)),
+            h("div", null, h("span", { className: "hi", style: { fontWeight: 600, fontSize: 13 } }, d.name || "Untitled drive"), h("span", { className: "muted mono", style: { fontSize: 11, marginLeft: 8 } }, d.model || d.bus || d.id || "Unknown model")),
             h(StatusBadge, { status: d.status }))))) ),
 
       // no results
@@ -111,8 +114,8 @@ const h = React.createElement;
       // locations
       cardShell("Found on 3 locations", "map", "var(--tx-mut)", h(Badge, { square: true }, "1 working · 1 archive · 1 cloud"),
         h("div", { style: { padding: "6px 0" } }, S.found.map((f, i) => {
-          const rm = ROLE_META[f.role];
-          const drive = DB.driveById[f.drive];
+          const rm = ROLE_META[f.role] || ["accent", "Tracked copy", "hdd"];
+          const drive = DB.driveById[f.drive] || DB.drives.find((d) => d.id === f.drive) || { name: f.drive || "Unknown drive" };
           return h("div", { key: i, className: "spread offender-row", onClick: () => go("drive", { id: f.drive }), style: { padding: "13px 18px", cursor: "pointer" } },
             h("div", { className: "row", style: { gap: 12, minWidth: 0 } },
               h("span", { style: { width: 32, height: 32, borderRadius: 8, display: "grid", placeItems: "center", flexShrink: 0, background: "var(--" + rm[0] + "-soft)", color: "var(--" + rm[0] + ")" } }, h(Icon, { name: rm[2], size: 15 })),

@@ -76,14 +76,14 @@ const h = React.createElement;
       h(PageHead, { eyebrow: "Projects", title: "Create Project", desc: "Spin up a project with the studio's folder structure, manifest, and watch rules — automatically." }),
 
       // stepper
-      h("div", { className: "card card-pad fade-up", style: { marginBottom: "var(--gap)", display: "flex", gap: 0, alignItems: "center" } },
+      h("div", { className: "card card-pad fade-up wizard-stepper", style: { marginBottom: "var(--gap)", display: "flex", gap: 0, alignItems: "center" } },
         STEPS.map((s, i) => h(React.Fragment, { key: i },
-          h("div", { className: "row", style: { gap: 10, cursor: i < step ? "pointer" : "default" }, onClick: () => i < step && setStep(i) },
+          h("div", { className: "row wizard-step", style: { gap: 10, cursor: i < step ? "pointer" : "default" }, onClick: () => i < step && setStep(i) },
             h("span", { style: { width: 28, height: 28, borderRadius: 99, display: "grid", placeItems: "center", flexShrink: 0, fontSize: 12, fontWeight: 700, fontFamily: "var(--font-mono)",
               background: i < step ? "var(--ok)" : i === step ? "var(--accent)" : "var(--bg-elevated)", color: i <= step ? "#fff" : "var(--tx-dim)", border: i === step ? "none" : "1px solid var(--line)" } },
               i < step ? h(Icon, { name: "check", size: 14, stroke: 3 }) : i + 1),
             h("span", { style: { fontSize: 12.5, fontWeight: 600, color: i === step ? "var(--tx-hi)" : "var(--tx-mut)", whiteSpace: "nowrap" } }, s)),
-          i < STEPS.length - 1 && h("div", { style: { flex: 1, height: 1.5, background: i < step ? "var(--ok)" : "var(--line)", margin: "0 14px" } })))),
+          i < STEPS.length - 1 && h("div", { className: "wizard-step-line", style: { flex: 1, height: 1.5, background: i < step ? "var(--ok)" : "var(--line)", margin: "0 14px" } })))),
 
       // step content
       h("div", { className: "card card-pad fade-up", style: { marginBottom: "var(--gap)", minHeight: 380 } },

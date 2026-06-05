@@ -42,7 +42,30 @@ const NAV = [
 
 // route -> nav highlight (detail screens map back to their section)
 const ROUTE_NAV: Record<string, string> = { drive: "drives", project: "projects", wizard: "projects" };
+const SCREEN_IDS = new Set([
+  "dashboard",
+  "drives",
+  "drive",
+  "projects",
+  "project",
+  "duplicates",
+  "cleanup",
+  "quarantine",
+  "cloud",
+  "archive",
+  "search",
+  "settings",
+  "wizard",
+]);
 const DEFAULT_OWNER = "founder";
+
+function routeFromHash(hash: string) {
+  const raw = hash.replace(/^#/, "").trim();
+  if (!raw) return { screen: "dashboard", params: {} };
+  const [screen, id] = raw.split("/");
+  if (!SCREEN_IDS.has(screen)) return { screen: "dashboard", params: {} };
+  return { screen, params: id ? { id } : {} };
+}
 
 function resolveOwnerId(record: any) {
   const owner = record?.owner || record?.ownerId || DEFAULT_OWNER;
@@ -214,7 +237,9 @@ function Placeholder({ title }: { title: string }) {
 }
 
 export default function App() {
-  const [route, setRoute] = useState<{ screen: string; params: any }>({ screen: "dashboard", params: {} });
+  const [route, setRoute] = useState<{ screen: string; params: any }>(() =>
+    typeof window === "undefined" ? { screen: "dashboard", params: {} } : routeFromHash(window.location.hash)
+  );
   const [push, toastNode] = useToast();
   const [dense, setDense] = useState(false);
   const pageRef = useRef<HTMLDivElement>(null);
@@ -337,6 +362,22 @@ export default function App() {
   useEffect(() => {
     (window as any).__go = go;
   }, [go]);
+
+  useEffect(() => {
+    const syncRouteFromHash = () => {
+      const next = routeFromHash(window.location.hash);
+      setRoute((current) => {
+        const currentId = current.params?.id || "";
+        const nextId = next.params?.id || "";
+        return current.screen === next.screen && currentId === nextId ? current : next;
+      });
+      if (pageRef.current) pageRef.current.scrollTop = 0;
+    };
+
+    syncRouteFromHash();
+    window.addEventListener("hashchange", syncRouteFromHash);
+    return () => window.removeEventListener("hashchange", syncRouteFromHash);
+  }, []);
 
   // Tweaks: accent + density
   useDriveOSTweaks(setDense);
