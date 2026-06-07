@@ -242,6 +242,16 @@ const searchSample = {
   ],
 };
 
+// ---- Notifications & Alerts (demo fallback for offline mode) ----
+const notifications = [
+  { id: "n1", severity: "critical", category: "drive", title: "CJ Working SSD is 90% full", message: "Only 0.4 TB free on a working drive. Cleanup can recover 0.6 TB.", actionScreen: "drive", actionParams: { id: "cj-ssd" }, read: false, time: "2 min ago" },
+  { id: "n2", severity: "critical", category: "project", title: "Single-copy risk: Brand Films — Atlas Motors", message: "0.9 TB of footage exists on only one drive with no archive or cloud backup.", actionScreen: "project", actionParams: { id: "brand-films" }, read: false, time: "18 min ago" },
+  { id: "n3", severity: "warning", category: "duplicate", title: "Reclaim 4.2 TB of duplicates", message: "11 open duplicate clusters are wasting 4.2 TB across drives. Review and quarantine the redundant copies.", actionScreen: "duplicates", actionParams: {}, read: false, time: "1 hr ago" },
+  { id: "n4", severity: "info", category: "archive", title: "Show X — Ep. 198 (old) is ready to archive", message: "Delivered and verified. Move 1.3 TB to cold archive to free working storage.", actionScreen: "project", actionParams: { id: "show-x-old" }, read: false, time: "3 hr ago" },
+  { id: "n5", severity: "warning", category: "project", title: "Brand Films structure health is 64%", message: "Folder structure is incomplete. Run the structure fix to restore the studio template.", actionScreen: "project", actionParams: { id: "brand-films" }, read: true, time: "5 hr ago" },
+  { id: "n6", severity: "success", category: "cleanup", title: "8.6 TB of safe cleanup ready", message: "Low-risk recommendations can free 8.6 TB of cache, proxies, and duplicates with one approval.", actionScreen: "cleanup", actionParams: {}, read: true, time: "yesterday" },
+];
+
 // ---- KPIs (dashboard) ----
 const kpi = {
   totalTB: 74.8, cleanupTB: 8.6, dupTB: 4.2, proxyCacheTB: 2.9, reviewExportsTB: 1.5,
@@ -252,5 +262,5 @@ const kpi = {
 export const DB = {
   team, teamById, drives, driveById, projects, projectById, fileTypes, tiers,
   duplicates, cleanup, quarantine, audit, driveEvents, warnings, cloud,
-  folderTemplate, templates, projectFolders, searchSample, kpi,
+  folderTemplate, templates, projectFolders, searchSample, kpi, notifications,
 };

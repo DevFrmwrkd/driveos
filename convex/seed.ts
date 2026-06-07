@@ -1,4 +1,5 @@
 import { mutation } from "./_generated/server";
+import { deriveAlerts } from "@driveos/shared";
 
 export const seed = mutation({
   args: {},
@@ -41,6 +42,9 @@ export const seed = mutation({
 
     const existingJobs = await ctx.db.query("cleanupJobs").collect();
     for (const x of existingJobs) await ctx.db.delete(x._id);
+
+    const existingNotifications = await ctx.db.query("notifications").collect();
+    for (const x of existingNotifications) await ctx.db.delete(x._id);
 
     // Helper: TB to Bytes
     const tb = (n: number) => Math.round(n * 1024 * 1024 * 1024 * 1024);
@@ -407,6 +411,43 @@ export const seed = mutation({
       });
     }
 
-    return { success: true };
+    // 12) Seed Notifications & Alerts from the live derived state
+    const seededDrives = await ctx.db.query("drives").collect();
+    const seededProjects = await ctx.db.query("projects").collect();
+    const seededClusters = await ctx.db.query("duplicateClusters").collect();
+    const seededRecs = await ctx.db.query("recommendations").collect();
+
+    const signals = deriveAlerts({
+      drives: seededDrives,
+      projects: seededProjects,
+      duplicateClusters: seededClusters,
+      recommendations: seededRecs,
+      now: timestamp,
+    });
+
+    for (let i = 0; i < signals.length; i++) {
+      const s = signals[i];
+      await ctx.db.insert("notifications", {
+        key: s.key,
+        severity: s.severity,
+        category: s.category,
+        title: s.title,
+        message: s.message,
+        entityType: s.entityType,
+        entityId: s.entityId,
+        actionScreen: s.actionScreen,
+        actionParams: s.actionParams,
+        metricBytes: s.metricBytes,
+        source: "auto",
+        read: false,
+        dismissed: false,
+        // Stagger timestamps so the feed has a natural recent ordering.
+        createdAt: timestamp - i * 60 * 1000,
+        updatedAt: timestamp - i * 60 * 1000,
+        lastSeenAt: timestamp,
+      });
+    }
+
+    return { success: true, notifications: signals.length };
   },
 });

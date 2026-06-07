@@ -513,3 +513,361 @@ export function calculateProjectHealth(
 
   return Math.max(0, Math.min(100, Math.round(score)));
 }
+
+// ============================================================
+// Notifications & Alerts Engine (deterministic, pure)
+// ------------------------------------------------------------
+// Derives the studio-wide alert feed from the current storage
+// state. Kept side-effect free so it can be unit tested and
+// reused by the Convex backend, the agent, and the web UI.
+// ============================================================
+
+export type AlertSeverity = "critical" | "warning" | "info" | "success";
+export type AlertCategory =
+  | "drive"
+  | "project"
+  | "duplicate"
+  | "cleanup"
+  | "agent"
+  | "cloud"
+  | "archive"
+  | "system";
+
+export interface AlertSignal {
+  /** Stable key used to de-duplicate the alert across refreshes. */
+  key: string;
+  severity: AlertSeverity;
+  category: AlertCategory;
+  title: string;
+  message: string;
+  entityType?: string;
+  entityId?: string;
+  /** Web route to deep-link to when the alert is clicked. */
+  actionScreen?: string;
+  actionParams?: Record<string, string>;
+  /** Bytes reclaimable / at risk — used for ranking and display. */
+  metricBytes?: number;
+}
+
+export interface AlertThresholds {
+  driveCriticalRatio: number;
+  driveWarningRatio: number;
+  driveOfflineMs: number;
+  duplicateWarnBytes: number;
+  cleanupInfoBytes: number;
+  agentStaleMs: number;
+  projectRiskyBytes: number;
+  projectHealthFloor: number;
+  projectDueSoonMs: number;
+}
+
+export const DEFAULT_ALERT_THRESHOLDS: AlertThresholds = {
+  driveCriticalRatio: 0.92,
+  driveWarningRatio: 0.8,
+  driveOfflineMs: 14 * 24 * 60 * 60 * 1000, // 14 days
+  duplicateWarnBytes: 1024 ** 4, // 1 TB
+  cleanupInfoBytes: 0.5 * 1024 ** 4, // 0.5 TB
+  agentStaleMs: 30 * 60 * 1000, // 30 minutes
+  projectRiskyBytes: 0.5 * 1024 ** 4, // 0.5 TB single-copy footage
+  projectHealthFloor: 60,
+  projectDueSoonMs: 3 * 24 * 60 * 60 * 1000, // 3 days
+};
+
+export interface AlertInputDrive {
+  _id?: string;
+  id?: string;
+  label?: string;
+  name?: string;
+  capacityBytes?: number;
+  usedBytes?: number;
+  freeBytes?: number;
+  status?: string;
+  tier?: string;
+  cleanTB?: number;
+  lastSeenAt?: number;
+}
+
+export interface AlertInputProject {
+  _id?: string;
+  id?: string;
+  name?: string;
+  status?: string;
+  tier?: string;
+  storageHealthScore?: number;
+  riskyBytes?: number;
+  totalBytes?: number;
+  dueDate?: number;
+}
+
+export interface AlertInputCluster {
+  status?: string;
+  type?: string;
+  wastedBytes?: number;
+}
+
+export interface AlertInputRecommendation {
+  status?: string;
+  type?: string;
+  riskLevel?: string;
+  affectedBytes?: number;
+}
+
+export interface AlertInputMachine {
+  _id?: string;
+  id?: string;
+  name?: string;
+  status?: string;
+  lastSeenAt?: number;
+}
+
+export interface DeriveAlertsInput {
+  drives?: AlertInputDrive[];
+  projects?: AlertInputProject[];
+  duplicateClusters?: AlertInputCluster[];
+  recommendations?: AlertInputRecommendation[];
+  machines?: AlertInputMachine[];
+  now?: number;
+  thresholds?: Partial<AlertThresholds>;
+}
+
+const SEVERITY_RANK: Record<AlertSeverity, number> = {
+  critical: 0,
+  warning: 1,
+  info: 2,
+  success: 3,
+};
+
+function fmtBytes(bytes: number): string {
+  const tb = bytes / 1024 ** 4;
+  if (tb >= 1) return `${tb.toFixed(tb >= 10 ? 0 : 1)} TB`;
+  const gb = bytes / 1024 ** 3;
+  if (gb >= 1) return `${gb.toFixed(gb >= 10 ? 0 : 1)} GB`;
+  return `${Math.max(0, Math.round(bytes / 1024 ** 2))} MB`;
+}
+
+function driveKey(d: AlertInputDrive): string {
+  return String(d._id || d.id || d.label || d.name || "drive");
+}
+
+function projectKey(p: AlertInputProject): string {
+  return String(p._id || p.id || p.name || "project");
+}
+
+export function deriveAlerts(input: DeriveAlertsInput): AlertSignal[] {
+  const now = input.now ?? Date.now();
+  const t: AlertThresholds = { ...DEFAULT_ALERT_THRESHOLDS, ...(input.thresholds || {}) };
+  const alerts: AlertSignal[] = [];
+
+  // ---- Drives ----
+  for (const d of input.drives || []) {
+    const id = driveKey(d);
+    const name = d.label || d.name || "Drive";
+    const status = (d.status || "online").toLowerCase();
+    const capacity = d.capacityBytes || 0;
+    const used = d.usedBytes ?? (capacity && d.freeBytes != null ? capacity - d.freeBytes : 0);
+    const ratio = capacity > 0 ? used / capacity : 0;
+    const cleanBytes = (d.cleanTB || 0) * 1024 ** 4;
+
+    if (status === "uninit") {
+      alerts.push({
+        key: `drive-uninit-${id}`,
+        severity: "info",
+        category: "drive",
+        title: `${name} needs initialization`,
+        message: `A new ${fmtBytes(capacity)} volume was detected but is not yet tracked by DriveOS.`,
+        entityType: "drive",
+        entityId: id,
+        actionScreen: "drive",
+        actionParams: { id },
+      });
+      continue;
+    }
+
+    if (capacity > 0 && status !== "cloud") {
+      if (ratio >= t.driveCriticalRatio) {
+        alerts.push({
+          key: `drive-full-${id}`,
+          severity: "critical",
+          category: "drive",
+          title: `${name} is ${Math.round(ratio * 100)}% full`,
+          message: `Only ${fmtBytes(capacity - used)} free on a working drive.${
+            cleanBytes > 0 ? ` Cleanup can recover ${fmtBytes(cleanBytes)}.` : ""
+          }`,
+          entityType: "drive",
+          entityId: id,
+          actionScreen: "drive",
+          actionParams: { id },
+          metricBytes: used,
+        });
+      } else if (ratio >= t.driveWarningRatio) {
+        alerts.push({
+          key: `drive-full-${id}`,
+          severity: "warning",
+          category: "drive",
+          title: `${name} is filling up (${Math.round(ratio * 100)}%)`,
+          message: `${fmtBytes(capacity - used)} free remaining.${
+            cleanBytes > 0 ? ` Cleanup can recover ${fmtBytes(cleanBytes)}.` : ""
+          }`,
+          entityType: "drive",
+          entityId: id,
+          actionScreen: "drive",
+          actionParams: { id },
+          metricBytes: used,
+        });
+      }
+    }
+
+    if (status === "offline" && d.lastSeenAt != null && now - d.lastSeenAt >= t.driveOfflineMs) {
+      const days = Math.round((now - d.lastSeenAt) / (24 * 60 * 60 * 1000));
+      alerts.push({
+        key: `drive-offline-${id}`,
+        severity: "info",
+        category: "drive",
+        title: `${name} has been offline ${days} days`,
+        message: `DriveOS has not seen this volume in ${days} days. Re-connect it to refresh its index.`,
+        entityType: "drive",
+        entityId: id,
+        actionScreen: "drive",
+        actionParams: { id },
+      });
+    }
+  }
+
+  // ---- Duplicates ----
+  const openClusters = (input.duplicateClusters || []).filter((c) => (c.status || "open") === "open");
+  const dupWaste = openClusters.reduce((acc, c) => acc + (c.wastedBytes || 0), 0);
+  if (dupWaste >= t.duplicateWarnBytes) {
+    alerts.push({
+      key: "dup-waste",
+      severity: "warning",
+      category: "duplicate",
+      title: `Reclaim ${fmtBytes(dupWaste)} of duplicates`,
+      message: `${openClusters.length} open duplicate cluster${
+        openClusters.length === 1 ? "" : "s"
+      } are wasting ${fmtBytes(dupWaste)} across drives. Review and quarantine the redundant copies.`,
+      actionScreen: "duplicates",
+      metricBytes: dupWaste,
+    });
+  }
+
+  // ---- Safe cleanup ----
+  const safeRecs = (input.recommendations || []).filter(
+    (r) => (r.status || "open") === "open" && (r.riskLevel || "") === "green"
+  );
+  const safeBytes = safeRecs.reduce((acc, r) => acc + (r.affectedBytes || 0), 0);
+  if (safeBytes >= t.cleanupInfoBytes) {
+    alerts.push({
+      key: "cleanup-safe",
+      severity: "success",
+      category: "cleanup",
+      title: `${fmtBytes(safeBytes)} of safe cleanup ready`,
+      message: `${safeRecs.length} low-risk recommendation${
+        safeRecs.length === 1 ? "" : "s"
+      } can free ${fmtBytes(safeBytes)} of cache, proxies, and duplicates with one approval.`,
+      actionScreen: "cleanup",
+      metricBytes: safeBytes,
+    });
+  }
+
+  // ---- Projects ----
+  for (const p of input.projects || []) {
+    const id = projectKey(p);
+    const name = p.name || "Project";
+    const status = (p.status || "active").toLowerCase();
+
+    if (status === "ready_to_archive" || status === "ready") {
+      alerts.push({
+        key: `project-archive-${id}`,
+        severity: "info",
+        category: "archive",
+        title: `${name} is ready to archive`,
+        message: `Delivered and verified. Move ${fmtBytes(p.totalBytes || 0)} to cold archive to free working storage.`,
+        entityType: "project",
+        entityId: id,
+        actionScreen: "project",
+        actionParams: { id },
+        metricBytes: p.totalBytes,
+      });
+    }
+
+    if ((p.riskyBytes || 0) >= t.projectRiskyBytes) {
+      alerts.push({
+        key: `project-risk-${id}`,
+        severity: "critical",
+        category: "project",
+        title: `Single-copy risk: ${name}`,
+        message: `${fmtBytes(p.riskyBytes || 0)} of footage exists on only one drive with no archive or cloud backup.`,
+        entityType: "project",
+        entityId: id,
+        actionScreen: "project",
+        actionParams: { id },
+        metricBytes: p.riskyBytes,
+      });
+    }
+
+    if (
+      p.dueDate != null &&
+      p.dueDate - now <= t.projectDueSoonMs &&
+      p.dueDate - now >= 0 &&
+      (status === "active" || status === "review")
+    ) {
+      const days = Math.max(0, Math.round((p.dueDate - now) / (24 * 60 * 60 * 1000)));
+      alerts.push({
+        key: `project-due-${id}`,
+        severity: "warning",
+        category: "project",
+        title: `${name} is due ${days <= 0 ? "today" : `in ${days} day${days === 1 ? "" : "s"}`}`,
+        message: `Delivery deadline is approaching. Confirm exports and backups are in place.`,
+        entityType: "project",
+        entityId: id,
+        actionScreen: "project",
+        actionParams: { id },
+      });
+    }
+
+    if (
+      p.storageHealthScore != null &&
+      p.storageHealthScore < t.projectHealthFloor &&
+      status !== "archived"
+    ) {
+      alerts.push({
+        key: `project-health-${id}`,
+        severity: "warning",
+        category: "project",
+        title: `${name} structure health is ${Math.round(p.storageHealthScore)}%`,
+        message: `Folder structure is incomplete or cluttered. Run the structure fix to restore the studio template.`,
+        entityType: "project",
+        entityId: id,
+        actionScreen: "project",
+        actionParams: { id },
+      });
+    }
+  }
+
+  // ---- Agents / machines ----
+  for (const m of input.machines || []) {
+    const id = String(m._id || m.id || m.name || "agent");
+    const name = m.name || "Agent";
+    const stale = m.lastSeenAt != null && now - m.lastSeenAt >= t.agentStaleMs;
+    if ((m.status || "online").toLowerCase() === "offline" || stale) {
+      alerts.push({
+        key: `agent-offline-${id}`,
+        severity: "warning",
+        category: "agent",
+        title: `Agent ${name} is offline`,
+        message: `The local DriveOS agent on ${name} has stopped reporting. Scans and cleanup jobs are paused until it reconnects.`,
+        entityType: "machine",
+        entityId: id,
+        actionScreen: "settings",
+      });
+    }
+  }
+
+  alerts.sort((a, b) => {
+    const sev = SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity];
+    if (sev !== 0) return sev;
+    return (b.metricBytes || 0) - (a.metricBytes || 0);
+  });
+
+  return alerts;
+}

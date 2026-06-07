@@ -84,4 +84,10 @@ post("getProject", async (ctx, body) => {
   return { success: true, project };
 });
 
+// Let the agent trigger an alert-feed recompute after a scan completes.
+post("refreshAlerts", async (ctx) => {
+  const result = await ctx.runMutation(api.notifications.refresh, {});
+  return { success: true, ...result };
+});
+
 export default http;

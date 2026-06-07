@@ -4,7 +4,7 @@ import React, { useState, useEffect, useRef, useCallback, Fragment } from "react
 import { DB } from "@/data";
 import { Icon } from "@/components/icons";
 import { Avatar, useToast } from "@/components/components";
-import { useQuery } from "convex/react";
+import { useQuery, useMutation } from "convex/react";
 import { api } from "../../../../convex/_generated/api";
 
 // Import all modularized screens
@@ -148,6 +148,177 @@ function Sidebar({ route, go }: SidebarProps) {
   );
 }
 
+const SEVERITY_META: Record<string, { icon: string; color: string; label: string }> = {
+  critical: { icon: "alert", color: "var(--risk)", label: "Critical" },
+  warning: { icon: "warn", color: "var(--warn)", label: "Warning" },
+  info: { icon: "info", color: "var(--cloud)", label: "Info" },
+  success: { icon: "checkCircle", color: "var(--ok)", label: "Resolved" },
+};
+
+function relativeTime(ts?: number) {
+  if (!ts) return "just now";
+  const diff = Date.now() - ts;
+  if (diff < 60_000) return "just now";
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} hr ago`;
+  const days = Math.floor(hrs / 24);
+  return days === 1 ? "yesterday" : `${days} days ago`;
+}
+
+interface NotificationBellProps {
+  go: (screen: string, params?: any) => void;
+}
+
+function NotificationBell({ go }: NotificationBellProps) {
+  const [open, setOpen] = useState(false);
+  // Local overrides keep the demo (offline) feed interactive even when
+  // the Convex backend is not reachable.
+  const [localRead, setLocalRead] = useState<Record<string, boolean>>({});
+  const [localDismissed, setLocalDismissed] = useState<Record<string, boolean>>({});
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  const liveNotifications = useQuery(api.notifications.list, {});
+  const liveUnread = useQuery(api.notifications.unreadCount, {});
+  const markAllRead = useMutation(api.notifications.markAllRead);
+  const markRead = useMutation(api.notifications.markRead);
+  const dismiss = useMutation(api.notifications.dismiss);
+
+  const isLive = Array.isArray(liveNotifications) && liveNotifications.length > 0;
+
+  const items = React.useMemo(() => {
+    const source = isLive
+      ? (liveNotifications as any[]).map((n) => ({
+          id: n._id,
+          severity: n.severity,
+          category: n.category,
+          title: n.title,
+          message: n.message,
+          actionScreen: n.actionScreen,
+          actionParams: n.actionParams || {},
+          read: n.read,
+          time: relativeTime(n.createdAt),
+        }))
+      : (DB as any).notifications || [];
+    return source
+      .filter((n: any) => !localDismissed[n.id])
+      .map((n: any) => ({ ...n, read: n.read || !!localRead[n.id] }));
+  }, [isLive, liveNotifications, localRead, localDismissed]);
+
+  const unread = isLive
+    ? Math.max(0, (typeof liveUnread === "number" ? liveUnread : 0) - Object.keys(localRead).length)
+    : items.filter((n: any) => !n.read).length;
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const onMarkAll = () => {
+    if (isLive) {
+      markAllRead({}).catch(() => {});
+    } else {
+      const next: Record<string, boolean> = {};
+      for (const n of items) next[n.id] = true;
+      setLocalRead((r) => ({ ...r, ...next }));
+    }
+  };
+
+  const onDismiss = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setLocalDismissed((d) => ({ ...d, [id]: true }));
+    if (isLive) dismiss({ notificationId: id }).catch(() => {});
+  };
+
+  const onOpenItem = (n: any) => {
+    setLocalRead((r) => ({ ...r, [n.id]: true }));
+    if (isLive) markRead({ notificationId: n.id }).catch(() => {});
+    if (n.actionScreen) go(n.actionScreen, n.actionParams || {});
+    setOpen(false);
+  };
+
+  return (
+    <div ref={wrapRef} style={{ position: "relative" }}>
+      <button
+        className="btn ghost icon"
+        title="Notifications"
+        onClick={() => setOpen((o) => !o)}
+        style={{ position: "relative" }}
+      >
+        <Icon name="bell" size={17} />
+        {unread > 0 && <span className="notif-dot">{unread > 9 ? "9+" : unread}</span>}
+      </button>
+
+      {open && (
+        <div className="notif-panel">
+          <div className="notif-head">
+            <div className="row" style={{ gap: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: "var(--tx-hi)" }}>Alerts</span>
+              {unread > 0 && <span className="notif-count">{unread} unread</span>}
+            </div>
+            {items.length > 0 && (
+              <button className="notif-link" onClick={onMarkAll}>
+                Mark all read
+              </button>
+            )}
+          </div>
+
+          <div className="notif-list">
+            {items.length === 0 ? (
+              <div className="notif-empty">
+                <Icon name="checkCircle" size={22} style={{ color: "var(--ok)" }} />
+                <div style={{ fontSize: 12.5, color: "var(--tx-mut)", marginTop: 8 }}>
+                  You&apos;re all caught up
+                </div>
+              </div>
+            ) : (
+              items.map((n: any) => {
+                const meta = SEVERITY_META[n.severity] || SEVERITY_META.info;
+                return (
+                  <div
+                    key={n.id}
+                    className={"notif-item" + (n.read ? " read" : "")}
+                    onClick={() => onOpenItem(n)}
+                  >
+                    <span className="notif-ico" style={{ background: meta.color + "22", color: meta.color }}>
+                      <Icon name={meta.icon} size={15} />
+                    </span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div className="notif-title">
+                        {!n.read && <span className="notif-unread-dot" />}
+                        {n.title}
+                      </div>
+                      <div className="notif-msg">{n.message}</div>
+                      <div className="notif-time">{n.time}</div>
+                    </div>
+                    <button
+                      className="notif-dismiss"
+                      title="Dismiss"
+                      onClick={(e) => onDismiss(n.id, e)}
+                    >
+                      <Icon name="x" size={13} />
+                    </button>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface TopBarProps {
   go: (screen: string, params?: any) => void;
   route: { screen: string; params: any };
@@ -182,9 +353,7 @@ function TopBar({ go, route }: TopBarProps) {
         <span className="kbd">⌘K</span>
       </div>
       <div className="topbar-actions">
-        <button className="btn ghost icon" title="Notifications">
-          <Icon name="bell" size={17} />
-        </button>
+        <NotificationBell go={go} />
         <button className="btn ghost icon" title="Refresh all agents">
           <Icon name="refresh" size={16} />
         </button>

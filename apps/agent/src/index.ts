@@ -696,6 +696,9 @@ program
       errorsCount,
     });
 
+    // Recompute the studio-wide alert feed from the freshly indexed state.
+    await syncToConvex("refreshAlerts", {});
+
     console.log(`[Scan Complete] Scanned ${fileCount} file(s), ${(byteCount / 1024 ** 4).toFixed(2)} TB, errors: ${errorsCount}`);
   });
 

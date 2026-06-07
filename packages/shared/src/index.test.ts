@@ -1,4 +1,6 @@
-import { classifyFile, calculateFileRisk, calculateProjectHealth } from "./index";
+import { classifyFile, calculateFileRisk, calculateProjectHealth, deriveAlerts } from "./index";
+
+const TB = 1024 ** 4;
 
 describe("DriveOS shared library classification rules", () => {
   test("Classify raw camera footage files", () => {
@@ -59,5 +61,115 @@ describe("DriveOS shared library classification rules", () => {
 
     // Project missing final deliverable and RAW camera files
     expect(calculateProjectHealth(100, 1000, 0, 0, false, true, false)).toBe(65); // deducts 15 for finals, 20 for raw
+  });
+});
+
+describe("DriveOS notifications & alerts engine", () => {
+  const now = 1_700_000_000_000;
+
+  test("Flags a near-full working drive as critical", () => {
+    const alerts = deriveAlerts({
+      drives: [
+        { _id: "d1", label: "CJ Working SSD", capacityBytes: 4 * TB, usedBytes: 3.8 * TB, status: "online", cleanTB: 0.6 },
+      ],
+      now,
+    });
+    const drive = alerts.find((a) => a.key === "drive-full-d1");
+    expect(drive).toBeDefined();
+    expect(drive!.severity).toBe("critical");
+    expect(drive!.actionScreen).toBe("drive");
+    expect(drive!.actionParams).toEqual({ id: "d1" });
+    expect(drive!.message).toContain("recover");
+  });
+
+  test("Uses a warning (not critical) for moderately full drives", () => {
+    const alerts = deriveAlerts({
+      drives: [{ _id: "d2", label: "Master 02", capacityBytes: 20 * TB, usedBytes: 17 * TB, status: "online" }],
+      now,
+    });
+    const drive = alerts.find((a) => a.key === "drive-full-d2");
+    expect(drive?.severity).toBe("warning");
+  });
+
+  test("Does not warn on healthy, cloud, or uninitialized capacity drives", () => {
+    const alerts = deriveAlerts({
+      drives: [
+        { _id: "ok", label: "Healthy", capacityBytes: 10 * TB, usedBytes: 2 * TB, status: "online" },
+        { _id: "cloud", label: "GDrive", capacityBytes: 20 * TB, usedBytes: 19 * TB, status: "cloud" },
+      ],
+      now,
+    });
+    expect(alerts.find((a) => a.key === "drive-full-ok")).toBeUndefined();
+    expect(alerts.find((a) => a.key === "drive-full-cloud")).toBeUndefined();
+  });
+
+  test("Surfaces an init alert for uninitialized drives", () => {
+    const alerts = deriveAlerts({
+      drives: [{ _id: "new", label: "Japan Storage 01", capacityBytes: 20 * TB, usedBytes: 0, status: "uninit" }],
+      now,
+    });
+    expect(alerts.find((a) => a.key === "drive-uninit-new")?.severity).toBe("info");
+  });
+
+  test("Aggregates duplicate waste above the threshold", () => {
+    const alerts = deriveAlerts({
+      duplicateClusters: [
+        { status: "open", wastedBytes: 0.8 * TB },
+        { status: "open", wastedBytes: 0.5 * TB },
+        { status: "resolved", wastedBytes: 5 * TB },
+      ],
+      now,
+    });
+    const dup = alerts.find((a) => a.key === "dup-waste");
+    expect(dup).toBeDefined();
+    expect(dup!.metricBytes).toBeCloseTo(1.3 * TB, -9);
+    expect(dup!.message).toContain("2 open duplicate clusters");
+  });
+
+  test("Reports safe cleanup only for open green recommendations", () => {
+    const alerts = deriveAlerts({
+      recommendations: [
+        { status: "open", riskLevel: "green", affectedBytes: 0.4 * TB },
+        { status: "open", riskLevel: "green", affectedBytes: 0.3 * TB },
+        { status: "open", riskLevel: "red", affectedBytes: 9 * TB },
+        { status: "completed", riskLevel: "green", affectedBytes: 9 * TB },
+      ],
+      now,
+    });
+    const cleanup = alerts.find((a) => a.key === "cleanup-safe");
+    expect(cleanup?.severity).toBe("success");
+    expect(cleanup!.metricBytes).toBeCloseTo(0.7 * TB, -9);
+  });
+
+  test("Flags single-copy project risk and ready-to-archive projects", () => {
+    const alerts = deriveAlerts({
+      projects: [
+        { _id: "p1", name: "Brand Films", status: "active", riskyBytes: 0.9 * TB, storageHealthScore: 64 },
+        { _id: "p2", name: "Client Launch", status: "ready_to_archive", totalBytes: 0.92 * TB, storageHealthScore: 88 },
+      ],
+      now,
+    });
+    expect(alerts.find((a) => a.key === "project-risk-p1")?.severity).toBe("critical");
+    expect(alerts.find((a) => a.key === "project-archive-p2")?.severity).toBe("info");
+  });
+
+  test("Flags due-soon projects and stale agents", () => {
+    const alerts = deriveAlerts({
+      projects: [{ _id: "p3", name: "Spot", status: "active", dueDate: now + 2 * 24 * 60 * 60 * 1000 }],
+      machines: [{ _id: "m1", name: "CJ-Workstation", status: "online", lastSeenAt: now - 60 * 60 * 1000 }],
+      now,
+    });
+    expect(alerts.find((a) => a.key === "project-due-p3")?.severity).toBe("warning");
+    expect(alerts.find((a) => a.key === "agent-offline-m1")?.severity).toBe("warning");
+  });
+
+  test("Sorts critical alerts before lower-severity ones", () => {
+    const alerts = deriveAlerts({
+      drives: [{ _id: "d", label: "Full", capacityBytes: 4 * TB, usedBytes: 3.9 * TB, status: "online" }],
+      recommendations: [{ status: "open", riskLevel: "green", affectedBytes: 2 * TB }],
+      now,
+    });
+    expect(alerts[0].severity).toBe("critical");
+    expect(alerts[alerts.length - 1].severity).toBe("success");
   });
 });

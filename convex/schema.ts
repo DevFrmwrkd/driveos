@@ -96,7 +96,11 @@ export default defineSchema({
     .index("by_classification", ["classification"])
     .index("by_riskLevel", ["riskLevel"])
     .index("by_sizeBytes", ["sizeBytes"])
-    .index("by_lastSeenAt", ["lastSeenAt"]),
+    .index("by_lastSeenAt", ["lastSeenAt"])
+    .searchIndex("search_name", {
+      searchField: "name",
+      filterFields: ["classification", "riskLevel", "source", "driveId", "projectId"],
+    }),
 
   projects: defineTable({
     name: v.string(),
@@ -246,4 +250,27 @@ export default defineSchema({
     metadata: v.optional(v.any()),
     createdAt: v.number(),
   }).index("by_createdAt", ["createdAt"]),
+
+  notifications: defineTable({
+    key: v.string(), // stable de-dupe key from the alerts engine
+    severity: v.string(), // "critical" | "warning" | "info" | "success"
+    category: v.string(), // "drive" | "project" | "duplicate" | "cleanup" | "agent" | "cloud" | "archive" | "system"
+    title: v.string(),
+    message: v.string(),
+    entityType: v.optional(v.string()),
+    entityId: v.optional(v.string()),
+    actionScreen: v.optional(v.string()), // web route to deep-link to
+    actionParams: v.optional(v.any()),
+    metricBytes: v.optional(v.number()),
+    source: v.string(), // "auto" (derived) | "manual"
+    read: v.boolean(),
+    dismissed: v.boolean(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+    lastSeenAt: v.number(),
+  })
+    .index("by_key", ["key"])
+    .index("by_read", ["read"])
+    .index("by_dismissed", ["dismissed"])
+    .index("by_createdAt", ["createdAt"]),
 });
