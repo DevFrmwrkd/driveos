@@ -11,8 +11,33 @@ DriveOS is a highly optimized, production-grade **Storage Command Center** desig
 *   **🧠 Intelligent File Classification**: Automatic file detection (RAW, Proxy, Cache, Export-Final, stock footage, documents, fonts, etc.) based on advanced extension mapping, filename structures, and relative paths.
 *   **⚖️ Automatic Risk Leveling**: Categorization of files into risk tiers (Green = Safe to purge, Yellow = Review needed, Red = High risk / protected).
 *   **🛡️ Non-Destructive Quarantine**: All cleanup actions move files to a secure, reversible quarantine buffer (`.driveos_quarantine/YYYY-MM-DD/`) rather than deleting them immediately, providing a 14-day rollback safeguard.
-*   **🪄 Create Project Wizard**: Instantly scaffold standardized project folders (ADMIN, RAW, DAVINCI/PREMIERE, SOCIAL_CUTDOWNS, MANIFESTS) with zero chaos.
+*   **🪄 Create Project Wizard**: Instantly scaffold standardized project folders (ADMIN, RAW, DAVINCI/PREMIERE, SOCIAL_CUTDOWNS, MANIFESTS) with zero chaos. The wizard now persists projects to Convex and queues the folder-creation agent job automatically.
+*   **🔔 Notifications & Alerts Center**: A live, studio-wide alert feed (full drives, single-copy footage risk, duplicate waste, projects ready to archive, offline agents, safe-cleanup opportunities) derived by a deterministic engine. Surfaced in the top-bar bell with unread counts, mark-all-read, dismiss, and click-to-navigate deep links.
+*   **🔎 Global File Search**: Full-text search across every indexed file name (with classification / risk / drive / project facet filters) backed by a Convex search index.
+*   **⏱️ Scheduled Maintenance**: Convex cron jobs continuously re-cluster duplicates, regenerate cleanup recommendations, and recompute the alert feed.
 *   **🔗 Real-Time Backend**: Built on Convex's real-time document engine for collaborative synchronization across all editing workstations.
+
+---
+
+## ✨ Feature Modules (for developers taking over)
+
+These features are self-contained and clearly separated so they can be picked up independently:
+
+### `feature/notifications-alerts-center`
+*   **Engine** — `deriveAlerts()` in `packages/shared/src/index.ts` is a pure, unit-tested function (`packages/shared/src/index.test.ts`) that turns the current storage state (drives, projects, duplicate clusters, recommendations, machines) into ranked `AlertSignal`s with stable de-dupe keys and deep-link routes. Thresholds live in `DEFAULT_ALERT_THRESHOLDS`.
+*   **Backend** — `convex/notifications.ts` (`list`, `unreadCount`, `markRead`, `markAllRead`, `dismiss`, `create`, `refresh`). `refresh` upserts derived alerts by `key`, preserves read state, and auto-resolves cleared alerts. Table defined in `convex/schema.ts` (`notifications`). HTTP trigger: `POST /api/refreshAlerts`. The agent calls it after every `scan`.
+*   **UI** — `NotificationBell` in `apps/web/src/app/page.tsx` + styles in `apps/web/src/app/globals.css` (`.notif-*`). Falls back to `DB.notifications` (`apps/web/src/data.ts`) when Convex is offline so the demo stays interactive.
+
+### `feature/global-file-search`
+*   **Index** — `files.search_name` search index in `convex/schema.ts` (searchField `name`, facet filters `classification`, `riskLevel`, `source`, `driveId`, `projectId`).
+*   **Backend** — `files.search` query in `convex/files.ts`.
+*   **UI** — `LiveFileResults` in `apps/web/src/screens/screens-search.tsx`, wired via `useQuery(api.files.search, …)` with a `"skip"` token when the box is empty.
+
+### `feature/live-project-provisioning`
+*   The Create Project wizard (`apps/web/src/screens/screens-wizard.tsx`) calls `api.projects.create`, builds the `rootPath`, maps the storage tier/template, and degrades gracefully to the success screen when offline.
+
+### `feature/scheduled-maintenance`
+*   `convex/crons.ts` schedules `duplicates.runDuplicateDetection`, `recommendations.generateRecommendations`, and `notifications.refresh`.
 
 ---
 
