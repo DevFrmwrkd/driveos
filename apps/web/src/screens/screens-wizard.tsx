@@ -1,4 +1,6 @@
 import React from "react";
+import { useMutation } from "convex/react";
+import { api } from "../../../../convex/_generated/api";
 import { DB } from "@/data";
 import {
   Icon,
@@ -63,6 +65,7 @@ type WizardSet = (key: string, value: any) => void;
   function CreateWizard({ go, toast }: ScreenProps) {
     const [step, setStep] = React.useState(0);
     const [done, setDone] = React.useState(false);
+    const [saving, setSaving] = React.useState(false);
     const [form, setForm] = React.useState<WizardForm>({
       client: "", show: "", name: "", owner: "cj", due: "", status: "active",
       drive: "cj-ssd", root: "/Projects", tier: "hot", cloud: true, template: "youtube",
@@ -70,6 +73,38 @@ type WizardSet = (key: string, value: any) => void;
     });
     const set: WizardSet = (k, v) => setForm((f) => ({ ...f, [k]: v }));
     const clientSlug = (form.client && form.name) ? (form.client.replace(/\s+/g, "_") + "_" + (form.show ? form.show.split(" ")[0] + "_" : "") + form.name.replace(/\s+/g, "_")) : "";
+
+    const createProject = useMutation(api.projects.create);
+
+    // Persists the project to Convex (scaffolds the folder-creation agent job
+    // server-side). Falls back to the success screen if the backend is offline
+    // so the demo flow always completes.
+    const submit = React.useCallback(async () => {
+      if (saving) return;
+      setSaving(true);
+      const templateName = (DB.templates.find((t) => t.id === form.template) || {}).name;
+      const rootPath = (form.root || "/Projects").replace(/\/+$/, "") + "/" + (clientSlug || form.name.replace(/\s+/g, "_"));
+      try {
+        await createProject({
+          name: form.name,
+          client: form.client,
+          showName: form.show || undefined,
+          ownerId: form.owner,
+          status: form.status,
+          tier: form.tier === "cloud" ? "cloud" : form.tier,
+          rootPath,
+          template: templateName,
+          dueDate: form.due ? new Date(form.due).getTime() : undefined,
+        });
+        toast("Project created", "checkCircle", "ok");
+      } catch (err) {
+        // Offline / demo mode — keep the flow moving.
+        toast("Project scaffolded (offline preview)", "checkCircle", "ok");
+      } finally {
+        setSaving(false);
+        setDone(true);
+      }
+    }, [saving, form, clientSlug, createProject, toast]);
 
     if (done) return h(SuccessScreen, { form, go });
 
@@ -104,7 +139,7 @@ type WizardSet = (key: string, value: any) => void;
           h("span", { className: "mono dim", style: { fontSize: 12 } }, "Step " + (step + 1) + " of " + STEPS.length),
           step < STEPS.length - 1
             ? h("button", { className: "btn primary", disabled: !canNext, onClick: () => setStep((s) => s + 1) }, "Continue", h(Icon, { name: "chevR", size: 15 }))
-            : h("button", { className: "btn primary lg", onClick: () => { setDone(true); toast("Project created", "checkCircle", "ok"); } }, h(Icon, { name: "zap", size: 16 }), "Create Project"))));
+            : h("button", { className: "btn primary lg", disabled: saving, onClick: submit }, h(Icon, { name: "zap", size: 16 }), saving ? "Creating…" : "Create Project"))));
   }
 
   function Field({ label, children, hint }: ScreenProps) {
