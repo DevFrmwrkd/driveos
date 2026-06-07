@@ -1,4 +1,6 @@
 import React from "react";
+import { useQuery } from "convex/react";
+import { api } from "../../../../convex/_generated/api";
 import { DB } from "@/data";
 import {
   Icon,
@@ -56,9 +58,13 @@ type RoleMeta = Record<string, [string, string, string]>;
 
     const ql = q.trim().toLowerCase();
     const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const showSample = ql && norm("A001_C004").includes(norm(q)) && norm(q).length > 1;
+    // Live full-text file search against Convex (skips when the box is empty).
+    const fileResults = useQuery(api.files.search, ql ? { query: q.trim(), limit: 12 } : "skip") as any[] | undefined;
+    const hasFileResults = Array.isArray(fileResults) && fileResults.length > 0;
+    const showSample = ql && !hasFileResults && norm("A001_C004").includes(norm(q)) && norm(q).length > 1;
     const projHits = ql ? DB.projects.filter((p) => [p.name, p.client, p.show].filter(Boolean).join(" ").toLowerCase().includes(ql)) : [];
     const driveHits = ql ? DB.drives.filter((d) => [d.name, d.model, d.id].filter(Boolean).join(" ").toLowerCase().includes(ql)) : [];
+    const noResults = ql && !showSample && !hasFileResults && projHits.length === 0 && driveHits.length === 0;
 
     return h("div", { className: "page-inner", style: { maxWidth: 920 } },
       h(PageHead, { eyebrow: "System", title: "Search", desc: "Find any file, hash, project, drive, or folder across every tracked volume and the cloud." }),
@@ -75,6 +81,9 @@ type RoleMeta = Record<string, [string, string, string]>;
         h("div", { className: "eyebrow", style: { marginBottom: 10 } }, "Try searching"),
         h("div", { className: "chip-row" }, ["A001_C004", "Show X", "CJ Working SSD", "city_timelapse", "xxh64:9f3a"].map((s: string) =>
           h("button", { key: s, className: "tag", style: { cursor: "pointer", height: 30, padding: "0 12px" }, onClick: () => setQ(s) }, h(Icon, { name: "search", size: 12 }), s)))),
+
+      // live file matches from Convex
+      hasFileResults && h(LiveFileResults, { results: fileResults, go }),
 
       // sample file result
       showSample && h(FileResult, { go, toast }),
@@ -94,8 +103,28 @@ type RoleMeta = Record<string, [string, string, string]>;
             h(StatusBadge, { status: d.status }))))) ),
 
       // no results
-      ql && !showSample && projHits.length === 0 && driveHits.length === 0 &&
+      noResults &&
         h("div", { className: "card" }, h("div", { className: "empty" }, h("div", { className: "empty-ico" }, h(Icon, { name: "search", size: 24 })), h("h3", null, "No matches for “" + q + "”"), h("div", { className: "muted" }, "Try a filename, project, drive, or a fingerprint hash."))));
+  }
+
+  const FILE_RISK_KIND: Record<string, string> = { green: "ok", yellow: "warn", red: "risk", unknown: "" };
+
+  function LiveFileResults({ results, go }: ScreenProps) {
+    return cardShell("Files · " + results.length, "film", "var(--ft-raw)", h(Badge, { square: true }, "Indexed metadata"),
+      h("div", { style: { padding: "6px 0" } }, results.map((f: any) => {
+        const sizeGB = (f.sizeBytes || 0) / (1024 ** 3);
+        const drive = DB.driveById[f.driveId] || DB.drives.find((d) => d.id === f.driveId);
+        return h("div", { key: f._id, className: "offender-row spread", onClick: () => f.driveId && go("drive", { id: f.driveId }), style: { padding: "11px 18px", cursor: f.driveId ? "pointer" : "default" } },
+          h("div", { style: { minWidth: 0, flex: 1 } },
+            h("div", { className: "row", style: { gap: 9, minWidth: 0 } },
+              h("span", { className: "mono hi", style: { fontWeight: 600, fontSize: 12.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, f.name),
+              f.classification && h(Badge, { square: true }, f.classification)),
+            h("div", { className: "mono", style: { fontSize: 11, color: "var(--tx-dim)", marginTop: 3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, f.path)),
+          h("div", { className: "row", style: { gap: 10, flexShrink: 0 } },
+            drive && h("span", { className: "muted", style: { fontSize: 11.5 } }, drive.name),
+            h("span", { className: "mono dim", style: { fontSize: 11.5 } }, sizeGB >= 1 ? sizeGB.toFixed(1) + " GB" : Math.round(sizeGB * 1024) + " MB"),
+            h(Badge, { kind: FILE_RISK_KIND[f.riskLevel] || "" }, f.riskLevel || "—")));
+      })));
   }
 
   function FileResult({ go, toast }: ScreenProps) {

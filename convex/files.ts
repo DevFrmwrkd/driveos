@@ -51,6 +51,38 @@ export const getByHash = query({
   },
 });
 
+// Full-text search across indexed file names, with optional facet filters.
+export const search = query({
+  args: {
+    query: v.string(),
+    limit: v.optional(v.number()),
+    classification: v.optional(v.string()),
+    riskLevel: v.optional(v.string()),
+    source: v.optional(v.string()),
+    driveId: v.optional(v.string()),
+    projectId: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const term = args.query.trim();
+    if (!term) return [];
+
+    const results = await ctx.db
+      .query("files")
+      .withSearchIndex("search_name", (q) => {
+        let search = q.search("name", term);
+        if (args.classification) search = search.eq("classification", args.classification);
+        if (args.riskLevel) search = search.eq("riskLevel", args.riskLevel);
+        if (args.source) search = search.eq("source", args.source);
+        if (args.driveId) search = search.eq("driveId", args.driveId);
+        if (args.projectId) search = search.eq("projectId", args.projectId);
+        return search;
+      })
+      .take(args.limit ?? 25);
+
+    return results;
+  },
+});
+
 export const uploadBatch = mutation({
   args: {
     scanSessionId: v.string(),
