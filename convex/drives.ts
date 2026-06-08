@@ -1,10 +1,46 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { requireMember } from "./access";
 
 export const list = query({
   args: {},
   handler: async (ctx) => {
     return await ctx.db.query("drives").collect();
+  },
+});
+
+// Stop tracking a drive: removes the drive and its file records (and any
+// now-empty duplicate clusters). Requires a signed-in team member. This only
+// affects DriveOS's catalog — it never touches the actual disk.
+export const remove = mutation({
+  args: { driveId: v.string() },
+  handler: async (ctx, args) => {
+    const member = await requireMember(ctx);
+    const driveId = ctx.db.normalizeId("drives", args.driveId);
+    if (!driveId) return { removed: false };
+
+    const drive = await ctx.db.get(driveId);
+    if (!drive) return { removed: false };
+
+    // Delete the drive's file records.
+    const files = await ctx.db
+      .query("files")
+      .withIndex("by_drive", (q) => q.eq("driveId", driveId))
+      .collect();
+    for (const f of files) await ctx.db.delete(f._id);
+
+    await ctx.db.delete(driveId);
+
+    await ctx.db.insert("auditLogs", {
+      actorId: member.email,
+      action: "drive_remove",
+      entityType: "drive",
+      entityId: driveId,
+      message: `Stopped tracking drive "${drive.label}" and removed ${files.length} file record(s).`,
+      createdAt: Date.now(),
+    });
+
+    return { removed: true, filesRemoved: files.length };
   },
 });
 
