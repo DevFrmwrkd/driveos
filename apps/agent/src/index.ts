@@ -85,7 +85,7 @@ const DEFAULT_CONFIG: DriveOSConfig = {
   ownerId: "cj",
   convexUrl: DEFAULT_CONVEX_URL,
   quarantineRoot: path.join(AGENT_HOME, "quarantine"),
-  scanRoots: ["./temp_test_drive"],
+  scanRoots: [],
   minFileSizeBytes: ONE_MB,
   fullHash: false,
 };
@@ -691,7 +691,7 @@ async function runSyncCycle(config: DriveOSConfig, options: ScanOptions = {}): P
 
   const roots = config.scanRoots.filter(Boolean);
   if (roots.length === 0) {
-    console.warn("[Sync] No scan roots configured. Set them with `driveos-agent init --roots ...`.");
+    console.log("[Sync] No folders are being tracked yet. Add a drive or folder to start scanning.");
     return null;
   }
 
@@ -699,10 +699,16 @@ async function runSyncCycle(config: DriveOSConfig, options: ScanOptions = {}): P
   const totals: ScanResult = { fileCount: 0, byteCount: 0, errorsCount: 0, skippedUnstable: 0 };
 
   for (const root of roots) {
+    // Roots must be absolute. A relative root can't be resolved reliably from a
+    // packaged app (cwd is the app folder, not the project), so flag it clearly.
+    if (!path.isAbsolute(root)) {
+      console.warn(`[Sync] Ignoring folder "${root}" — please re-add it as a full path via Add drive.`);
+      continue;
+    }
     const resolved = path.resolve(root);
     if (!fs.existsSync(resolved)) {
       // Disconnected drive / missing root: skip safely, keep last-known catalog in Convex.
-      console.warn(`[Sync] Scan root unavailable (skipped, last-known catalog kept): ${resolved}`);
+      console.warn(`[Sync] Folder not found right now (skipped, last catalog kept): ${resolved}`);
       continue;
     }
     try {
@@ -746,8 +752,10 @@ program
   .option("--full-hash", "Calculate streaming SHA-256 hashes during scans")
   .option("--allow-cloud-root", "Allow cloud-synced folders as scan roots with metadata-only warnings")
   .action((options) => {
+    // Store roots as absolute paths so they resolve correctly even when the agent
+    // runs from inside a packaged desktop app (where cwd is the app folder).
     const scanRoots = options.roots
-      ? String(options.roots).split(",").map((root) => root.trim()).filter(Boolean)
+      ? String(options.roots).split(",").map((root) => root.trim()).filter(Boolean).map((root) => path.resolve(root))
       : DEFAULT_CONFIG.scanRoots;
 
     const config: DriveOSConfig = {
@@ -864,6 +872,15 @@ program
     fs.chmodSync(path.join(hookDir, "scan.sh"), 0o755);
     fs.chmodSync(path.join(hookDir, "watch.sh"), 0o755);
 
+    // Register the folder so the scheduled `sync` actually scans it. Normalize
+    // every root to an absolute path (dropping any stale relative entries) and
+    // dedupe, so the desktop "Add drive" reliably starts tracking the folder.
+    const existing = config.scanRoots.map((r) => path.resolve(r));
+    const merged = Array.from(new Set([...existing, root]));
+    config.scanRoots = merged;
+    saveConfig(config);
+    console.log(`[Success] Now tracking ${root} for hourly sync.`);
+
     console.log(`[Success] Installed DriveOS hooks in ${hookDir}`);
   });
 
@@ -950,10 +967,14 @@ program
 program
   .command("status")
   .description("Show agent scheduler state (paused/running, last sync)")
-  .action(() => {
+  .option("--json", "Emit machine-readable JSON (used by the desktop tray app)")
+  .action((options) => {
     const state = loadState();
     const config = loadConfig();
-    console.log({
+    const status = {
+      connected: Boolean(config.authToken),
+      machineName: config.machineName,
+      convexUrl: config.convexUrl,
       paused: state.paused,
       pausedAt: state.pausedAt,
       scanRoots: config.scanRoots,
@@ -962,7 +983,13 @@ program
       lastSyncFiles: state.lastSyncFiles,
       lastSyncTB: state.lastSyncBytes ? (state.lastSyncBytes / 1024 ** 4).toFixed(2) : undefined,
       appDataDir: AGENT_HOME,
-    });
+    };
+    if (options.json) {
+      // Single clean JSON line so the tray app can parse stdout reliably.
+      process.stdout.write(JSON.stringify(status) + "\n");
+    } else {
+      console.log(status);
+    }
   });
 
 program

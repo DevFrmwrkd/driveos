@@ -1,0 +1,25 @@
+{
+  "name": "driveos-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DriveOS Agent — desktop tray app for non-technical editors",
+  "main": "dist/main.js",
+  "author": "DriveOS",
+  "scripts": {
+    "build:agent": "npm --prefix ../agent run build && npm --prefix ../agent run bundle",
+    "build:main": "tsc -p tsconfig.json",
+    "build": "npm run build:agent && npm run build:main",
+    "start": "npm run build && electron .",
+    "dist": "npm run build && electron-builder",
+    "dist:win": "npm run build && electron-builder --win",
+    "dist:mac": "npm run build && electron-builder --mac"
+  },
+  "dependencies": {
+    "auto-launch": "^5.0.6"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.0.0"
+  }
+}

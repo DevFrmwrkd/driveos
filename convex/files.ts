@@ -111,12 +111,19 @@ export const uploadBatch = mutation({
         }
       }
 
-      // Check if file record already exists
-      const existing = await ctx.db
-        .query("files")
-        .withIndex("by_drive", (q) => q.eq("driveId", args.driveId))
-        .filter((q) => q.eq(q.field("path"), f.path))
-        .first();
+      // Check if file record already exists. Use the normalized driveId; when a
+      // drive is known, scope by the by_drive index, otherwise fall back to a
+      // path match so an undefined driveId can't dedupe against unrelated files.
+      const existing = driveIdObj
+        ? await ctx.db
+            .query("files")
+            .withIndex("by_drive", (q) => q.eq("driveId", driveIdObj))
+            .filter((q) => q.eq(q.field("path"), f.path))
+            .first()
+        : await ctx.db
+            .query("files")
+            .filter((q) => q.eq(q.field("path"), f.path))
+            .first();
 
       if (existing) {
         await ctx.db.patch(existing._id, {
@@ -138,7 +145,7 @@ export const uploadBatch = mutation({
         newFilesCount++;
         await ctx.db.insert("files", {
           projectId: resolvedProjectId,
-          driveId: args.driveId,
+          driveId: driveIdObj ?? args.driveId,
           machineId: args.machineId,
           source: "local",
           path: f.path,

@@ -6,6 +6,10 @@ import ConvexClientProvider from "@/components/ConvexClientProvider";
 export const metadata: Metadata = {
   title: "DriveOS — Storage Command Center",
   description: "Mission control for video production and studio storage networks",
+  icons: {
+    icon: "/icon.png",
+    apple: "/apple-icon.png",
+  },
 };
 
 export default function RootLayout({

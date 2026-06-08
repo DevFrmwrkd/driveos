@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline';" />
+  <title>DriveOS Agent</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="head">
+      <div class="brand">
+        <img class="mark" src="logo.png" alt="DriveOS" onerror="this.style.display='none'" />
+        <div>
+          <div class="title">DriveOS</div>
+          <div class="sub">Storage Agent</div>
+        </div>
+      </div>
+      <span id="pill" class="pill off">Not connected</span>
+    </header>
+
+    <!-- CONNECT VIEW -->
+    <section id="connect-view" class="view">
+      <h2>Connect this Mac/PC to DriveOS</h2>
+      <p class="muted">
+        In the DriveOS dashboard, open <b>Settings → Machines</b>, add this computer,
+        and copy the one-time token. Paste it below.
+      </p>
+      <label class="lbl">Machine name</label>
+      <input id="machine" class="input" placeholder="e.g. Editing-Bay-1" />
+      <label class="lbl">Connect token</label>
+      <input id="token" class="input mono" placeholder="Paste the token from the dashboard" />
+      <label class="lbl">Backend URL <span class="muted">(usually pre-filled)</span></label>
+      <input id="url" class="input mono" placeholder="https://your-app.convex.cloud" />
+      <button id="connect-btn" class="btn primary">Connect</button>
+      <div id="connect-msg" class="msg"></div>
+      <button id="open-dash" class="link">Open the DriveOS dashboard ↗</button>
+    </section>
+
+    <!-- STATUS VIEW -->
+    <section id="status-view" class="view hidden">
+      <div class="stat-grid">
+        <div class="stat"><div class="stat-k">Status</div><div id="s-state" class="stat-v">—</div></div>
+        <div class="stat"><div class="stat-k">Last sync</div><div id="s-last" class="stat-v">—</div></div>
+        <div class="stat"><div class="stat-k">Files last sync</div><div id="s-files" class="stat-v">—</div></div>
+        <div class="stat"><div class="stat-k">Machine</div><div id="s-machine" class="stat-v">—</div></div>
+      </div>
+
+      <div class="row">
+        <button id="scan-btn" class="btn primary">Scan Now</button>
+        <button id="pause-btn" class="btn">Pause</button>
+        <button id="adddrive-btn" class="btn">Add drive…</button>
+      </div>
+
+      <label class="toggle">
+        <input type="checkbox" id="autolaunch" />
+        <span>Start DriveOS automatically when I log in</span>
+      </label>
+
+      <div class="drives">
+        <div class="lbl">Tracked folders</div>
+        <ul id="roots" class="roots"><li class="muted">—</li></ul>
+      </div>
+
+      <div class="logwrap">
+        <div class="lbl">Recent activity</div>
+        <pre id="log" class="log"></pre>
+      </div>
+    </section>
+  </div>
+  <script src="renderer.js"></script>
+</body>
+</html>
