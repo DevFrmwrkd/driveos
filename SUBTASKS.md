@@ -67,3 +67,29 @@ After scans.complete, trigger duplicates.runDuplicateDetection + recommendations
 Keep it batched / once-per-cycle — don't run on every file.
 
 Files: convex/scans.ts, convex/duplicates.ts, convex/recommendations.ts.
+
+
+
+6. Non-technical installer + connect/login flow
+
+
+Editors are non-technical — no Node / npm / build steps.
+
+Do:
+
+Package the agent as a self-contained binary / installer (pkg, bun build --compile, or a small tray/menu app) for macOS (Windows if needed).
+First-run "Connect to DriveOS" flow: log in to the dashboard, store backend URL + token locally (in the app-data dir).
+Simple local UI/tray exposing: connected drives, Add drive, Scan Now, enable hourly, pause, create project, last-sync status, and errors in plain language.
+
+
+7. Auth & access control (dashboard + agent → backend)
+
+No auth anywhere. HTTP endpoints accept an authToken but never validate it.
+
+Do:
+
+Add auth to the dashboard (Convex Auth / Clerk).
+Issue + validate a per-machine token on the agent HTTP endpoints; reject unauthenticated calls.
+Gate metadata reads/writes to authorized team members.
+
+Files: convex/http.ts (token currently accepted but unchecked), apps/web provider/auth.

@@ -781,6 +781,56 @@ program
   });
 
 program
+  .command("connect")
+  .description("Connect this machine to DriveOS: store backend URL + machine token (from the dashboard)")
+  .requiredOption("--token <token>", "Per-machine token issued by the DriveOS dashboard")
+  .requiredOption("--machine <name>", "Machine name this token was issued for")
+  .option("-c, --convex <url>", "Convex deployment URL (.convex.cloud or .convex.site)", DEFAULT_CONVEX_URL)
+  .option("-o, --owner <ownerId>", "Owner / Lead Editor ID")
+  .action(async (options) => {
+    const config = loadConfig();
+    const next: DriveOSConfig = {
+      ...config,
+      convexUrl: options.convex || config.convexUrl,
+      machineName: options.machine,
+      authToken: String(options.token).trim(),
+      ownerId: options.owner || config.ownerId,
+    };
+    enforceLocalStatePath("Agent data directory", AGENT_HOME);
+
+    // Verify the token with a direct authenticated call so we can distinguish a
+    // rejected token (401) from a real network outage before saving.
+    const baseUrl = resolveConvexHttpUrl(next.convexUrl);
+    try {
+      const res = await fetch(`${baseUrl}/api/registerMachine`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${next.authToken}` },
+        body: JSON.stringify({
+          name: next.machineName,
+          ownerId: next.ownerId,
+          agentVersion: AGENT_VERSION,
+          platform: process.platform,
+        }),
+      });
+      if (res.status === 401) {
+        console.error("[Connect] Token rejected (401). Re-issue a token in the dashboard for this machine and try again.");
+        process.exit(1);
+      }
+      if (!res.ok) {
+        console.error(`[Connect] Backend error ${res.status}. Saved nothing.`);
+        process.exit(1);
+      }
+      saveConfig(next);
+      console.log(`[Connect] Connected as "${next.machineName}". Backend: ${next.convexUrl}`);
+      console.log("[Connect] Token stored in the app-data config. You can now run `driveos-agent scan-now` or `sync`.");
+    } catch (err: any) {
+      // Network failure: save anyway so the agent works once back online.
+      saveConfig(next);
+      console.warn(`[Connect] Saved credentials, but could not reach the backend (${err.message}). It will sync when online.`);
+    }
+  });
+
+program
   .command("install-drive")
   .description("Install DriveOS scan/watch hooks into a mounted drive root")
   .requiredOption("-p, --path <dir>", "Mounted drive or folder root")

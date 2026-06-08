@@ -1,7 +1,22 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
+import { authTables } from "@convex-dev/auth/server";
 
 export default defineSchema({
+  // Convex Auth tables (users, authAccounts, authSessions, …). We override the
+  // built-in `users` table below to link it to our team member records.
+  ...authTables,
+  users: defineTable({
+    name: v.optional(v.string()),
+    email: v.optional(v.string()),
+    emailVerificationTime: v.optional(v.number()),
+    phone: v.optional(v.string()),
+    phoneVerificationTime: v.optional(v.number()),
+    image: v.optional(v.string()),
+    isAnonymous: v.optional(v.boolean()),
+    teamMemberId: v.optional(v.string()),
+  }).index("email", ["email"]),
+
   teamMembers: defineTable({
     name: v.string(),
     email: v.string(),
