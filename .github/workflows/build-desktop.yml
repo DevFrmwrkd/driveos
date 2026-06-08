@@ -21,7 +21,9 @@ jobs:
           - os: windows-latest
             target: dist:win
             artifact: driveos-desktop-win
-            glob: "apps/desktop/release/*.exe"
+            glob: |
+              apps/desktop/release/*.exe
+              apps/desktop/release/*.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -67,8 +69,9 @@ jobs:
           # notarization vars on mac) as repo secrets — see apps/desktop/INSTALLER.md.
 
       - name: Upload installer
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.glob }}
-          if-no-files-found: error
+          if-no-files-found: warn
