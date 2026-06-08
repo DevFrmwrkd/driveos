@@ -30,3 +30,15 @@ Add useQuery(api.files.list) + useQuery(api.scans.list) so Files + Scan History 
 Remove hardcoded fallbacks masking missing data (e.g. dupTB || 0.42, cleanTB || 0.61).
 
 Key file: apps/web/src/app/page.tsx.
+
+
+3.  Today scan is one-shot and watch is a live event watcher. We want careful, batched updates — not constant streaming.
+
+Do:
+
+Add an hourly scheduled scan/sync with a local change-queue that batches metadata and uploads once per cycle.
+Keep a manual "Scan Now" that flushes immediately.
+Add pause / resume (confirm it survives restart).
+Ensure no constant filesystem-event uploads (replace/guard the watch streaming path).
+
+Key file: apps/agent/src/index.ts.
