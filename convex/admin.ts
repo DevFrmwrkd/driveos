@@ -69,6 +69,16 @@ export const addTeamMember = mutation({
   },
 });
 
+// List team members (for the Settings → Team UI). Requires a signed-in member.
+export const listTeamMembers = query({
+  args: {},
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) return [];
+    return await ctx.db.query("teamMembers").collect();
+  },
+});
+
 // Who am I — resolves the signed-in user to their team member record (or null).
 export const me = query({
   args: {},

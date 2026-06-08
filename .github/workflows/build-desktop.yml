@@ -17,7 +17,9 @@ jobs:
           - os: macos-latest
             target: dist:mac
             artifact: driveos-desktop-mac
-            glob: "apps/desktop/release/*.dmg"
+            glob: |
+              apps/desktop/release/*.dmg
+              apps/desktop/release/*.zip
           - os: windows-latest
             target: dist:win
             artifact: driveos-desktop-win
@@ -33,15 +35,19 @@ jobs:
           node-version: "22"
           cache: "npm"
 
-      # Cache the downloaded Electron binary so a transient CDN hiccup (HTTP 504)
-      # on one run doesn't force a fresh ~100MB download on the next.
-      - name: Cache Electron binaries
+      # Cache the Electron binary AND electron-builder's tool cache (NSIS,
+      # winCodeSign, app-builder) so a transient CDN hiccup (HTTP 504) on one run
+      # doesn't force a fresh download on the next.
+      - name: Cache Electron + builder binaries
         uses: actions/cache@v4
         with:
           path: |
             ~/.cache/electron
+            ~/.cache/electron-builder
             ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
             ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
           key: ${{ runner.os }}-electron-${{ hashFiles('package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-electron-
@@ -60,13 +66,26 @@ jobs:
           # Give electron's downloader more headroom before timing out.
           ELECTRON_GET_TIMEOUT: "120000"
 
-      - name: Build desktop installer
-        run: npm run ${{ matrix.target }} --workspace=apps/desktop
+      # Retry the build too: electron-builder downloads NSIS/winCodeSign tools
+      # from a CDN that also occasionally returns 504. A retry clears it.
+      - name: Build desktop installer (with retry)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 25
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: npm run ${{ matrix.target }} --workspace=apps/desktop
         env:
           # electron-builder: don't try to publish; just build artifacts.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Unsigned builds. To sign, add CSC_LINK / CSC_KEY_PASSWORD (and Apple
           # notarization vars on mac) as repo secrets — see apps/desktop/INSTALLER.md.
+
+      # Show exactly what electron-builder produced (helps debug missing artifacts).
+      - name: List build output
+        if: always()
+        shell: bash
+        run: ls -la apps/desktop/release/ || echo "release dir not found"
 
       - name: Upload installer
         if: always()
