@@ -9,16 +9,18 @@ directories:
   output: release
   buildResources: build
 
-# No native modules (auto-launch is pure JS), so skip the rebuild step that
-# breaks under npm workspaces.
+# Main + preload are bundled by esbuild (all deps inlined), so there are NO app
+# runtime dependencies to collect. Skipping node_modules entirely avoids the
+# electron-builder workspace dependency-collection failures in our npm monorepo.
 npmRebuild: false
+nodeGypRebuild: false
+buildDependenciesFromSource: false
 
-# Ship the compiled main/preload, the renderer, and node_modules.
+# Ship only the bundled JS, the renderer, and package.json — no node_modules.
 files:
   - dist/**/*
   - renderer/**/*
   - package.json
-  - node_modules/**/*
 
 # Ship the self-contained agent bundle (one CJS file, all deps inlined) as an
 # unpacked resource. agentBridge.ts resolves it at resources/agent/agent-bundle.cjs.
