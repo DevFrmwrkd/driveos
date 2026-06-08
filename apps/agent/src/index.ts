@@ -103,12 +103,26 @@ const IGNORED_FOLDERS = new Set([
   "TMP",
 ]);
 
+// Substring markers matched against the lowercased, resolved path.
 const CLOUD_SYNC_MARKERS = [
-  { name: "iCloud Drive", markers: ["mobile documents", "icloud drive", `${path.sep}cloudstorage${path.sep}icloud`] },
+  { name: "iCloud Drive", markers: ["mobile documents", "com~apple~clouddocs", "icloud drive", `${path.sep}cloudstorage${path.sep}icloud`] },
   { name: "Dropbox", markers: [`${path.sep}dropbox${path.sep}`, `${path.sep}cloudstorage${path.sep}dropbox`] },
-  { name: "Google Drive", markers: ["google drive", `${path.sep}cloudstorage${path.sep}google`] },
+  { name: "Google Drive", markers: ["google drive", "googledrive", "drivefs", `${path.sep}cloudstorage${path.sep}google`] },
   { name: "OneDrive", markers: ["onedrive", `${path.sep}cloudstorage${path.sep}onedrive`] },
+  { name: "Box", markers: [`${path.sep}box${path.sep}`, `${path.sep}cloudstorage${path.sep}box`] },
   { name: "Creative Cloud Files", markers: ["creative cloud files"] },
+  // Any macOS file-provider mount lives under ~/Library/CloudStorage — treat the
+  // whole tree as cloud-synced even if the specific provider is unrecognized.
+  { name: "CloudStorage provider", markers: [`${path.sep}library${path.sep}cloudstorage${path.sep}`] },
+];
+
+// Folders that sit directly at the home root for some providers (e.g. ~/Dropbox,
+// ~/Google Drive). Matched only when the resolved path is at/under that exact dir.
+const CLOUD_HOME_DIRS = [
+  { name: "Dropbox", dir: "Dropbox" },
+  { name: "Google Drive", dir: "Google Drive" },
+  { name: "OneDrive", dir: "OneDrive" },
+  { name: "Box", dir: "Box" },
 ];
 
 const PROJECT_FOLDER_TREE = [
@@ -191,9 +205,18 @@ function saveState(patch: Partial<AgentState>) {
 }
 
 function cloudSyncProvider(targetPath: string) {
-  const normalized = path.resolve(targetPath).toLowerCase();
+  const resolved = path.resolve(targetPath);
+  const normalized = resolved.toLowerCase();
   for (const provider of CLOUD_SYNC_MARKERS) {
     if (provider.markers.some((marker) => normalized.includes(marker.toLowerCase()))) return provider.name;
+  }
+  // Home-rooted provider folders: only match the exact ~/<dir> tree, so an
+  // unrelated path that merely contains the word "box" isn't flagged.
+  const home = os.homedir();
+  for (const { name, dir } of CLOUD_HOME_DIRS) {
+    const base = path.join(home, dir);
+    const rel = path.relative(base, resolved);
+    if (rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))) return name;
   }
   return null;
 }
@@ -454,7 +477,21 @@ function buildProjectManifest(project: any, projectId: string, root: string) {
   };
 }
 
-function writeProjectStructure(root: string, project: any, projectId: string) {
+function writeProjectStructure(root: string, project: any, projectId: string, allowCloud = false) {
+  // Scaffolding writes ~28 folders + a manifest. Refuse to do that inside a
+  // cloud-synced folder unless explicitly allowed — it would spawn many small
+  // files that trigger sync churn.
+  const provider = cloudSyncProvider(root);
+  if (provider && !allowCloud) {
+    throw new Error(
+      `Refusing to scaffold a project inside ${provider}: ${path.resolve(root)}. ` +
+      `Cloud-synced folders generate sync churn. Use --allow-cloud-root to override.`
+    );
+  }
+  if (provider) {
+    console.warn(`[Cloud Folder Warning] Scaffolding project inside ${provider}: ${path.resolve(root)}`);
+  }
+
   for (const branch of PROJECT_FOLDER_TREE) {
     fs.mkdirSync(path.join(root, branch), { recursive: true });
   }
@@ -562,8 +599,12 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
   const hashCache = loadHashCache();
   const calculateFull = Boolean(options.fullHash || config.fullHash);
   const driveMetrics = getDriveMetrics(scanDir);
+  const cloudProvider = cloudSyncProvider(scanDir);
 
   console.log(`[Scan Start] Crawling files larger than ${Math.round(config.minFileSizeBytes / ONE_MB)} MB in ${scanDir}`);
+  if (cloudProvider) {
+    console.warn(`[Cloud Folder] ${scanDir} is in ${cloudProvider} — tracking as metadata-only (cloud tier), not a normal drive.`);
+  }
 
   const machineRes = await syncToConvex("registerMachine", {
     name: config.machineName,
@@ -573,14 +614,17 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
   });
   const machineId = machineRes.machineId || config.machineName;
 
+  // Cloud-synced roots register as metadata-tracked (tier "cloud", filesystem
+  // "cloud") so the dashboard never treats them as a normal local hot drive.
   const driveRes = await syncToConvex("registerDrive", {
     label: path.basename(scanDir),
     volumeId: `${process.platform}:${scanDir}`,
     machineId,
     ownerId: config.ownerId,
     ...driveMetrics,
+    filesystem: cloudProvider ? "cloud" : driveMetrics.filesystem,
     mountPath: scanDir,
-    tier: "hot",
+    tier: cloudProvider ? "cloud" : "hot",
   });
   const driveId = driveRes.driveId;
 
