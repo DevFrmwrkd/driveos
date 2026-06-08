@@ -34,9 +34,12 @@ extraResources:
 
 mac:
   category: public.app-category.productivity
+  # Universal binary so one .dmg runs on BOTH Apple Silicon and Intel Macs.
   target:
-    - dmg
-    - zip
+    - target: dmg
+      arch: universal
+    - target: zip
+      arch: universal
   # Unsigned by default — see INSTALLER.md for signing/notarization.
 
 win:
