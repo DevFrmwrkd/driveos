@@ -1,8 +1,13 @@
 import { httpRouter } from "convex/server";
 import { httpAction } from "./_generated/server";
 import { api } from "./_generated/api";
+import { auth } from "./auth";
+import { hashToken } from "./agentAuth";
 
 const http = httpRouter();
+
+// Convex Auth endpoints (/.well-known/openid-configuration, token exchange, etc.)
+auth.addHttpRoutes(http);
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -11,14 +16,51 @@ function json(data: unknown, status = 200) {
   });
 }
 
-function post(path: string, handler: (ctx: any, body: any) => Promise<unknown>) {
+// Validate the agent's per-machine Bearer token. Returns the machine on success
+// or null if the header is missing/invalid (caller responds 401).
+async function authenticateAgent(ctx: any, request: Request) {
+  const header = request.headers.get("Authorization") || "";
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
+  const tokenHash = await hashToken(match[1].trim());
+  return await ctx.runQuery(api.agentAuth.verifyMachineToken, { tokenHash });
+}
+
+function clientIp(request: Request) {
+  const fwd = request.headers.get("x-forwarded-for");
+  if (fwd) return fwd.split(",")[0].trim();
+  return request.headers.get("cf-connecting-ip") || "unknown";
+}
+
+function post(path: string, handler: (ctx: any, body: any, machine?: any) => Promise<unknown>) {
   http.route({
     path: `/api/${path}`,
     method: "POST",
     handler: httpAction(async (ctx, request) => {
+      // Reject unauthenticated agent calls. Previously the token was accepted but
+      // never verified — every /api/* route now requires a valid machine token.
+      const machine = await authenticateAgent(ctx, request);
+
+      // Rate limit (defense-in-depth + avoid spamming Convex). Authenticated
+      // traffic is keyed per machine with generous headroom; unauthenticated
+      // calls are keyed per IP and throttled harder to slow token guessing.
+      const rl = await ctx.runMutation(api.rateLimits.checkAgentRateLimit, {
+        authenticated: Boolean(machine),
+        key: machine ? machine.machineId : clientIp(request),
+      });
+      if (!rl.ok) {
+        return new Response(
+          JSON.stringify({ error: "Rate limited. Slow down and retry shortly." }),
+          { status: 429, headers: { "Content-Type": "application/json", "Retry-After": String(Math.ceil((rl.retryAfter || 1000) / 1000)) } }
+        );
+      }
+
+      if (!machine) {
+        return json({ error: "Unauthorized: missing or invalid agent token. Run `driveos-agent connect`." }, 401);
+      }
       try {
         const body = await request.json();
-        return json(await handler(ctx, body));
+        return json(await handler(ctx, body, machine));
       } catch (err: any) {
         return json({ error: err.message || "Unknown DriveOS agent API error" }, 500);
       }

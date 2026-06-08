@@ -1,4 +1,6 @@
 import React from "react";
+import { useMutation } from "convex/react";
+import { api } from "@/convexApi";
 import { DB } from "@/data";
 import {
   Icon,
@@ -60,9 +62,19 @@ type WizardSet = (key: string, value: any) => void;
         h("span", { className: "tree-new", style: { color: f.lvl ? "var(--tx-mut)" : "var(--tx)", fontWeight: f.lvl ? 400 : 500 } }, f.name)))));
   }
 
+  const TEMPLATE_NAMES: Record<string, string> = {
+    youtube: "YouTube Show",
+    film: "Brand Film",
+    podcast: "Podcast",
+    social: "Social Campaign",
+    blank: "Blank",
+  };
+
   function CreateWizard({ go, toast }: ScreenProps) {
     const [step, setStep] = React.useState(0);
     const [done, setDone] = React.useState(false);
+    const [saving, setSaving] = React.useState(false);
+    const createProject = useMutation(api.projects.create);
     const [form, setForm] = React.useState<WizardForm>({
       client: "", show: "", name: "", owner: "cj", due: "", status: "active",
       drive: "cj-ssd", root: "/Projects", tier: "hot", cloud: true, template: "youtube",
@@ -104,7 +116,33 @@ type WizardSet = (key: string, value: any) => void;
           h("span", { className: "mono dim", style: { fontSize: 12 } }, "Step " + (step + 1) + " of " + STEPS.length),
           step < STEPS.length - 1
             ? h("button", { className: "btn primary", disabled: !canNext, onClick: () => setStep((s) => s + 1) }, "Continue", h(Icon, { name: "chevR", size: 15 }))
-            : h("button", { className: "btn primary lg", onClick: () => { setDone(true); toast("Project created", "checkCircle", "ok"); } }, h(Icon, { name: "zap", size: 16 }), "Create Project"))));
+            : h("button", { className: "btn primary lg", disabled: saving, onClick: () => submit() }, h(Icon, { name: "zap", size: 16 }), saving ? "Creating…" : "Create Project"))));
+
+    async function submit() {
+      if (saving) return;
+      setSaving(true);
+      try {
+        const dueMs = form.due ? new Date(form.due).getTime() : undefined;
+        const rootPath = [form.root.replace(/\/+$/, ""), clientSlug].filter(Boolean).join("/");
+        await createProject({
+          name: form.name,
+          client: form.client,
+          showName: form.show || undefined,
+          ownerId: form.owner,
+          status: form.status,
+          tier: form.tier,
+          rootPath: rootPath || undefined,
+          template: TEMPLATE_NAMES[form.template] || "YouTube Show",
+          dueDate: dueMs && !Number.isNaN(dueMs) ? dueMs : undefined,
+        });
+        setDone(true);
+        toast("Project created", "checkCircle", "ok");
+      } catch (err: any) {
+        toast(err?.message || "Could not create project", "alert", "risk");
+      } finally {
+        setSaving(false);
+      }
+    }
   }
 
   function Field({ label, children, hint }: ScreenProps) {

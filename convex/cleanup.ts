@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { requireMember } from "./access";
 
 export const listJobs = query({
   args: {},
@@ -57,6 +58,7 @@ export const createJob = mutation({
     result: v.optional(v.any()),
   },
   handler: async (ctx, args) => {
+    await requireMember(ctx);
     const timestamp = Date.now();
     // Default rollback duration: 14 days (14 * 24 * 60 * 60 * 1000)
     const rollbackPeriod = 14 * 24 * 60 * 60 * 1000;
@@ -81,7 +83,7 @@ export const createJob = mutation({
       action: "job_create",
       entityType: "cleanupJob",
       entityId: jobId,
-      message: `Created cleanup job for action "${args.action}" affecting ${(args.affectedBytes / (1024 ** 9)).toFixed(1)} GB`,
+      message: `Created cleanup job for action "${args.action}" affecting ${(args.affectedBytes / (1024 ** 3)).toFixed(1)} GB`,
       createdAt: timestamp,
     });
 
@@ -95,6 +97,7 @@ export const approveJob = mutation({
     approvedBy: v.string(),
   },
   handler: async (ctx, args) => {
+    await requireMember(ctx);
     const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
     if (!id) return;
 

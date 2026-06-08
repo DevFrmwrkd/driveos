@@ -19,9 +19,14 @@
   },
   "devDependencies": {
     "concurrently": "^8.2.2",
+    "png2icons": "^2.0.1",
+    "sharp": "^0.34.5",
     "typescript": "^5.0.0"
   },
   "dependencies": {
+    "@auth/core": "^0.37.0",
+    "@convex-dev/auth": "^0.0.93",
+    "@convex-dev/rate-limiter": "^0.3.2",
     "convex": "^1.40.0"
   }
 }

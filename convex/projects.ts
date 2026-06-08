@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { requireMember } from "./access";
 
 export const list = query({
   args: {},
@@ -33,6 +34,7 @@ export const create = mutation({
     notes: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
+    await requireMember(ctx);
     const timestamp = Date.now();
     const slug = args.name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
 

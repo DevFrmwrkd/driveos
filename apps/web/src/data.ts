@@ -249,8 +249,13 @@ const kpi = {
   healthTrend: [61, 63, 62, 65, 64, 66, 68], readyToArchive: 3,
 };
 
+// Live collections — populated from Convex queries at runtime (see app/page.tsx).
+const files: any[] = [];
+const scans: any[] = [];
+
 export const DB = {
   team, teamById, drives, driveById, projects, projectById, fileTypes, tiers,
   duplicates, cleanup, quarantine, audit, driveEvents, warnings, cloud,
   folderTemplate, templates, projectFolders, searchSample, kpi,
+  files, scans,
 };

@@ -1,0 +1,50 @@
+appId: media.frmwrkd.driveos.agent
+productName: DriveOS Agent
+copyright: DriveOS
+# Pinned so electron-builder doesn't need electron resolvable in this workspace
+# (it's hoisted to the monorepo root in our npm workspaces setup).
+electronVersion: 33.4.11
+
+directories:
+  output: release
+  buildResources: build
+
+# No native modules (auto-launch is pure JS), so skip the rebuild step that
+# breaks under npm workspaces.
+npmRebuild: false
+
+# Ship the compiled main/preload, the renderer, and node_modules.
+files:
+  - dist/**/*
+  - renderer/**/*
+  - package.json
+  - node_modules/**/*
+
+# Ship the self-contained agent bundle (one CJS file, all deps inlined) as an
+# unpacked resource. agentBridge.ts resolves it at resources/agent/agent-bundle.cjs.
+extraResources:
+  - from: ../agent/dist/agent-bundle.cjs
+    to: agent/agent-bundle.cjs
+  - from: build/icon.png
+    to: build/icon.png
+
+mac:
+  category: public.app-category.productivity
+  target:
+    - dmg
+    - zip
+  # Unsigned by default — see INSTALLER.md for signing/notarization.
+
+win:
+  target:
+    - nsis
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+
+linux:
+  target:
+    - AppImage

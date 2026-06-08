@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { requireMember } from "./access";
 
 export const list = query({
   args: {},
@@ -179,6 +180,7 @@ export const updateStatus = mutation({
     status: v.string(), // "open" | "ignored" | "quarantined" | "resolved"
   },
   handler: async (ctx, args) => {
+    await requireMember(ctx);
     const id = ctx.db.normalizeId("duplicateClusters", args.clusterId);
     if (!id) return;
     await ctx.db.patch(id, {

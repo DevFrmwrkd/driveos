@@ -8,8 +8,12 @@
  * @module
  */
 
+import type * as access from "../access.js";
+import type * as admin from "../admin.js";
+import type * as agentAuth from "../agentAuth.js";
 import type * as archive from "../archive.js";
 import type * as audit from "../audit.js";
+import type * as auth from "../auth.js";
 import type * as cleanup from "../cleanup.js";
 import type * as cloud from "../cloud.js";
 import type * as drives from "../drives.js";
@@ -17,6 +21,7 @@ import type * as duplicates from "../duplicates.js";
 import type * as files from "../files.js";
 import type * as http from "../http.js";
 import type * as projects from "../projects.js";
+import type * as rateLimits from "../rateLimits.js";
 import type * as recommendations from "../recommendations.js";
 import type * as scans from "../scans.js";
 import type * as seed from "../seed.js";
@@ -28,8 +33,12 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  access: typeof access;
+  admin: typeof admin;
+  agentAuth: typeof agentAuth;
   archive: typeof archive;
   audit: typeof audit;
+  auth: typeof auth;
   cleanup: typeof cleanup;
   cloud: typeof cloud;
   drives: typeof drives;
@@ -37,6 +46,7 @@ declare const fullApi: ApiFromModules<{
   files: typeof files;
   http: typeof http;
   projects: typeof projects;
+  rateLimits: typeof rateLimits;
   recommendations: typeof recommendations;
   scans: typeof scans;
   seed: typeof seed;
@@ -68,4 +78,6 @@ export declare const internal: FilterApi<
   FunctionReference<any, "internal">
 >;
 
-export declare const components: {};
+export declare const components: {
+  rateLimiter: import("@convex-dev/rate-limiter/_generated/component.js").ComponentApi<"rateLimiter">;
+};

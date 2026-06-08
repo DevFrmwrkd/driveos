@@ -4,8 +4,10 @@ import React, { useState, useEffect, useRef, useCallback, Fragment } from "react
 import { DB } from "@/data";
 import { Icon } from "@/components/icons";
 import { Avatar, useToast } from "@/components/components";
-import { useQuery } from "convex/react";
-import { api } from "../../../../convex/_generated/api";
+import { useQuery, Authenticated, Unauthenticated, AuthLoading } from "convex/react";
+import { useAuthActions } from "@convex-dev/auth/react";
+import { api } from "@/convexApi";
+import { LoginScreen } from "@/screens/screens-login";
 
 // Import all modularized screens
 import { Dashboard } from "@/screens/screens-dashboard";
@@ -91,6 +93,23 @@ function resolveDuplicateRisk(risk?: string) {
   return risk || "review";
 }
 
+// Recommendation risk uses the same green/yellow/red scale as duplicates.
+function resolveRecommendationRisk(risk?: string) {
+  return resolveDuplicateRisk(risk);
+}
+
+function recommendationCategory(type?: string) {
+  const map: Record<string, string> = {
+    delete_cache: "Cache",
+    delete_proxies: "Proxies",
+    delete_duplicate_stock: "Duplicate stock",
+    review_exports: "Review exports",
+    archive_abandoned: "Abandoned copies",
+    delete_duplicate_downloads: "Duplicate downloads",
+  };
+  return map[type || ""] || "Unknown";
+}
+
 function duplicateName(cluster: any) {
   const match = String(cluster?.explanation || "").match(/duplicates? of "([^"]+)"/i);
   return match?.[1] || "Duplicate cluster";
@@ -155,6 +174,7 @@ interface TopBarProps {
 
 function TopBar({ go, route }: TopBarProps) {
   const crumbs = useCrumbs(route);
+  const { signOut } = useAuthActions();
   return (
     <div className="topbar">
       <div className="row" style={{ gap: 8, minWidth: 0 }}>
@@ -190,6 +210,9 @@ function TopBar({ go, route }: TopBarProps) {
         </button>
         <div style={{ width: 1, height: 22, background: "var(--line)" }} />
         <Avatar id="founder" size={30} />
+        <button className="btn ghost icon" title="Sign out" onClick={() => void signOut()}>
+          <Icon name="external" size={16} />
+        </button>
       </div>
     </div>
   );
@@ -237,6 +260,24 @@ function Placeholder({ title }: { title: string }) {
 }
 
 export default function App() {
+  return (
+    <>
+      <AuthLoading>
+        <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "var(--bg)", color: "var(--tx-mut)", fontSize: 13 }}>
+          Loading DriveOS…
+        </div>
+      </AuthLoading>
+      <Unauthenticated>
+        <LoginScreen />
+      </Unauthenticated>
+      <Authenticated>
+        <Workspace />
+      </Authenticated>
+    </>
+  );
+}
+
+function Workspace() {
   const [route, setRoute] = useState<{ screen: string; params: any }>({ screen: "dashboard", params: {} });
   const [push, toastNode] = useToast();
   const [dense, setDense] = useState(false);
@@ -249,6 +290,8 @@ export default function App() {
   const convexRecommendations = useQuery(api.recommendations.list);
   const convexQuarantine = useQuery(api.cleanup.listQuarantine);
   const convexAudit = useQuery(api.audit.list);
+  const convexFiles = useQuery(api.files.list, { limit: 200 });
+  const convexScans = useQuery(api.scans.list);
 
   // Sync back to our local DB data layer reactively!
   if (convexDrives && convexDrives.length > 0) {
@@ -316,10 +359,15 @@ export default function App() {
     (DB as any).cleanup = convexRecommendations.map((r: any) => ({
       ...r,
       id: r._id,
-      cat: r.type === "delete_cache" ? "Cache" : "Proxies",
-      recoverTB: r.affectedBytes / (1024 ** 4),
-      files: r.affectedFileIds.length,
-      projects: ["show-x"],
+      cat: recommendationCategory(r.type),
+      risk: resolveRecommendationRisk(r.riskLevel),
+      approval: r.riskLevel === "yellow" || r.riskLevel === "red",
+      recoverTB: (r.affectedBytes || 0) / (1024 ** 4),
+      files: r.affectedFileIds?.length || 0,
+      // raw fields kept for mutations (createJob needs affectedFileIds/affectedBytes)
+      affectedFileIds: r.affectedFileIds || [],
+      affectedBytes: r.affectedBytes || 0,
+      projects: Array.isArray(r.affectedProjectIds) && r.affectedProjectIds.length > 0 ? r.affectedProjectIds : ["—"],
       why: r.explanation,
       action: r.title,
     }));
@@ -346,6 +394,36 @@ export default function App() {
       who: a.actorId || "System",
       action: a.message,
       kind: a.action,
+    }));
+  }
+  if (convexFiles) {
+    (DB as any).files = convexFiles.map((f: any) => ({
+      ...f,
+      id: f._id,
+      name: f.name,
+      path: f.path,
+      sizeGB: (f.sizeBytes || 0) / (1024 ** 3),
+      sizeBytes: f.sizeBytes || 0,
+      type: f.classification || "UNKNOWN",
+      risk: resolveDuplicateRisk(f.riskLevel),
+      driveId: f.driveId,
+      projectId: f.projectId,
+      modified: f.modifiedAtFile ? new Date(f.modifiedAtFile).toLocaleDateString() : "—",
+    }));
+  }
+  if (convexScans) {
+    (DB as any).scans = convexScans.map((s: any) => ({
+      ...s,
+      id: s._id,
+      rootPath: s.rootPath,
+      status: s.status,
+      files: s.filesScanned || 0,
+      bytes: s.bytesScanned || 0,
+      sizeTB: (s.bytesScanned || 0) / (1024 ** 4),
+      errors: s.errorsCount || 0,
+      startedAt: s.startedAt,
+      completedAt: s.completedAt,
+      when: s.startedAt ? new Date(s.startedAt).toLocaleString() : "—",
     }));
   }
 

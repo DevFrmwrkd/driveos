@@ -30,6 +30,17 @@ interface HashCacheEntry {
   fullHash?: string;
 }
 
+// Persisted scheduler state. Survives restart so pause/resume and the
+// hourly cadence are durable across agent crashes and reboots.
+interface AgentState {
+  paused: boolean;
+  pausedAt?: string;
+  lastSyncStartedAt?: string;
+  lastSyncCompletedAt?: string;
+  lastSyncFiles?: number;
+  lastSyncBytes?: number;
+}
+
 interface FileMetadata {
   path: string;
   normalizedPath: string;
@@ -67,13 +78,14 @@ const AGENT_HOME = resolveAgentHome();
 const CONFIG_PATH = path.join(AGENT_HOME, "driveos-config.json");
 const HASH_CACHE_PATH = path.join(AGENT_HOME, "driveos-hash-cache.json");
 const OFFLINE_LOG_PATH = path.join(AGENT_HOME, "driveos-agent-offline-log.txt");
+const STATE_PATH = path.join(AGENT_HOME, "driveos-agent-state.json");
 
 const DEFAULT_CONFIG: DriveOSConfig = {
   machineName: "CJ-Workstation",
   ownerId: "cj",
   convexUrl: DEFAULT_CONVEX_URL,
   quarantineRoot: path.join(AGENT_HOME, "quarantine"),
-  scanRoots: ["./temp_test_drive"],
+  scanRoots: [],
   minFileSizeBytes: ONE_MB,
   fullHash: false,
 };
@@ -91,12 +103,26 @@ const IGNORED_FOLDERS = new Set([
   "TMP",
 ]);
 
+// Substring markers matched against the lowercased, resolved path.
 const CLOUD_SYNC_MARKERS = [
-  { name: "iCloud Drive", markers: ["mobile documents", "icloud drive", `${path.sep}cloudstorage${path.sep}icloud`] },
+  { name: "iCloud Drive", markers: ["mobile documents", "com~apple~clouddocs", "icloud drive", `${path.sep}cloudstorage${path.sep}icloud`] },
   { name: "Dropbox", markers: [`${path.sep}dropbox${path.sep}`, `${path.sep}cloudstorage${path.sep}dropbox`] },
-  { name: "Google Drive", markers: ["google drive", `${path.sep}cloudstorage${path.sep}google`] },
+  { name: "Google Drive", markers: ["google drive", "googledrive", "drivefs", `${path.sep}cloudstorage${path.sep}google`] },
   { name: "OneDrive", markers: ["onedrive", `${path.sep}cloudstorage${path.sep}onedrive`] },
+  { name: "Box", markers: [`${path.sep}box${path.sep}`, `${path.sep}cloudstorage${path.sep}box`] },
   { name: "Creative Cloud Files", markers: ["creative cloud files"] },
+  // Any macOS file-provider mount lives under ~/Library/CloudStorage — treat the
+  // whole tree as cloud-synced even if the specific provider is unrecognized.
+  { name: "CloudStorage provider", markers: [`${path.sep}library${path.sep}cloudstorage${path.sep}`] },
+];
+
+// Folders that sit directly at the home root for some providers (e.g. ~/Dropbox,
+// ~/Google Drive). Matched only when the resolved path is at/under that exact dir.
+const CLOUD_HOME_DIRS = [
+  { name: "Dropbox", dir: "Dropbox" },
+  { name: "Google Drive", dir: "Google Drive" },
+  { name: "OneDrive", dir: "OneDrive" },
+  { name: "Box", dir: "Box" },
 ];
 
 const PROJECT_FOLDER_TREE = [
@@ -165,10 +191,32 @@ function saveHashCache(cache: Record<string, HashCacheEntry>) {
   fs.writeFileSync(HASH_CACHE_PATH, JSON.stringify(cache, null, 2), "utf-8");
 }
 
+const DEFAULT_STATE: AgentState = { paused: false };
+
+function loadState(): AgentState {
+  return { ...DEFAULT_STATE, ...(readJsonFile<Partial<AgentState>>(STATE_PATH) || {}) };
+}
+
+function saveState(patch: Partial<AgentState>) {
+  ensureAgentHome();
+  const next = { ...loadState(), ...patch };
+  fs.writeFileSync(STATE_PATH, JSON.stringify(next, null, 2), "utf-8");
+  return next;
+}
+
 function cloudSyncProvider(targetPath: string) {
-  const normalized = path.resolve(targetPath).toLowerCase();
+  const resolved = path.resolve(targetPath);
+  const normalized = resolved.toLowerCase();
   for (const provider of CLOUD_SYNC_MARKERS) {
     if (provider.markers.some((marker) => normalized.includes(marker.toLowerCase()))) return provider.name;
+  }
+  // Home-rooted provider folders: only match the exact ~/<dir> tree, so an
+  // unrelated path that merely contains the word "box" isn't flagged.
+  const home = os.homedir();
+  for (const { name, dir } of CLOUD_HOME_DIRS) {
+    const base = path.join(home, dir);
+    const rel = path.relative(base, resolved);
+    if (rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))) return name;
   }
   return null;
 }
@@ -429,7 +477,21 @@ function buildProjectManifest(project: any, projectId: string, root: string) {
   };
 }
 
-function writeProjectStructure(root: string, project: any, projectId: string) {
+function writeProjectStructure(root: string, project: any, projectId: string, allowCloud = false) {
+  // Scaffolding writes ~28 folders + a manifest. Refuse to do that inside a
+  // cloud-synced folder unless explicitly allowed — it would spawn many small
+  // files that trigger sync churn.
+  const provider = cloudSyncProvider(root);
+  if (provider && !allowCloud) {
+    throw new Error(
+      `Refusing to scaffold a project inside ${provider}: ${path.resolve(root)}. ` +
+      `Cloud-synced folders generate sync churn. Use --allow-cloud-root to override.`
+    );
+  }
+  if (provider) {
+    console.warn(`[Cloud Folder Warning] Scaffolding project inside ${provider}: ${path.resolve(root)}`);
+  }
+
   for (const branch of PROJECT_FOLDER_TREE) {
     fs.mkdirSync(path.join(root, branch), { recursive: true });
   }
@@ -514,6 +576,162 @@ async function executeJob(job: any, config: DriveOSConfig) {
   await syncToConvex("updateJobStatus", { jobId: job._id, status: "completed" });
 }
 
+interface ScanOptions {
+  fullHash?: boolean;
+  allowCloudRoot?: boolean;
+  checkStability?: boolean;
+}
+
+interface ScanResult {
+  fileCount: number;
+  byteCount: number;
+  errorsCount: number;
+  skippedUnstable: number;
+}
+
+// Single batched scan of one directory: register machine/drive, open a scan
+// session, walk files >minSize, upload metadata in chunks of 100, and close the
+// session. This is the unit of work the hourly scheduler and `scan-now` reuse.
+async function performScan(scanDir: string, config: DriveOSConfig, options: ScanOptions = {}): Promise<ScanResult> {
+  enforceTrackableRoot("Scan target", scanDir, Boolean(options.allowCloudRoot));
+  validateRuntimeConfig(config);
+
+  const hashCache = loadHashCache();
+  const calculateFull = Boolean(options.fullHash || config.fullHash);
+  const driveMetrics = getDriveMetrics(scanDir);
+  const cloudProvider = cloudSyncProvider(scanDir);
+
+  console.log(`[Scan Start] Crawling files larger than ${Math.round(config.minFileSizeBytes / ONE_MB)} MB in ${scanDir}`);
+  if (cloudProvider) {
+    console.warn(`[Cloud Folder] ${scanDir} is in ${cloudProvider} — tracking as metadata-only (cloud tier), not a normal drive.`);
+  }
+
+  const machineRes = await syncToConvex("registerMachine", {
+    name: config.machineName,
+    ownerId: config.ownerId,
+    agentVersion: AGENT_VERSION,
+    platform: process.platform,
+  });
+  const machineId = machineRes.machineId || config.machineName;
+
+  // Cloud-synced roots register as metadata-tracked (tier "cloud", filesystem
+  // "cloud") so the dashboard never treats them as a normal local hot drive.
+  const driveRes = await syncToConvex("registerDrive", {
+    label: path.basename(scanDir),
+    volumeId: `${process.platform}:${scanDir}`,
+    machineId,
+    ownerId: config.ownerId,
+    ...driveMetrics,
+    filesystem: cloudProvider ? "cloud" : driveMetrics.filesystem,
+    mountPath: scanDir,
+    tier: cloudProvider ? "cloud" : "hot",
+  });
+  const driveId = driveRes.driveId;
+
+  const scanRes = await syncToConvex("startScan", {
+    machineId,
+    driveId,
+    rootPath: scanDir,
+    agentVersion: AGENT_VERSION,
+  });
+  const sessionId = scanRes.sessionId || `offline-${Date.now()}`;
+
+  const fileBatch: FileMetadata[] = [];
+  const result: ScanResult = { fileCount: 0, byteCount: 0, errorsCount: 0, skippedUnstable: 0 };
+
+  async function flushBatch(final = false) {
+    if (fileBatch.length === 0) return;
+    console.log(`[${final ? "Final " : ""}Batch Upload] Syncing ${fileBatch.length} file(s) to Convex`);
+    await syncToConvex("uploadBatch", { scanSessionId: sessionId, machineId, driveId, files: fileBatch });
+    fileBatch.length = 0;
+    saveHashCache(hashCache);
+  }
+
+  await walkFiles(
+    scanDir,
+    async (filePath, statObj) => {
+      try {
+        // Skip files that are still being written so we never index a half-flushed export.
+        if (options.checkStability && !(await isFileStable(filePath))) {
+          result.skippedUnstable++;
+          console.log(`[Scan Skip] File still changing, deferring to next cycle: ${filePath}`);
+          return;
+        }
+        fileBatch.push(await buildFileMetadata(filePath, statObj, hashCache, calculateFull));
+        result.fileCount++;
+        result.byteCount += statObj.size;
+        if (fileBatch.length >= 100) await flushBatch();
+      } catch (err: any) {
+        result.errorsCount++;
+        console.warn(`[Scan Error] ${filePath}: ${err.message}`);
+      }
+    },
+    config.minFileSizeBytes
+  );
+
+  await flushBatch(true);
+  saveHashCache(hashCache);
+  await syncToConvex("completeScan", {
+    sessionId,
+    status: result.errorsCount > 0 ? "partial" : "completed",
+    errorsCount: result.errorsCount,
+  });
+
+  console.log(`[Scan Complete] ${scanDir} — ${result.fileCount} file(s), ${(result.byteCount / 1024 ** 4).toFixed(2)} TB, errors: ${result.errorsCount}, deferred: ${result.skippedUnstable}`);
+  return result;
+}
+
+// One sync cycle over every configured scan root. Respects the persisted pause
+// flag and records last-run stats so `status` and restart recovery are accurate.
+async function runSyncCycle(config: DriveOSConfig, options: ScanOptions = {}): Promise<ScanResult | null> {
+  if (loadState().paused) {
+    console.log("[Sync] Agent is paused — skipping this cycle. Run `driveos-agent resume` to continue.");
+    return null;
+  }
+
+  const roots = config.scanRoots.filter(Boolean);
+  if (roots.length === 0) {
+    console.log("[Sync] No folders are being tracked yet. Add a drive or folder to start scanning.");
+    return null;
+  }
+
+  saveState({ lastSyncStartedAt: new Date().toISOString() });
+  const totals: ScanResult = { fileCount: 0, byteCount: 0, errorsCount: 0, skippedUnstable: 0 };
+
+  for (const root of roots) {
+    // Roots must be absolute. A relative root can't be resolved reliably from a
+    // packaged app (cwd is the app folder, not the project), so flag it clearly.
+    if (!path.isAbsolute(root)) {
+      console.warn(`[Sync] Ignoring folder "${root}" — please re-add it as a full path via Add drive.`);
+      continue;
+    }
+    const resolved = path.resolve(root);
+    if (!fs.existsSync(resolved)) {
+      // Disconnected drive / missing root: skip safely, keep last-known catalog in Convex.
+      console.warn(`[Sync] Folder not found right now (skipped, last catalog kept): ${resolved}`);
+      continue;
+    }
+    try {
+      const res = await performScan(resolved, config, { ...options, checkStability: true });
+      totals.fileCount += res.fileCount;
+      totals.byteCount += res.byteCount;
+      totals.errorsCount += res.errorsCount;
+      totals.skippedUnstable += res.skippedUnstable;
+    } catch (err: any) {
+      console.error(`[Sync] Scan of ${resolved} failed: ${err.message}`);
+      totals.errorsCount++;
+    }
+  }
+
+  saveState({
+    lastSyncCompletedAt: new Date().toISOString(),
+    lastSyncFiles: totals.fileCount,
+    lastSyncBytes: totals.byteCount,
+  });
+  console.log(`[Sync Cycle Complete] ${totals.fileCount} file(s) across ${roots.length} root(s), ${(totals.byteCount / 1024 ** 4).toFixed(2)} TB.`);
+  return totals;
+}
+
 const program = new Command();
 
 program
@@ -534,8 +752,10 @@ program
   .option("--full-hash", "Calculate streaming SHA-256 hashes during scans")
   .option("--allow-cloud-root", "Allow cloud-synced folders as scan roots with metadata-only warnings")
   .action((options) => {
+    // Store roots as absolute paths so they resolve correctly even when the agent
+    // runs from inside a packaged desktop app (where cwd is the app folder).
     const scanRoots = options.roots
-      ? String(options.roots).split(",").map((root) => root.trim()).filter(Boolean)
+      ? String(options.roots).split(",").map((root) => root.trim()).filter(Boolean).map((root) => path.resolve(root))
       : DEFAULT_CONFIG.scanRoots;
 
     const config: DriveOSConfig = {
@@ -566,6 +786,56 @@ program
       appDataDir: AGENT_HOME,
       hashCachePath: HASH_CACHE_PATH,
     });
+  });
+
+program
+  .command("connect")
+  .description("Connect this machine to DriveOS: store backend URL + machine token (from the dashboard)")
+  .requiredOption("--token <token>", "Per-machine token issued by the DriveOS dashboard")
+  .requiredOption("--machine <name>", "Machine name this token was issued for")
+  .option("-c, --convex <url>", "Convex deployment URL (.convex.cloud or .convex.site)", DEFAULT_CONVEX_URL)
+  .option("-o, --owner <ownerId>", "Owner / Lead Editor ID")
+  .action(async (options) => {
+    const config = loadConfig();
+    const next: DriveOSConfig = {
+      ...config,
+      convexUrl: options.convex || config.convexUrl,
+      machineName: options.machine,
+      authToken: String(options.token).trim(),
+      ownerId: options.owner || config.ownerId,
+    };
+    enforceLocalStatePath("Agent data directory", AGENT_HOME);
+
+    // Verify the token with a direct authenticated call so we can distinguish a
+    // rejected token (401) from a real network outage before saving.
+    const baseUrl = resolveConvexHttpUrl(next.convexUrl);
+    try {
+      const res = await fetch(`${baseUrl}/api/registerMachine`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${next.authToken}` },
+        body: JSON.stringify({
+          name: next.machineName,
+          ownerId: next.ownerId,
+          agentVersion: AGENT_VERSION,
+          platform: process.platform,
+        }),
+      });
+      if (res.status === 401) {
+        console.error("[Connect] Token rejected (401). Re-issue a token in the dashboard for this machine and try again.");
+        process.exit(1);
+      }
+      if (!res.ok) {
+        console.error(`[Connect] Backend error ${res.status}. Saved nothing.`);
+        process.exit(1);
+      }
+      saveConfig(next);
+      console.log(`[Connect] Connected as "${next.machineName}". Backend: ${next.convexUrl}`);
+      console.log("[Connect] Token stored in the app-data config. You can now run `driveos-agent scan-now` or `sync`.");
+    } catch (err: any) {
+      // Network failure: save anyway so the agent works once back online.
+      saveConfig(next);
+      console.warn(`[Connect] Saved credentials, but could not reach the backend (${err.message}). It will sync when online.`);
+    }
   });
 
 program
@@ -602,106 +872,129 @@ program
     fs.chmodSync(path.join(hookDir, "scan.sh"), 0o755);
     fs.chmodSync(path.join(hookDir, "watch.sh"), 0o755);
 
+    // Register the folder so the scheduled `sync` actually scans it. Normalize
+    // every root to an absolute path (dropping any stale relative entries) and
+    // dedupe, so the desktop "Add drive" reliably starts tracking the folder.
+    const existing = config.scanRoots.map((r) => path.resolve(r));
+    const merged = Array.from(new Set([...existing, root]));
+    config.scanRoots = merged;
+    saveConfig(config);
+    console.log(`[Success] Now tracking ${root} for hourly sync.`);
+
     console.log(`[Success] Installed DriveOS hooks in ${hookDir}`);
   });
 
 program
   .command("scan")
-  .description("Recursively scan directory metadata and upload to Convex")
+  .description("Recursively scan directory metadata and upload to Convex (one-shot)")
   .requiredOption("-p, --path <dir>", "Directory path to scan")
   .option("--full-hash", "Calculate streaming SHA-256 full hashes for this scan")
   .option("--allow-cloud-root", "Allow scanning a cloud-synced folder as metadata-only")
+  .option("--check-stability", "Skip files that are still being written")
   .action(async (options) => {
     const scanDir = path.resolve(options.path);
     if (!fs.existsSync(scanDir)) {
       console.error(`[Error] Target path does not exist: ${scanDir}`);
       process.exit(1);
     }
-    enforceTrackableRoot("Scan target", scanDir, Boolean(options.allowCloudRoot));
+    const config = loadConfig();
+    await performScan(scanDir, config, {
+      fullHash: Boolean(options.fullHash),
+      allowCloudRoot: Boolean(options.allowCloudRoot),
+      checkStability: Boolean(options.checkStability),
+    });
+  });
 
+program
+  .command("sync")
+  .description("Scheduled, batched sync: scan all configured roots once per interval (default hourly)")
+  .option("--interval-minutes <minutes>", "Minutes between sync cycles", "60")
+  .option("--once", "Run a single sync cycle and exit (no scheduling)")
+  .option("--full-hash", "Calculate streaming SHA-256 full hashes during scans")
+  .option("--allow-cloud-root", "Allow cloud-synced roots as metadata-only")
+  .action(async (options) => {
     const config = loadConfig();
     validateRuntimeConfig(config);
-    const hashCache = loadHashCache();
-    const calculateFull = Boolean(options.fullHash || config.fullHash);
-    const driveMetrics = getDriveMetrics(scanDir);
+    const scanOpts: ScanOptions = {
+      fullHash: Boolean(options.fullHash),
+      allowCloudRoot: Boolean(options.allowCloudRoot),
+    };
+    const intervalMs = Math.max(1, Number(options.intervalMinutes) || 60) * 60 * 1000;
 
-    console.log(`[Scan Start] Crawling files larger than ${Math.round(config.minFileSizeBytes / ONE_MB)} MB in ${scanDir}`);
+    // Always run an immediate catch-up cycle on start (unless paused).
+    await runSyncCycle(config, scanOpts);
+    if (options.once) return;
 
-    const machineRes = await syncToConvex("registerMachine", {
-      name: config.machineName,
-      ownerId: config.ownerId,
-      agentVersion: AGENT_VERSION,
-      platform: process.platform,
+    console.log(`[Scheduler Started] Next sync in ${Math.round(intervalMs / 60000)} minute(s). Convex receives one batched update per cycle — no constant streaming.`);
+    const timer = setInterval(() => { void runSyncCycle(config, scanOpts); }, intervalMs);
+
+    const shutdown = () => { clearInterval(timer); console.log("\n[Scheduler Stopped]"); process.exit(0); };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+  });
+
+program
+  .command("scan-now")
+  .description("Flush a sync cycle immediately across all configured roots (ignores schedule, respects pause)")
+  .option("--full-hash", "Calculate streaming SHA-256 full hashes for this scan")
+  .option("--allow-cloud-root", "Allow cloud-synced roots as metadata-only")
+  .action(async (options) => {
+    const config = loadConfig();
+    validateRuntimeConfig(config);
+    const res = await runSyncCycle(config, {
+      fullHash: Boolean(options.fullHash),
+      allowCloudRoot: Boolean(options.allowCloudRoot),
     });
-    const machineId = machineRes.machineId || config.machineName;
+    if (!res) process.exitCode = 0;
+  });
 
-    const driveRes = await syncToConvex("registerDrive", {
-      label: path.basename(scanDir),
-      volumeId: `${process.platform}:${scanDir}`,
-      machineId,
-      ownerId: config.ownerId,
-      ...driveMetrics,
-      mountPath: scanDir,
-      tier: "hot",
-    });
-    const driveId = driveRes.driveId;
+program
+  .command("pause")
+  .description("Pause scheduled syncs (persists across restart)")
+  .action(() => {
+    const state = saveState({ paused: true, pausedAt: new Date().toISOString() });
+    console.log(`[Paused] Scheduled syncs are paused since ${state.pausedAt}. A running scheduler will skip cycles until you resume.`);
+  });
 
-    const scanRes = await syncToConvex("startScan", {
-      machineId,
-      driveId,
-      rootPath: scanDir,
-      agentVersion: AGENT_VERSION,
-    });
-    const sessionId = scanRes.sessionId || `offline-${Date.now()}`;
+program
+  .command("resume")
+  .description("Resume scheduled syncs")
+  .action(() => {
+    saveState({ paused: false, pausedAt: undefined });
+    console.log("[Resumed] Scheduled syncs will run on the next cycle. Run `driveos-agent scan-now` to sync immediately.");
+  });
 
-    const fileBatch: FileMetadata[] = [];
-    let fileCount = 0;
-    let byteCount = 0;
-    let errorsCount = 0;
-
-    async function flushBatch(final = false) {
-      if (fileBatch.length === 0) return;
-      console.log(`[${final ? "Final " : ""}Batch Upload] Syncing ${fileBatch.length} file(s) to Convex`);
-      await syncToConvex("uploadBatch", {
-        scanSessionId: sessionId,
-        machineId,
-        driveId,
-        files: fileBatch,
-      });
-      fileBatch.length = 0;
-      saveHashCache(hashCache);
+program
+  .command("status")
+  .description("Show agent scheduler state (paused/running, last sync)")
+  .option("--json", "Emit machine-readable JSON (used by the desktop tray app)")
+  .action((options) => {
+    const state = loadState();
+    const config = loadConfig();
+    const status = {
+      connected: Boolean(config.authToken),
+      machineName: config.machineName,
+      convexUrl: config.convexUrl,
+      paused: state.paused,
+      pausedAt: state.pausedAt,
+      scanRoots: config.scanRoots,
+      lastSyncStartedAt: state.lastSyncStartedAt,
+      lastSyncCompletedAt: state.lastSyncCompletedAt,
+      lastSyncFiles: state.lastSyncFiles,
+      lastSyncTB: state.lastSyncBytes ? (state.lastSyncBytes / 1024 ** 4).toFixed(2) : undefined,
+      appDataDir: AGENT_HOME,
+    };
+    if (options.json) {
+      // Single clean JSON line so the tray app can parse stdout reliably.
+      process.stdout.write(JSON.stringify(status) + "\n");
+    } else {
+      console.log(status);
     }
-
-    await walkFiles(
-      scanDir,
-      async (filePath, statObj) => {
-        try {
-          fileBatch.push(await buildFileMetadata(filePath, statObj, hashCache, calculateFull));
-          fileCount++;
-          byteCount += statObj.size;
-          if (fileBatch.length >= 100) await flushBatch();
-        } catch (err: any) {
-          errorsCount++;
-          console.warn(`[Scan Error] ${filePath}: ${err.message}`);
-        }
-      },
-      config.minFileSizeBytes
-    );
-
-    await flushBatch(true);
-    saveHashCache(hashCache);
-    await syncToConvex("completeScan", {
-      sessionId,
-      status: errorsCount > 0 ? "partial" : "completed",
-      errorsCount,
-    });
-
-    console.log(`[Scan Complete] Scanned ${fileCount} file(s), ${(byteCount / 1024 ** 4).toFixed(2)} TB, errors: ${errorsCount}`);
   });
 
 program
   .command("watch")
-  .description("Queue watched folder changes and upload metadata in safe batches")
+  .description("Queue watched folder changes and upload metadata in safe batches (never per-event)")
   .requiredOption("-p, --path <dir>", "Directory path to watch")
   .option("--interval-minutes <minutes>", "Batch upload interval; defaults to hourly", "60")
   .option("--debounce-seconds <seconds>", "Wait for files to settle before queueing metadata", "8")
@@ -722,8 +1015,14 @@ program
     }
     enforceTrackableRoot("Watch target", watchDir, Boolean(options.allowCloudRoot));
 
+    // Flushes the accumulated local change-queue as ONE batched upload cycle.
+    // Only ever called on the interval timer or the safety cap — never per FS event.
     async function processQueue() {
       if (queue.length === 0) return;
+      if (loadState().paused) {
+        console.log(`[Watcher Paused] Holding ${queue.length} queued change(s) until resume.`);
+        return;
+      }
       const batch = queue;
       queue = [];
       console.log(`[Watcher Batch] Flushing ${batch.length} file change(s) to Convex`);
@@ -737,6 +1036,8 @@ program
       saveHashCache(hashCache);
     }
 
+    // Builds metadata into the local queue. Does NOT upload — uploads happen only
+    // in processQueue() on the interval, so filesystem events never stream to Convex.
     async function enqueue(filePath: string) {
       try {
         const statObj = fs.statSync(filePath);
@@ -746,7 +1047,11 @@ program
           return;
         }
         queue.push(await buildFileMetadata(filePath, statObj, hashCache, config.fullHash));
-        if (queue.length >= 500) await processQueue();
+        // Safety cap only — bounds memory if a huge burst arrives between intervals.
+        if (queue.length >= 500) {
+          console.log("[Watcher Cap] Local queue reached 500 — flushing early to bound memory.");
+          await processQueue();
+        }
       } catch (err: any) {
         console.warn(`[Watcher Skip] ${filePath}: ${err.message}`);
       }

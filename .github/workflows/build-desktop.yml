@@ -1,0 +1,50 @@
+name: Build DriveOS Desktop
+
+# Builds the desktop installers without needing local Mac/Windows hardware.
+# Trigger manually (Actions tab → Run workflow) or on a version tag.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "desktop-v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: dist:mac
+            artifact: driveos-desktop-mac
+            glob: "apps/desktop/release/*.dmg"
+          - os: windows-latest
+            target: dist:win
+            artifact: driveos-desktop-win
+            glob: "apps/desktop/release/*.exe"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build desktop installer
+        run: npm run ${{ matrix.target }} --workspace=apps/desktop
+        env:
+          # electron-builder: don't try to publish; just build artifacts.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Unsigned builds. To sign, add CSC_LINK / CSC_KEY_PASSWORD (and Apple
+          # notarization vars on mac) as repo secrets — see apps/desktop/INSTALLER.md.
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.glob }}
+          if-no-files-found: error

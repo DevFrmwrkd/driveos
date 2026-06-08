@@ -5,6 +5,18 @@ node_modules
 /apps/web/build
 /apps/agent/dist
 /packages/shared/dist
+/apps/desktop/dist
+/apps/desktop/release
+
+# Auth key generator temp output (never commit private keys)
+.auth_keys.tmp
+.jwt_pk.tmp
+.jwks.tmp
+
+# Generated app icons (regenerated from assets/logo.png via scripts/applyLogo.mjs)
+/apps/desktop/build/icon.ico
+/apps/desktop/build/icon.icns
+/apps/desktop/renderer/logo.png
 
 # Local configs and caches
 .env
