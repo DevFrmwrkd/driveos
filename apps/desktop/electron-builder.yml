@@ -1,6 +1,8 @@
 appId: media.frmwrkd.driveos.agent
 productName: DriveOS Agent
 copyright: DriveOS
+# We only want local artifacts (uploaded as CI artifacts), never a GitHub release.
+publish: null
 # Pinned so electron-builder doesn't need electron resolvable in this workspace
 # (it's hoisted to the monorepo root in our npm workspaces setup).
 electronVersion: 33.4.11
@@ -40,6 +42,9 @@ mac:
 win:
   target:
     - nsis
+    # Portable zip fallback — needs no code-sign cache, so it always builds even
+    # if the NSIS installer step hits a signing-tool issue on a runner.
+    - zip
 
 nsis:
   oneClick: false
