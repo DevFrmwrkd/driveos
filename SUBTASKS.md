@@ -54,3 +54,16 @@ Add a "file still being written" stability check (size stable across 2 stats N s
 Don't generate thousands of tiny files inside cloud folders.
 
 Key file: apps/agent/src/index.ts (local-state paths near top of file; walkFiles / scan path).
+
+
+5. Auto-run analysis after a scan (duplicates + recommendations)
+
+
+runDuplicateDetection and generateRecommendations exist but are manual — nothing triggers them after a scan, so the dashboard's Duplicates / Cleanup stay stale.
+
+Do:
+
+After scans.complete, trigger duplicates.runDuplicateDetection + recommendations.generateRecommendations — via a Convex scheduled action (ctx.scheduler) post-scan hook, or an extra agent call after completeScan.
+Keep it batched / once-per-cycle — don't run on every file.
+
+Files: convex/scans.ts, convex/duplicates.ts, convex/recommendations.ts.
