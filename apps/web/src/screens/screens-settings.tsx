@@ -1,4 +1,6 @@
 import React from "react";
+import { useQuery, useMutation } from "convex/react";
+import { api } from "@/convexApi";
 import { DB } from "@/data";
 import {
   Icon,
@@ -82,7 +84,7 @@ type ToggleMap = Record<string, boolean>;
         // content
         h("div", { key: sec, className: "fade-up", style: { minWidth: 0 } },
           sec === "team" && h(TeamSettings, { toast }),
-          sec === "agents" && h(AgentSettings, null),
+          sec === "agents" && h(AgentSettings, { toast }),
           sec === "templates" && h(TemplateSettings, { toast }),
           sec === "rules" && h(RuleSettings, null),
           sec === "classify" && h(ClassifySettings, null),
@@ -112,22 +114,99 @@ type ToggleMap = Record<string, boolean>;
           h("td", null, h(Badge, { kind: m.role.includes("Founder") ? "accent" : "" }, m.role.includes("Founder") ? "Admin" : "Editor")))))));
   }
 
-  function AgentSettings() {
-    const agents = [
-      { name: "CJ-Studio-MBP", os: "macOS 15.2", user: "cj", status: "online", v: "1.8.2", drives: 2 },
-      { name: "Brandon-Tower", os: "Windows 11", user: "brandon", status: "online", v: "1.8.2", drives: 3 },
-      { name: "Ingest-Station", os: "macOS 15.1", user: "mara", status: "online", v: "1.8.2", drives: 2 },
-      { name: "Kenji-Tokyo-MBP", os: "macOS 15.2", user: "kenji", status: "online", v: "1.8.1", drives: 2 },
-      { name: "Studio-NAS-Agent", os: "Synology DSM", user: "founder", status: "offline", v: "1.7.9", drives: 4 },
-    ];
-    return h(Panel, { title: "Machines / Agents", desc: "Local agents that scan and watch drives. Metadata only — no media is uploaded.", action: h("button", { className: "btn sm" }, h(Icon, { name: "download", size: 14 }), "Install Agent") },
-      h("div", { style: { display: "flex", flexDirection: "column", gap: 10 } }, agents.map((a, i) =>
-        h("div", { key: i, className: "spread", style: { padding: "13px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
-          h("div", { className: "row", style: { gap: 12 } },
-            h("div", { style: { width: 36, height: 36, borderRadius: 9, display: "grid", placeItems: "center", flexShrink: 0, background: a.status === "online" ? "var(--ok-soft)" : "var(--bg-panel-2)", color: a.status === "online" ? "var(--ok)" : "var(--tx-dim)" } }, h(Icon, { name: "cpu", size: 17 })),
-              h("div", null, h("div", { className: "hi mono", style: { fontWeight: 600, fontSize: 13 } }, a.name),
-              h("div", { className: "muted", style: { fontSize: 11.5 } }, a.os + " · " + ((DB.teamById as Record<string, any>)[a.user]?.name || a.user) + " · " + a.drives + " drives"))),
-          h("div", { className: "row", style: { gap: 10 } }, h("span", { className: "mono dim", style: { fontSize: 11 } }, "agent v" + a.v), h(StatusBadge, { status: a.status }))))));
+  function AgentSettings({ toast }: ScreenProps) {
+    const machines = useQuery(api.drives.listMachines) || [];
+    const issueToken = useMutation(api.agentAuth.issueMachineToken);
+    const revokeToken = useMutation(api.agentAuth.revokeMachineToken);
+    const [adding, setAdding] = React.useState(false);
+    const [newName, setNewName] = React.useState("");
+    const [issued, setIssued] = React.useState<{ token: string; machineName: string } | null>(null);
+    const [busy, setBusy] = React.useState(false);
+
+    const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL || "";
+
+    const onIssue = async (machineName: string) => {
+      if (busy || !machineName.trim()) return;
+      setBusy(true);
+      try {
+        const res = await issueToken({ machineName: machineName.trim() });
+        setIssued({ token: res.token, machineName: res.machineName });
+        setAdding(false);
+        setNewName("");
+      } catch (err: any) {
+        toast(err?.data || err?.message || "Could not issue token", "alert", "risk");
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    const onRevoke = async (machineId: string) => {
+      try {
+        await revokeToken({ machineId });
+        toast("Token revoked", "shield", "warn");
+      } catch (err: any) {
+        toast(err?.data || err?.message || "Could not revoke", "alert", "risk");
+      }
+    };
+
+    return h(Panel, {
+      title: "Machines / Agents",
+      desc: "Local agents that scan and watch drives. Metadata only — no media is uploaded.",
+      action: h("button", { className: "btn sm primary", onClick: () => { setAdding(true); setNewName(""); } }, h(Icon, { name: "plus", size: 14 }), "Add machine"),
+    },
+      // Add-machine inline form
+      adding && h("div", { style: { padding: "14px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--accent-line)", marginBottom: 12 } },
+        h("div", { className: "field-label", style: { marginBottom: 6 } }, "Machine name (e.g. Editing-Bay-1)"),
+        h("div", { className: "row", style: { gap: 9 } },
+          h("input", { className: "input", style: { flex: 1 }, value: newName, autoFocus: true, placeholder: "Editing-Bay-1",
+            onChange: (e: React.ChangeEvent<HTMLInputElement>) => setNewName(e.target.value),
+            onKeyDown: (e: React.KeyboardEvent) => { if (e.key === "Enter") onIssue(newName); } }),
+          h("button", { className: "btn primary", disabled: busy || !newName.trim(), onClick: () => onIssue(newName) }, busy ? "…" : "Issue token"),
+          h("button", { className: "btn ghost", onClick: () => setAdding(false) }, "Cancel"))),
+
+      // Machine list
+      machines.length === 0 && !adding
+        ? h("div", { className: "empty", style: { padding: "30px 0" } }, h("div", { className: "empty-ico" }, h(Icon, { name: "cpu", size: 22 })), h("h3", null, "No machines yet"), h("div", { className: "muted" }, "Add a machine to generate a connect token for the desktop app."))
+        : h("div", { style: { display: "flex", flexDirection: "column", gap: 10 } }, machines.map((a: any) => {
+            const online = a.status === "online";
+            return h("div", { key: a._id, className: "spread", style: { padding: "13px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
+              h("div", { className: "row", style: { gap: 12 } },
+                h("div", { style: { width: 36, height: 36, borderRadius: 9, display: "grid", placeItems: "center", flexShrink: 0, background: online ? "var(--ok-soft)" : "var(--bg-panel-2)", color: online ? "var(--ok)" : "var(--tx-dim)" } }, h(Icon, { name: "cpu", size: 17 })),
+                h("div", null,
+                  h("div", { className: "hi mono", style: { fontWeight: 600, fontSize: 13 } }, a.name),
+                  h("div", { className: "muted", style: { fontSize: 11.5 } }, (a.platform && a.platform !== "pending" ? a.platform + " · " : "") + (a.authTokenHash ? "token active" : "no token")))),
+              h("div", { className: "row", style: { gap: 8 } },
+                a.agentVersion && a.agentVersion !== "pending" && h("span", { className: "mono dim", style: { fontSize: 11 } }, "v" + a.agentVersion),
+                h(StatusBadge, { status: a.status }),
+                h("button", { className: "btn sm", title: "Re-issue a new connect token", onClick: () => onIssue(a.name) }, h(Icon, { name: "rotate", size: 13 }), "Token"),
+                a.authTokenHash && h("button", { className: "btn sm ghost icon", title: "Revoke token", onClick: () => onRevoke(a._id) }, h(Icon, { name: "lock", size: 14 }))));
+          })),
+
+      // One-time token modal
+      issued && h(TokenModal, { issued, convexUrl, toast, onClose: () => setIssued(null) }));
+  }
+
+  function TokenModal({ issued, convexUrl, toast, onClose }: ScreenProps) {
+    const copy = (text: string, label: string) => {
+      try { navigator.clipboard.writeText(text); toast(label + " copied", "copy", "ok"); } catch { toast("Copy failed", "alert", "risk"); }
+    };
+    const cmd = `driveos-agent connect --machine "${issued.machineName}" --token ${issued.token}` + (convexUrl ? ` --convex ${convexUrl}` : "");
+    return h(Modal, { title: "Connect token for " + issued.machineName, subtitle: "Shown once — copy it now", icon: "shield", iconKind: "accent", onClose, width: 620, footer: [
+      h("button", { key: "c", className: "btn", onClick: onClose }, "Done"),
+    ] },
+      h("div", { style: { padding: "13px 15px", borderRadius: "var(--r)", background: "var(--warn-soft)", border: "1px solid var(--warn-line)", marginBottom: 16, display: "flex", gap: 10 } },
+        h(Icon, { name: "info", size: 17, style: { color: "var(--warn)", flexShrink: 0 } }),
+        h("div", { style: { fontSize: 12.5, lineHeight: 1.5 } }, h("b", { className: "hi" }, "This token is shown only once. "), "Paste it into the DriveOS desktop app on that machine, or run the command below. Re-issue anytime if lost.")),
+
+      h("div", { className: "eyebrow", style: { marginBottom: 6 } }, "Token"),
+      h("div", { className: "row", style: { gap: 8, marginBottom: 16 } },
+        h("input", { className: "input mono", readOnly: true, value: issued.token, style: { flex: 1, fontSize: 11.5 }, onFocus: (e: any) => e.target.select() }),
+        h("button", { className: "btn", onClick: () => copy(issued.token, "Token") }, h(Icon, { name: "copy", size: 14 }), "Copy")),
+
+      h("div", { className: "eyebrow", style: { marginBottom: 6 } }, "Or run on that machine"),
+      h("div", { className: "row", style: { gap: 8 } },
+        h("input", { className: "input mono", readOnly: true, value: cmd, style: { flex: 1, fontSize: 11 }, onFocus: (e: any) => e.target.select() }),
+        h("button", { className: "btn", onClick: () => copy(cmd, "Command") }, h(Icon, { name: "copy", size: 14 }), "Copy")));
   }
 
   function TemplateSettings({ toast }: ScreenProps) {

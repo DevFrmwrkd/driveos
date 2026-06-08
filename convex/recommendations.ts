@@ -54,7 +54,7 @@ export const generateRecommendations = mutation({
       await ctx.db.insert("recommendations", {
         type: "delete_cache",
         title: "Premiere & DaVinci cache",
-        explanation: `Regenerable cache and peak files from video editing. These files can be safely deleted and will rebuild automatically when you reopen the active projects. This will immediately free up ${(cacheBytes / (1024 ** 12)).toFixed(2)} TB.`,
+        explanation: `Regenerable cache and peak files from video editing. These files can be safely deleted and will rebuild automatically when you reopen the active projects. This will immediately free up ${(cacheBytes / (1024 ** 4)).toFixed(2)} TB.`,
         affectedFileIds: cacheFileIds,
         affectedBytes: cacheBytes,
         riskLevel: "green",
@@ -77,7 +77,7 @@ export const generateRecommendations = mutation({
       await ctx.db.insert("recommendations", {
         type: "delete_proxies",
         title: "Proxies of delivered projects",
-        explanation: `Generated proxy files for projects already completed and delivered. The camera RAW footage remains safely indexed and archived, so these temporary edit proxies are no longer needed. Clears ${(proxyBytes / (1024 ** 9)).toFixed(1)} GB.`,
+        explanation: `Generated proxy files for projects already completed and delivered. The camera RAW footage remains safely indexed and archived, so these temporary edit proxies are no longer needed. Clears ${(proxyBytes / (1024 ** 3)).toFixed(1)} GB.`,
         affectedFileIds: proxyFileIds,
         affectedBytes: proxyBytes,
         riskLevel: "green",
@@ -104,7 +104,7 @@ export const generateRecommendations = mutation({
         await ctx.db.insert("recommendations", {
           type: "remove_duplicate",
           title: "Remove exact duplicate media files",
-          explanation: `Identical video clips and raw files copied multiple times across projects and drives. Deleting redundant copies and keeping the reference master will safely recover ${(totalWastedBytes / (1024 ** 12)).toFixed(2)} TB.`,
+          explanation: `Identical video clips and raw files copied multiple times across projects and drives. Deleting redundant copies and keeping the reference master will safely recover ${(totalWastedBytes / (1024 ** 4)).toFixed(2)} TB.`,
           affectedFileIds: duplicateFileIds,
           affectedBytes: totalWastedBytes,
           riskLevel: "green",

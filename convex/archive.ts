@@ -47,7 +47,7 @@ export const createManifest = mutation({
       action: "manifest_generate",
       entityType: "archiveManifest",
       entityId: manifestId,
-      message: `Generated archive manifest for project ${args.projectId} with ${args.fileCount} files (${(args.totalBytes / (1024 ** 9)).toFixed(1)} GB)`,
+      message: `Generated archive manifest for project ${args.projectId} with ${args.fileCount} files (${(args.totalBytes / (1024 ** 3)).toFixed(1)} GB)`,
       createdAt: timestamp,
     });
 

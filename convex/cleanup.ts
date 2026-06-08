@@ -83,7 +83,7 @@ export const createJob = mutation({
       action: "job_create",
       entityType: "cleanupJob",
       entityId: jobId,
-      message: `Created cleanup job for action "${args.action}" affecting ${(args.affectedBytes / (1024 ** 9)).toFixed(1)} GB`,
+      message: `Created cleanup job for action "${args.action}" affecting ${(args.affectedBytes / (1024 ** 3)).toFixed(1)} GB`,
       createdAt: timestamp,
     });
 
