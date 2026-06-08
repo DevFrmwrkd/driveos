@@ -1,4 +1,6 @@
 import React from "react";
+import { useMutation } from "convex/react";
+import { api } from "@/convexApi";
 import { DB } from "@/data";
 import {
   Icon,
@@ -59,9 +61,65 @@ type AnyRecord = Record<string, any>;
     return Math.max(1, Math.round(mb * 1024)) + " KB";
   }
 
+  const DUP_REQUESTER = "founder";
+
   function ClusterCard({ c, go, toast }: ScreenProps) {
     const [roles, setRoles] = React.useState<string[]>(() => c.locations.map((l: any) => l.role));
     const [resolved, setResolved] = React.useState<string | null>(null);
+    const [busy, setBusy] = React.useState(false);
+    const createJob = useMutation(api.cleanup.createJob);
+    const approveJob = useMutation(api.cleanup.approveJob);
+    const updateClusterStatus = useMutation(api.duplicates.updateStatus);
+
+    // Quarantine every copy in the cluster except the recommended keep file.
+    const onQuarantine = async (label: string) => {
+      if (busy) return;
+      setBusy(true);
+      try {
+        const isConvexCluster = typeof c.id === "string" && c.id.length > 12;
+        const allIds: string[] = Array.isArray(c.fileIds) ? c.fileIds : [];
+        const keepId = c.recommendedKeepFileId;
+        const quarantineIds = allIds.filter((id) => id !== keepId);
+        if (isConvexCluster && quarantineIds.length > 0) {
+          const sizeBytes = c.sizeGB * (1024 ** 3);
+          const jobId = await createJob({
+            requestedBy: DUP_REQUESTER,
+            action: "quarantine",
+            affectedFileIds: quarantineIds,
+            affectedBytes: Math.round(sizeBytes * quarantineIds.length),
+          });
+          if (jobId) await approveJob({ jobId, approvedBy: DUP_REQUESTER });
+        }
+        if (isConvexCluster) await updateClusterStatus({ clusterId: c.id, status: "quarantined" });
+        setResolved(label);
+      } catch (err: any) {
+        toast(err?.message || "Could not queue quarantine", "alert", "risk");
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    const onIntentional = async () => {
+      if (busy) return;
+      setBusy(true);
+      try {
+        if (typeof c.id === "string" && c.id.length > 12) await updateClusterStatus({ clusterId: c.id, status: "resolved" });
+        setResolved("Marked intentional");
+      } catch (err: any) {
+        toast(err?.message || "Could not update cluster", "alert", "risk");
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    const onIgnore = async () => {
+      try {
+        if (typeof c.id === "string" && c.id.length > 12) await updateClusterStatus({ clusterId: c.id, status: "ignored" });
+        toast("Cluster ignored", "x", "accent");
+      } catch (err: any) {
+        toast(err?.message || "Could not ignore cluster", "alert", "risk");
+      }
+    };
     const keepCount = roles.filter((r: string) => r === "keep").length;
     const quarCount = roles.filter((r: string) => r === "quarantine").length;
     const recover = c.locations.reduce((s: number, l: any, i: number) => s + (roles[i] === "quarantine" ? c.sizeGB : 0), 0);
@@ -125,10 +183,10 @@ type AnyRecord = Record<string, any>;
           h("span", { className: "mono", style: { fontSize: 12, color: "var(--tx-mut)" } }, "Keep ", h("b", { style: { color: "var(--ok)" } }, keepCount), " · Quarantine ", h("b", { style: { color: "var(--warn)" } }, quarCount)),
           recover > 0 && h(Badge, { kind: "ok" }, "Recover " + fmtDuplicateSize(recover))),
         h("div", { className: "row", style: { gap: 8 } },
-          h("button", { className: "btn sm ghost", onClick: () => toast("Cluster ignored", "x", "accent") }, "Ignore"),
-          h("button", { className: "btn sm", onClick: () => setResolved("Marked intentional") }, h(Icon, { name: "flag", size: 13 }), "Intentional"),
-          h("button", { className: "btn sm primary", disabled: quarCount === 0 || c.risk === "danger", onClick: () => setResolved("Quarantined") },
-            h(Icon, { name: "shield", size: 13 }), "Quarantine " + quarCount))));
+          h("button", { className: "btn sm ghost", disabled: busy, onClick: onIgnore }, "Ignore"),
+          h("button", { className: "btn sm", disabled: busy, onClick: onIntentional }, h(Icon, { name: "flag", size: 13 }), "Intentional"),
+          h("button", { className: "btn sm primary", disabled: quarCount === 0 || c.risk === "danger" || busy, onClick: () => onQuarantine("Quarantined") },
+            h(Icon, { name: "shield", size: 13 }), busy ? "Queuing…" : "Quarantine " + quarCount))));
   }
 
   function DuplicateCenter({ go, toast }: ScreenProps) {
@@ -145,6 +203,12 @@ type AnyRecord = Record<string, any>;
         (scope === "project" && c.project !== "—")));
 
     const totalRecover = DB.duplicates.reduce((s, c) => s + c.recoverGB, 0);
+    // Derived from live duplicate clusters rather than hardcoded figures.
+    const totalDupTB = DB.duplicates.reduce((s, c) => s + (c.sizeGB * c.copies) / 1024, 0);
+    const clusterCount = DB.duplicates.length;
+    const recoverByRisk = (rk: string) => DB.duplicates.filter((c) => c.risk === rk).reduce((s, c) => s + c.recoverGB, 0);
+    const reviewTB = recoverByRisk("review") / 1024;
+    const protectedTB = recoverByRisk("danger") / 1024;
 
     return h("div", { className: "page-inner" },
       h(PageHead, { eyebrow: "Maintenance", title: "Duplicate Center", desc: "Review duplicate clusters across every drive and the cloud. Nothing is deleted — confirmed copies move to a recoverable quarantine.",
@@ -154,11 +218,11 @@ type AnyRecord = Record<string, any>;
       h("div", { className: "card fade-up", style: { marginBottom: "var(--gap)", display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 1fr", gap: 0 } },
         h("div", { className: "card-pad", style: { display: "flex", flexDirection: "column", justifyContent: "center", gap: 4 } },
           h("div", { className: "eyebrow" }, "Total Duplicate Storage"),
-          h("div", { className: "row", style: { alignItems: "baseline", gap: 8 } }, h("span", { className: "stat-num", style: { fontSize: 34 } }, "4.2"), h("span", { style: { fontSize: 16, color: "var(--tx-mut)", fontWeight: 600 } }, "TB")),
-          h("div", { className: "muted", style: { fontSize: 12 } }, "across ", h("b", { className: "hi" }, "1,240 clusters"))),
+          h("div", { className: "row", style: { alignItems: "baseline", gap: 8 } }, h("span", { className: "stat-num", style: { fontSize: 34 } }, totalDupTB.toFixed(1)), h("span", { style: { fontSize: 16, color: "var(--tx-mut)", fontWeight: 600 } }, "TB")),
+          h("div", { className: "muted", style: { fontSize: 12 } }, "across ", h("b", { className: "hi" }, fmtNum(clusterCount) + " cluster" + (clusterCount === 1 ? "" : "s")))),
         sumBox("Safe to recover", fmtDuplicateSize(totalRecover), "var(--ok)", "shieldCheck"),
-        sumBox("Needs review", "1.4 TB", "var(--warn)", "info"),
-        sumBox("Protected", "0.3 TB", "var(--risk)", "lock")),
+        sumBox("Needs review", fmtTB(reviewTB), "var(--warn)", "info"),
+        sumBox("Protected", fmtTB(protectedTB), "var(--risk)", "lock")),
 
       // filters
       h("div", { className: "filter-bar" },
