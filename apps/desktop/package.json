@@ -5,6 +5,10 @@
   "description": "DriveOS Agent — desktop tray app for non-technical editors",
   "main": "dist/main.js",
   "author": "DriveOS",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DevFrmwrkd/driveos.git"
+  },
   "scripts": {
     "build:shared": "npm --prefix ../../packages/shared run build",
     "build:agent": "npm run build:shared && npm --prefix ../agent run bundle",
@@ -12,9 +16,9 @@
     "build:main": "node esbuild.config.mjs",
     "build": "npm run build:agent && npm run build:main",
     "start": "npm run build && electron .",
-    "dist": "npm run build && electron-builder",
-    "dist:win": "npm run build && electron-builder --win",
-    "dist:mac": "npm run build && electron-builder --mac"
+    "dist": "npm run build && electron-builder --publish never",
+    "dist:win": "npm run build && electron-builder --win --publish never",
+    "dist:mac": "npm run build && electron-builder --mac --publish never"
   },
   "dependencies": {},
   "devDependencies": {

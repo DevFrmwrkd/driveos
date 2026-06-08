@@ -35,3 +35,4 @@ temp_test_drive/
 Thumbs.db
 ._*
 .vercel
+.env*.local
