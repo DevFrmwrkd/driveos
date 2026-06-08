@@ -51,6 +51,7 @@ type ToggleMap = Record<string, boolean>;
 
   const SECTIONS = [
     { id: "team", label: "Team Members", icon: "users" },
+    { id: "drives", label: "Tracked Drives", icon: "hdd" },
     { id: "agents", label: "Machines / Agents", icon: "cpu" },
     { id: "templates", label: "Folder Templates", icon: "folder" },
     { id: "rules", label: "Cleanup Rules", icon: "broom" },
@@ -84,6 +85,7 @@ type ToggleMap = Record<string, boolean>;
         // content
         h("div", { key: sec, className: "fade-up", style: { minWidth: 0 } },
           sec === "team" && h(TeamSettings, { toast }),
+          sec === "drives" && h(DriveSettings, { toast }),
           sec === "agents" && h(AgentSettings, { toast }),
           sec === "templates" && h(TemplateSettings, { toast }),
           sec === "rules" && h(RuleSettings, null),
@@ -101,17 +103,80 @@ type ToggleMap = Record<string, boolean>;
       h("div", { className: "card-pad" }, children));
   }
 
+  // Live team management — add a member by email so they can log in (sign-up is
+  // allowlisted to team members, so adding them here grants dashboard access).
   function TeamSettings({ toast }: ScreenProps) {
-    return h(Panel, { title: "Team Members", desc: "People with access to DriveOS and their storage footprint.", action: h("button", { className: "btn sm primary", onClick: () => toast("Invite sent", "user", "accent") }, h(Icon, { name: "plus", size: 14 }), "Invite") },
-      h("table", { className: "tbl" },
-        h("thead", null, h("tr", null, ["Member", "Role", "Location", "Drives", "Storage", "Access"].map((c, i) => h("th", { key: i, className: i === 3 || i === 4 ? "num" : "" }, c)))),
-        h("tbody", null, DB.team.map((m) => h("tr", { key: m.id, style: { cursor: "default" } },
-          h("td", null, h("div", { className: "row", style: { gap: 10 } }, h(Avatar, { id: m.id, size: 28 }), h("span", { className: "hi", style: { fontWeight: 600 } }, m.name))),
-          h("td", { className: "muted" }, m.role),
-          h("td", { className: "muted" }, m.location),
-          h("td", { className: "num mono" }, m.drives),
-          h("td", { className: "num mono hi" }, m.usedTB > 0 ? fmtTB(m.usedTB) : "—"),
-          h("td", null, h(Badge, { kind: m.role.includes("Founder") ? "accent" : "" }, m.role.includes("Founder") ? "Admin" : "Editor")))))));
+    const members = useQuery(api.admin.listTeamMembers) || [];
+    const addMember = useMutation(api.admin.addTeamMember);
+    const [adding, setAdding] = React.useState(false);
+    const [form, setForm] = React.useState({ name: "", email: "", role: "editor" });
+    const [busy, setBusy] = React.useState(false);
+
+    const submit = async () => {
+      if (busy || !form.email.trim() || !form.name.trim()) return;
+      setBusy(true);
+      try {
+        await addMember({ name: form.name.trim(), email: form.email.trim(), role: form.role });
+        toast(`${form.email.trim()} can now sign in`, "user", "ok");
+        setAdding(false);
+        setForm({ name: "", email: "", role: "editor" });
+      } catch (err: any) {
+        toast(err?.data || err?.message || "Could not add member", "alert", "risk");
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    return h(Panel, { title: "Team Members", desc: "People allowed to sign in to DriveOS. Add someone here, then they set their own password on first login.",
+      action: h("button", { className: "btn sm primary", onClick: () => setAdding(!adding) }, h(Icon, { name: "plus", size: 14 }), "Add member") },
+      adding && h("div", { style: { padding: "14px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--accent-line)", marginBottom: 14, display: "grid", gridTemplateColumns: "1fr 1fr auto auto", gap: 9, alignItems: "end" } },
+        h("div", null, h("label", { className: "field-label" }, "Name"), h("input", { className: "input", value: form.name, placeholder: "Jane Editor", onChange: (e: React.ChangeEvent<HTMLInputElement>) => setForm({ ...form, name: e.target.value }) })),
+        h("div", null, h("label", { className: "field-label" }, "Email"), h("input", { className: "input", type: "email", value: form.email, placeholder: "jane@studio.com", onChange: (e: React.ChangeEvent<HTMLInputElement>) => setForm({ ...form, email: e.target.value }) })),
+        h("select", { className: "select", value: form.role, onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setForm({ ...form, role: e.target.value }) },
+          ["admin", "producer", "editor", "assistant_editor", "viewer"].map((r) => h("option", { key: r, value: r }, r))),
+        h("button", { className: "btn primary", disabled: busy || !form.email || !form.name, onClick: submit }, busy ? "…" : "Add")),
+
+      members.length === 0 && h("div", { className: "empty", style: { padding: "24px 0" } }, h("div", { className: "muted" }, "No team members yet. Add the first one above.")),
+      members.length > 0 && h("table", { className: "tbl" },
+        h("thead", null, h("tr", null, ["Member", "Email", "Role"].map((c, i) => h("th", { key: i }, c)))),
+        h("tbody", null, members.map((m: any) => h("tr", { key: m._id, style: { cursor: "default" } },
+          h("td", null, h("span", { className: "hi", style: { fontWeight: 600 } }, m.name)),
+          h("td", { className: "muted mono", style: { fontSize: 12 } }, m.email),
+          h("td", null, h(Badge, { kind: m.role === "admin" ? "accent" : "" }, m.role)))))));
+  }
+
+  // Live tracked-drive management — stop tracking a drive (removes it from the
+  // DriveOS catalog only; never touches the actual disk).
+  function DriveSettings({ toast }: ScreenProps) {
+    const drives = useQuery(api.drives.list) || [];
+    const removeDrive = useMutation(api.drives.remove);
+    const [busyId, setBusyId] = React.useState<any>(null);
+
+    const onRemove = async (d: any) => {
+      if (busyId) return;
+      if (!window.confirm(`Stop tracking "${d.label}"? This removes it from DriveOS (the actual files on disk are NOT deleted).`)) return;
+      setBusyId(d._id);
+      try {
+        const r = await removeDrive({ driveId: d._id });
+        toast(r.removed ? `Stopped tracking ${d.label}` : "Drive not found", r.removed ? "ok" : "warn");
+      } catch (err: any) {
+        toast(err?.data || err?.message || "Could not remove drive", "alert", "risk");
+      } finally {
+        setBusyId(null);
+      }
+    };
+
+    return h(Panel, { title: "Tracked Drives", desc: "Drives and folders DriveOS is cataloging. Removing one only clears its metadata — it never deletes files on disk." },
+      drives.length === 0
+        ? h("div", { className: "empty", style: { padding: "24px 0" } }, h("div", { className: "muted" }, "No drives tracked yet."))
+        : h("div", { style: { display: "flex", flexDirection: "column", gap: 10 } }, drives.map((d: any) =>
+            h("div", { key: d._id, className: "spread", style: { padding: "13px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
+              h("div", { className: "row", style: { gap: 12 } },
+                h("div", { style: { width: 36, height: 36, borderRadius: 9, display: "grid", placeItems: "center", flexShrink: 0, background: "var(--bg-panel-2)", color: d.tier === "cloud" ? "var(--cloud)" : "var(--tx-mut)" } }, h(Icon, { name: d.tier === "cloud" ? "cloud" : "hdd", size: 17 })),
+                h("div", null,
+                  h("div", { className: "hi", style: { fontWeight: 600, fontSize: 13 } }, d.label),
+                  h("div", { className: "muted mono", style: { fontSize: 11 } }, (d.tier || "hot") + " · " + (d.mountPath || "")))),
+              h("button", { className: "btn sm danger", disabled: busyId === d._id, onClick: () => onRemove(d) }, h(Icon, { name: "trash", size: 13 }), busyId === d._id ? "Removing…" : "Stop tracking")))));
   }
 
   function AgentSettings({ toast }: ScreenProps) {
