@@ -8,17 +8,18 @@
   "scripts": {
     "build:shared": "npm --prefix ../../packages/shared run build",
     "build:agent": "npm run build:shared && npm --prefix ../agent run bundle",
-    "build:main": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build:main": "node esbuild.config.mjs",
     "build": "npm run build:agent && npm run build:main",
     "start": "npm run build && electron .",
     "dist": "npm run build && electron-builder",
     "dist:win": "npm run build && electron-builder --win",
     "dist:mac": "npm run build && electron-builder --mac"
   },
-  "dependencies": {
-    "auto-launch": "^5.0.6"
-  },
+  "dependencies": {},
   "devDependencies": {
+    "auto-launch": "^5.0.6",
+    "esbuild": "^0.24.0",
     "electron": "^33.0.0",
     "electron-builder": "^25.1.8",
     "typescript": "^5.0.0"
