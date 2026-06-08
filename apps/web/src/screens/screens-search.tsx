@@ -59,6 +59,10 @@ type RoleMeta = Record<string, [string, string, string]>;
     const showSample = ql && norm("A001_C004").includes(norm(q)) && norm(q).length > 1;
     const projHits = ql ? DB.projects.filter((p) => [p.name, p.client, p.show].filter(Boolean).join(" ").toLowerCase().includes(ql)) : [];
     const driveHits = ql ? DB.drives.filter((d) => [d.name, d.model, d.id].filter(Boolean).join(" ").toLowerCase().includes(ql)) : [];
+    // Live file matches from Convex (DB.files is populated by the files.list query).
+    const fileHits = ql ? DB.files.filter((f: any) =>
+      [f.name, f.path, f.quickHash, f.fullHash].filter(Boolean).join(" ").toLowerCase().includes(ql)).slice(0, 25) : [];
+    const hasResults = showSample || projHits.length > 0 || driveHits.length > 0 || fileHits.length > 0;
 
     return h("div", { className: "page-inner", style: { maxWidth: 920 } },
       h(PageHead, { eyebrow: "System", title: "Search", desc: "Find any file, hash, project, drive, or folder across every tracked volume and the cloud." }),
@@ -79,8 +83,19 @@ type RoleMeta = Record<string, [string, string, string]>;
       // sample file result
       showSample && h(FileResult, { go, toast }),
 
-      // project / drive matches
-      (projHits.length > 0 || driveHits.length > 0) && !showSample && h("div", { style: { display: "flex", flexDirection: "column", gap: "var(--gap)" } },
+      // project / drive / file matches
+      (projHits.length > 0 || driveHits.length > 0 || fileHits.length > 0) && !showSample && h("div", { style: { display: "flex", flexDirection: "column", gap: "var(--gap)" } },
+        fileHits.length > 0 && cardShell("Files · " + fileHits.length, "film", "var(--tx-mut)", null,
+          h("div", { style: { padding: "6px 0" } }, fileHits.map((f: any) => {
+            const rm = (RISK_META as Record<string, any>)[f.risk] || RISK_META.review;
+            return h("div", { key: f.id, className: "offender-row spread", style: { padding: "11px 18px" } },
+              h("div", { style: { minWidth: 0 } },
+                h("span", { className: "mono hi", style: { fontWeight: 600, fontSize: 12.5 } }, f.name || "Untitled file"),
+                h("div", { className: "mono dim", style: { fontSize: 11, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 520 } }, f.path)),
+              h("div", { className: "row", style: { gap: 10, flexShrink: 0 } },
+                h(Badge, { kind: rm.cls }, f.type),
+                h("span", { className: "mono", style: { fontSize: 12, color: "var(--tx-mut)" } }, fmtGB(f.sizeGB))));
+          }))),
         projHits.length > 0 && cardShell("Projects · " + projHits.length, "folder", "var(--tx-mut)", null,
           h("div", { style: { padding: "6px 0" } }, projHits.map((p) => {
             const status = PROJ_STATUS[p.status] || PROJ_STATUS.active;
@@ -94,7 +109,7 @@ type RoleMeta = Record<string, [string, string, string]>;
             h(StatusBadge, { status: d.status }))))) ),
 
       // no results
-      ql && !showSample && projHits.length === 0 && driveHits.length === 0 &&
+      ql && !hasResults &&
         h("div", { className: "card" }, h("div", { className: "empty" }, h("div", { className: "empty-ico" }, h(Icon, { name: "search", size: 24 })), h("h3", null, "No matches for “" + q + "”"), h("div", { className: "muted" }, "Try a filename, project, drive, or a fingerprint hash."))));
   }
 

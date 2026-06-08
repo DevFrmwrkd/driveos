@@ -1,4 +1,6 @@
 import React from "react";
+import { useMutation } from "convex/react";
+import { api } from "@/convexApi";
 import { DB } from "@/data";
 import {
   Icon,
@@ -56,8 +58,42 @@ type QuarantineItem = any;
     { risk: "danger", label: "Do not delete", desc: "Protected. Flagged for manual review only.", icon: "lock" },
   ];
 
+  const CLEANUP_REQUESTER = "founder";
+
+  // Create + approve a quarantine job from a recommendation. The local agent's
+  // `run-jobs` command picks up the approved job and performs the actual move.
+  function useQuarantineRecommendation() {
+    const createJob = useMutation(api.cleanup.createJob);
+    const approveJob = useMutation(api.cleanup.approveJob);
+    return React.useCallback(async (r: any) => {
+      const jobId = await createJob({
+        recommendationId: typeof r.id === "string" ? r.id : undefined,
+        requestedBy: CLEANUP_REQUESTER,
+        action: "quarantine",
+        affectedFileIds: r.affectedFileIds || [],
+        affectedBytes: r.affectedBytes || 0,
+      });
+      if (jobId) await approveJob({ jobId, approvedBy: CLEANUP_REQUESTER });
+      return jobId;
+    }, [createJob, approveJob]);
+  }
+
   function RecCard({ r, go, toast, onPreview }: ScreenProps) {
     const [state, setState] = React.useState<RecState>(null);
+    const [busy, setBusy] = React.useState(false);
+    const quarantine = useQuarantineRecommendation();
+    const onQuarantine = async () => {
+      if (busy) return;
+      setBusy(true);
+      try {
+        await quarantine(r);
+        setState("quarantined");
+      } catch (err: any) {
+        toast(err?.message || "Could not queue quarantine", "alert", "risk");
+      } finally {
+        setBusy(false);
+      }
+    };
     if (state === "quarantined")
       return h("div", { className: "card", style: { borderColor: "var(--ok-line)", background: "var(--ok-soft)" } },
         h("div", { className: "card-pad row", style: { gap: 11 } }, h(Icon, { name: "checkCircle", size: 18, style: { color: "var(--ok)" } }),
@@ -83,7 +119,7 @@ type QuarantineItem = any;
             h("span", { className: "muted" }, h("b", { className: "hi" }, "Next: "), r.action)),
           h("div", { className: "row", style: { gap: 8, marginTop: 14 } },
             h("button", { className: "btn sm", onClick: () => onPreview(r) }, h(Icon, { name: "eye", size: 13 }), "Preview"),
-            r.risk !== "danger" && h("button", { className: "btn sm primary", onClick: () => setState("quarantined") }, h(Icon, { name: "shield", size: 13 }), "Quarantine"),
+            r.risk !== "danger" && h("button", { className: "btn sm primary", disabled: busy, onClick: onQuarantine }, h(Icon, { name: "shield", size: 13 }), busy ? "Queuing…" : "Quarantine"),
             h("button", { className: "btn sm ghost", onClick: () => setState("ignored") }, "Ignore")))));
   }
   function catIcon(cat: string) {
@@ -99,6 +135,9 @@ type QuarantineItem = any;
     const byRisk = (rk: string) => filtered.filter((c) => c.risk === rk);
     const safeT = DB.cleanup.filter((c) => c.risk === "safe").reduce((s, c) => s + c.recoverTB, 0);
     const revT = DB.cleanup.filter((c) => c.risk === "review").reduce((s, c) => s + c.recoverTB, 0);
+    const protT = DB.cleanup.filter((c) => c.risk === "danger").reduce((s, c) => s + c.recoverTB, 0);
+    const totalT = DB.cleanup.reduce((s, c) => s + c.recoverTB, 0);
+    const heroMax = totalT > 0 ? totalT : 1;
 
     return h("div", { className: "page-inner" },
       h(PageHead, { eyebrow: "Maintenance", title: "Cleanup Recommendations", desc: "Every recommendation explains what was found, why it's safe, and exactly what happens next. Nothing is deleted — files move to quarantine first.",
@@ -110,16 +149,16 @@ type QuarantineItem = any;
           h("div", { className: "card-pad", style: { padding: 28 } },
             h("div", { className: "eyebrow", style: { marginBottom: 8 } }, "Potential recovery"),
             h("div", { className: "row", style: { alignItems: "baseline", gap: 10 } },
-              h("span", { className: "stat-num", style: { fontSize: 52, color: "var(--ok)" } }, "8.6"), h("span", { style: { fontSize: 22, color: "var(--tx-mut)", fontWeight: 600 } }, "TB")),
+              h("span", { className: "stat-num", style: { fontSize: 52, color: "var(--ok)" } }, totalT.toFixed(1)), h("span", { style: { fontSize: 22, color: "var(--tx-mut)", fontWeight: 600 } }, "TB")),
             h("div", { style: { fontSize: 13.5, color: "var(--tx-mut)", marginTop: 8, maxWidth: "44ch" } }, "Reclaimable across 8 categories without touching any RAW footage, final exports, or single-copy files."),
             h("div", { className: "row", style: { gap: 10, marginTop: 20 } },
               h("button", { className: "btn primary lg", onClick: () => setPreview({ title: "All safe cleanup", recoverTB: safeT, files: 36242, projects: ["studio"], risk: "safe", why: "Combined safe-to-recover categories.", action: "Move to quarantine" }) },
                 h(Icon, { name: "broom", size: 16 }), "Quarantine all safe (" + fmtTB(safeT) + ")"),
               h("button", { className: "btn lg", onClick: () => go("quarantine") }, "Review queue"))),
           h("div", { style: { borderLeft: "1px solid var(--line)", padding: 28, display: "flex", flexDirection: "column", justifyContent: "center", gap: 16 } },
-            recoverBar("Safe to recover", safeT, 8.6, "ok"),
-            recoverBar("Needs review", revT, 8.6, "warn"),
-            recoverBar("Protected (kept)", 0.4, 8.6, "risk"),
+            recoverBar("Safe to recover", safeT, heroMax, "ok"),
+            recoverBar("Needs review", revT, heroMax, "warn"),
+            recoverBar("Protected (kept)", protT, heroMax, "risk"),
             h("div", { className: "mono dim", style: { fontSize: 11, marginTop: 2 } }, "Quarantine retention: 30 days · full rollback")))),
 
       // category chips
@@ -153,6 +192,21 @@ type QuarantineItem = any;
   // ---- Cleanup Preview Modal ----
   function CleanupPreviewModal({ r, onClose, toast, go }: ScreenProps) {
     const [approved, setApproved] = React.useState(false);
+    const [busy, setBusy] = React.useState(false);
+    const quarantine = useQuarantineRecommendation();
+    const onMove = async () => {
+      if (busy) return;
+      setBusy(true);
+      try {
+        await quarantine(r);
+        toast("Queued " + fmtNum(r.files) + " files for quarantine", "shield", "ok");
+        onClose();
+      } catch (err: any) {
+        toast(err?.message || "Could not queue quarantine", "alert", "risk");
+      } finally {
+        setBusy(false);
+      }
+    };
     const sampleFiles = [
       { path: "/Show_X/06_RENDERS_CACHE/Premiere Pro Video Previews/", size: "182 GB", type: "cache" },
       { path: "/Show_X/05_PROXIES/A_CAM/A001_C004_proxy.mov", size: "4.2 GB", type: "proxy" },
@@ -166,8 +220,8 @@ type QuarantineItem = any;
         h("span", { style: { fontSize: 12.5, color: "var(--tx)" } }, "I understand these files move to quarantine and can be restored for 30 days.")),
       h("button", { key: "c", className: "btn", onClick: onClose }, "Cancel"),
       h("button", { key: "r", className: "btn", onClick: () => toast("Report exported", "download", "accent") }, h(Icon, { name: "download", size: 14 }), "Export Report"),
-      h("button", { key: "q", className: "btn primary", disabled: !approved, onClick: () => { toast("Moved " + fmtNum(r.files) + " files to quarantine", "shield", "ok"); onClose(); } },
-        h(Icon, { name: "shield", size: 14 }), "Move to Quarantine"),
+      h("button", { key: "q", className: "btn primary", disabled: !approved || busy, onClick: onMove },
+        h(Icon, { name: "shield", size: 14 }), busy ? "Queuing…" : "Move to Quarantine"),
     ];
     return h(Modal, { title: r.title, subtitle: "Preview before anything moves", icon: "broom", iconKind: "ok", onClose, footer, width: 760 },
       h("div", { style: { padding: "13px 15px", borderRadius: "var(--r)", background: "var(--ok-soft)", border: "1px solid var(--ok-line)", marginBottom: 18, display: "flex", gap: 10 } },
@@ -207,8 +261,24 @@ type QuarantineItem = any;
   // ============================================================
   function QuarantineScreen({ go, toast }: ScreenProps) {
     const [items, setItems] = React.useState<QuarantineItem[]>(DB.quarantine);
+    const [busyId, setBusyId] = React.useState<any>(null);
+    const markRestored = useMutation(api.cleanup.markQuarantineRestored);
+    // Keep local list in sync when the live Convex query updates DB.quarantine.
+    React.useEffect(() => { setItems(DB.quarantine); }, [DB.quarantine]);
     const totalGB = items.reduce((s, q) => s + q.sizeGB, 0);
-    const restore = (id: any) => { setItems((x) => x.filter((q) => q.id !== id)); toast("File restored to original location", "rotate", "accent"); };
+    const restore = async (id: any) => {
+      if (busyId) return;
+      setBusyId(id);
+      try {
+        if (typeof id === "string" && id.length > 12) await markRestored({ quarantineId: id });
+        setItems((x) => x.filter((q) => q.id !== id));
+        toast("File restored to original location", "rotate", "accent");
+      } catch (err: any) {
+        toast(err?.message || "Could not restore file", "alert", "risk");
+      } finally {
+        setBusyId(null);
+      }
+    };
     const purge = (id: any) => { setItems((x) => x.filter((q) => q.id !== id)); toast("Permanently deleted", "trash", "risk"); };
 
     return h("div", { className: "page-inner" },
@@ -236,7 +306,7 @@ type QuarantineItem = any;
                 h("td", null, h("span", { className: "mono", style: { fontSize: 11.5, color: "var(--warn)" } }, q.deadline)),
                 h("td", { className: "num mono hi" }, fmtGB(q.sizeGB)),
                 h("td", null, h("div", { className: "row", style: { gap: 6, justifyContent: "flex-end" } },
-                  h("button", { className: "btn sm", onClick: () => restore(q.id) }, h(Icon, { name: "rotate", size: 13 }), "Restore"),
+                  h("button", { className: "btn sm", disabled: busyId === q.id, onClick: () => restore(q.id) }, h(Icon, { name: "rotate", size: 13 }), busyId === q.id ? "…" : "Restore"),
                   h("button", { className: "btn sm danger icon", title: "Permanently delete", onClick: () => purge(q.id) }, h(Icon, { name: "trash", size: 14 })))))))) ),
 
       // audit log

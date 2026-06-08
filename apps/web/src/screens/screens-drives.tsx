@@ -296,13 +296,23 @@ type AnyRecord = Record<string, any>;
               h("div", { className: "muted", style: { fontSize: 12, marginTop: 3 } }, "147 RAW clips have no archive or cloud copy. Back up before any cleanup."))),
           h("button", { className: "btn sm primary", style: { marginTop: 11 }, onClick: () => go("archive") }, h(Icon, { name: "archive", size: 14 }), "Send to Archive Queue"))));
 
+    // Live scan history from Convex (DB.scans), most-recent first, scoped to this drive when known.
+    const liveScans = (DB.scans || [])
+      .filter((s: any) => !s.driveId || !d.id || s.driveId === d.id)
+      .map((s: any) => ({
+        t: s.when,
+        e: s.status === "completed" ? "Scan complete" : s.status === "running" ? "Scan running" : "Scan " + (s.status || "—"),
+        n: fmtNum(s.files) + " files · " + fmtTB(s.sizeTB) + " indexed" + (s.errors ? " · " + s.errors + " errors" : ""),
+        k: s.status === "completed" ? "ok" : s.status === "running" ? "accent" : "warn",
+      }));
+    const scanItems = liveScans.length > 0 ? liveScans : [
+      { t: "2 min ago", e: "Full scan complete", n: "142,308 files · 3.6 TB indexed", k: "ok" },
+      { t: "Yesterday", e: "Incremental scan", n: "+1,204 files · +42 GB", k: "accent" },
+      { t: "Jun 1", e: "Duplicate detection run", n: "0.42 TB duplicates flagged", k: "warn" },
+      { t: "May 28", e: "Drive connected", n: "Thunderbolt 4 · auto-watch enabled", k: "" },
+    ];
     const scans = cardShell("Scan Timeline", "activity", "var(--tx-mut)", null,
-      h("div", { style: { padding: "10px 18px" } }, [
-        { t: "2 min ago", e: "Full scan complete", n: "142,308 files · 3.6 TB indexed", k: "ok" },
-        { t: "Yesterday", e: "Incremental scan", n: "+1,204 files · +42 GB", k: "accent" },
-        { t: "Jun 1", e: "Duplicate detection run", n: "0.42 TB duplicates flagged", k: "warn" },
-        { t: "May 28", e: "Drive connected", n: "Thunderbolt 4 · auto-watch enabled", k: "" },
-      ].map((s, i, arr) => h("div", { key: i, className: "row", style: { gap: 13, alignItems: "flex-start", paddingBottom: i < arr.length - 1 ? 16 : 0, position: "relative" } },
+      h("div", { style: { padding: "10px 18px" } }, scanItems.map((s, i, arr) => h("div", { key: i, className: "row", style: { gap: 13, alignItems: "flex-start", paddingBottom: i < arr.length - 1 ? 16 : 0, position: "relative" } },
         h("div", { style: { display: "flex", flexDirection: "column", alignItems: "center", flexShrink: 0 } },
           h("span", { style: { width: 10, height: 10, borderRadius: 99, background: s.k ? "var(--" + s.k + ")" : "var(--tx-faint)", boxShadow: s.k ? "0 0 8px var(--" + s.k + ")" : "none", zIndex: 1 } }),
           i < arr.length - 1 && h("span", { style: { width: 1, flex: 1, background: "var(--line)", marginTop: 4, position: "absolute", top: 14, bottom: 0 } })),
