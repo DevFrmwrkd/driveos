@@ -4,8 +4,10 @@ import React, { useState, useEffect, useRef, useCallback, Fragment } from "react
 import { DB } from "@/data";
 import { Icon } from "@/components/icons";
 import { Avatar, useToast } from "@/components/components";
-import { useQuery } from "convex/react";
+import { useQuery, Authenticated, Unauthenticated, AuthLoading } from "convex/react";
+import { useAuthActions } from "@convex-dev/auth/react";
 import { api } from "@/convexApi";
+import { LoginScreen } from "@/screens/screens-login";
 
 // Import all modularized screens
 import { Dashboard } from "@/screens/screens-dashboard";
@@ -172,6 +174,7 @@ interface TopBarProps {
 
 function TopBar({ go, route }: TopBarProps) {
   const crumbs = useCrumbs(route);
+  const { signOut } = useAuthActions();
   return (
     <div className="topbar">
       <div className="row" style={{ gap: 8, minWidth: 0 }}>
@@ -207,6 +210,9 @@ function TopBar({ go, route }: TopBarProps) {
         </button>
         <div style={{ width: 1, height: 22, background: "var(--line)" }} />
         <Avatar id="founder" size={30} />
+        <button className="btn ghost icon" title="Sign out" onClick={() => void signOut()}>
+          <Icon name="external" size={16} />
+        </button>
       </div>
     </div>
   );
@@ -254,6 +260,24 @@ function Placeholder({ title }: { title: string }) {
 }
 
 export default function App() {
+  return (
+    <>
+      <AuthLoading>
+        <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "var(--bg)", color: "var(--tx-mut)", fontSize: 13 }}>
+          Loading DriveOS…
+        </div>
+      </AuthLoading>
+      <Unauthenticated>
+        <LoginScreen />
+      </Unauthenticated>
+      <Authenticated>
+        <Workspace />
+      </Authenticated>
+    </>
+  );
+}
+
+function Workspace() {
   const [route, setRoute] = useState<{ screen: string; params: any }>({ screen: "dashboard", params: {} });
   const [push, toastNode] = useToast();
   const [dense, setDense] = useState(false);

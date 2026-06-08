@@ -1,7 +1,8 @@
 "use client";
 
 import React, { ReactNode, createContext, useContext } from "react";
-import { ConvexProvider, ConvexReactClient } from "convex/react";
+import { ConvexReactClient } from "convex/react";
+import { ConvexAuthNextjsProvider } from "@convex-dev/auth/nextjs";
 
 const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL || "https://determined-anaconda-827.convex.cloud";
 const convexClient = new ConvexReactClient(convexUrl);
@@ -18,7 +19,7 @@ export function useConvexStatus() {
 export default function ConvexClientProvider({ children }: { children: ReactNode }) {
   return (
     <ConvexContext.Provider value={{ isLive: true, client: convexClient }}>
-      <ConvexProvider client={convexClient}>{children}</ConvexProvider>
+      <ConvexAuthNextjsProvider client={convexClient}>{children}</ConvexAuthNextjsProvider>
     </ConvexContext.Provider>
   );
 }
