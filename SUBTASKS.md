@@ -42,3 +42,15 @@ Add pause / resume (confirm it survives restart).
 Ensure no constant filesystem-event uploads (replace/guard the watch streaming path).
 
 Key file: apps/agent/src/index.ts.
+
+4. Agent: cloud-sync safety guardrails (iCloud/Dropbox/GDrive)
+
+
+Do:
+
+Move agent local state (config, hash cache, offline log) out of the current working directory into the OS app-data dir (~/Library/Application Support/DriveOS / ~/.config/driveos). Never inside a cloud-synced folder.
+Detect known cloud-sync paths (iCloud ~/Library/Mobile Documents/com~apple~CloudDocs, ~/Dropbox, ~/Google Drive / ~/Library/CloudStorage) and warn before scanning/initializing them. Treat cloud folders as metadata-tracked, not normal drives, unless explicitly enabled.
+Add a "file still being written" stability check (size stable across 2 stats N seconds apart) before hashing/uploading.
+Don't generate thousands of tiny files inside cloud folders.
+
+Key file: apps/agent/src/index.ts (local-state paths near top of file; walkFiles / scan path).
