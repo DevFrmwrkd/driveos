@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { api } from "./_generated/api";
 
 export const list = query({
   args: {},
@@ -86,5 +87,41 @@ export const complete = mutation({
       message: `Completed scan session for ${session.rootPath} with status ${args.status}. Scanned ${session.filesScanned} files (${(session.bytesScanned / (1024 ** 4)).toFixed(2)} TB).`,
       createdAt: timestamp,
     });
+
+    // Auto-run analysis once per finished scan (not per file). A short delay lets
+    // near-simultaneous multi-root completions coalesce onto fresh data, and runs
+    // it off the critical path so completeScan returns immediately to the agent.
+    if (args.status === "completed" || args.status === "partial") {
+      await ctx.scheduler.runAfter(5000, api.scans.runPostScanAnalysis, {
+        scanSessionId: id,
+        machineId: session.machineId,
+      });
+    }
+  },
+});
+
+// Post-scan analysis: rebuild duplicate clusters and regenerate recommendations
+// from the now-current file catalog. Both underlying mutations are idempotent
+// (they patch/replace existing clusters and clear open recommendations), so a
+// re-run per scan session is safe and keeps Duplicates / Cleanup fresh.
+export const runPostScanAnalysis = mutation({
+  args: {
+    scanSessionId: v.optional(v.string()),
+    machineId: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    await ctx.runMutation(api.duplicates.runDuplicateDetection, {});
+    await ctx.runMutation(api.recommendations.generateRecommendations, {});
+
+    await ctx.db.insert("auditLogs", {
+      machineId: args.machineId,
+      action: "analysis_complete",
+      entityType: "scanSession",
+      entityId: args.scanSessionId,
+      message: "Auto-ran duplicate detection and recommendations after scan.",
+      createdAt: Date.now(),
+    });
+
+    return { success: true };
   },
 });
