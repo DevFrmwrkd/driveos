@@ -1,6 +1,6 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
-import { requireRole } from "./access";
+import { requireRole, resolveIdentityEmail } from "./access";
 import { rateLimiter } from "./rateLimits";
 
 // Bootstrap helper: create the first admin team member if none exists yet.
@@ -83,9 +83,7 @@ export const listTeamMembers = query({
 export const me = query({
   args: {},
   handler: async (ctx) => {
-    const identity = await ctx.auth.getUserIdentity();
-    if (!identity) return null;
-    const email = (identity.email ?? "").toString().trim().toLowerCase();
+    const email = await resolveIdentityEmail(ctx);
     if (!email) return null;
     const member = await ctx.db
       .query("teamMembers")
