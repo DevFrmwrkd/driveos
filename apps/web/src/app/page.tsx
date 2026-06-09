@@ -70,8 +70,9 @@ function routeFromHash(hash: string) {
 }
 
 function resolveOwnerId(record: any) {
-  const owner = record?.owner || record?.ownerId || DEFAULT_OWNER;
-  return (DB as any).teamById?.[owner] ? owner : DEFAULT_OWNER;
+  // Keep the real owner id (e.g. "steven") even if they're not in the team list,
+  // rather than masking it with a mock default owner.
+  return record?.owner || record?.ownerId || DEFAULT_OWNER;
 }
 
 function resolveProjectStatus(status?: string) {
@@ -292,8 +293,29 @@ function Workspace() {
   const convexAudit = useQuery(api.audit.list);
   const convexFiles = useQuery(api.files.list, { limit: 200 });
   const convexScans = useQuery(api.scans.list);
+  const convexTeam = useQuery(api.admin.listTeamMembers);
 
   // Sync back to our local DB data layer reactively!
+  // Real team members from Convex replace the mock team list everywhere.
+  if (convexTeam && convexTeam.length > 0) {
+    const palette = ["#9aa9c8", "#8fb0a0", "#c8a98f", "#a98fc8", "#c88f9a", "#8fc8c0"];
+    (DB as any).team = convexTeam.map((m: any, i: number) => {
+      const name = m.name || m.email || "Member";
+      const initials = name.split(/\s+/).map((w: string) => w[0]).join("").slice(0, 2).toUpperCase();
+      return {
+        id: m.email,            // use email as the stable id (matches drive ownerId)
+        name,
+        email: m.email,
+        role: m.role || "editor",
+        initials,
+        color: palette[i % palette.length],
+        location: m.location || "",
+        usedTB: 0,
+        drives: 0,
+      };
+    });
+    (DB as any).teamById = Object.fromEntries((DB as any).team.map((m: any) => [m.id, m]));
+  }
   if (convexDrives && convexDrives.length > 0) {
     (DB as any).drives = convexDrives.map((d: any) => ({
       ...d,

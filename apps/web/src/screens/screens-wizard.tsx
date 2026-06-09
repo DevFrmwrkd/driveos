@@ -75,11 +75,17 @@ type WizardSet = (key: string, value: any) => void;
     const [done, setDone] = React.useState(false);
     const [saving, setSaving] = React.useState(false);
     const createProject = useMutation(api.projects.create);
+    // Default the owner to the first real team member (or empty until one loads).
+    const firstOwner = (DB.team && DB.team[0] && DB.team[0].id) || "";
     const [form, setForm] = React.useState<WizardForm>({
-      client: "", show: "", name: "", owner: "cj", due: "", status: "active",
-      drive: "cj-ssd", root: "/Projects", tier: "hot", cloud: true, template: "youtube",
+      client: "", show: "", name: "", owner: firstOwner, due: "", status: "active",
+      drive: "", root: "/Projects", tier: "hot", cloud: true, template: "youtube",
       rules: { rawKeep: true, proxyDelete: true, cacheDelete: true, finalKeep: true, licenseKeep: true },
     });
+    // Keep the owner valid once real members load.
+    React.useEffect(() => {
+      if (!form.owner && DB.team && DB.team[0]) setForm((f) => ({ ...f, owner: DB.team[0].id }));
+    }, [DB.team && DB.team.length]);
     const set: WizardSet = (k, v) => setForm((f) => ({ ...f, [k]: v }));
     const clientSlug = (form.client && form.name) ? (form.client.replace(/\s+/g, "_") + "_" + (form.show ? form.show.split(" ")[0] + "_" : "") + form.name.replace(/\s+/g, "_")) : "";
 
@@ -156,7 +162,10 @@ type WizardSet = (key: string, value: any) => void;
         h(Field, { label: "Client" }, h("input", { className: "input", placeholder: "e.g. Northwind", value: form.client, onChange: (e: React.ChangeEvent<HTMLInputElement>) => set("client", e.target.value) })),
         h(Field, { label: "Show / Campaign" }, h("input", { className: "input", placeholder: "e.g. Show X (YouTube)", value: form.show, onChange: (e: React.ChangeEvent<HTMLInputElement>) => set("show", e.target.value) })),
         h(Field, { label: "Episode / Project name" }, h("input", { className: "input", placeholder: "e.g. Ep. 215", value: form.name, onChange: (e: React.ChangeEvent<HTMLInputElement>) => set("name", e.target.value) })),
-        h(Field, { label: "Owner / Editor" }, h("select", { className: "select", style: { width: "100%" }, value: form.owner, onChange: (e: React.ChangeEvent<HTMLSelectElement>) => set("owner", e.target.value) }, DB.team.map((m) => h("option", { key: m.id, value: m.id }, m.name + " — " + m.role)))),
+        h(Field, { label: "Owner / Editor" }, h("select", { className: "select", style: { width: "100%" }, value: form.owner, onChange: (e: React.ChangeEvent<HTMLSelectElement>) => set("owner", e.target.value) },
+          (DB.team && DB.team.length > 0)
+            ? DB.team.map((m) => h("option", { key: m.id, value: m.id }, m.name + " — " + m.role))
+            : h("option", { value: "" }, "Add team members in Settings first"))),
         h(Field, { label: "Due date" }, h("input", { className: "input", type: "date", value: form.due, onChange: (e: React.ChangeEvent<HTMLInputElement>) => set("due", e.target.value) })),
         h(Field, { label: "Initial status" }, h("div", { style: { paddingTop: 2 } }, h(Seg, { value: form.status, onChange: (v: string) => set("status", v), options: [{ value: "active", label: "Active" }, { value: "review", label: "Review" }] })))));
   }

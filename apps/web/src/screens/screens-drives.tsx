@@ -64,9 +64,17 @@ type AnyRecord = Record<string, any>;
         d.status !== "uninit" && h("span", { className: "mono" }, d.scans + " scans")));
   }
 
+  // Resolve a drive's owner to a real team member, or fall back to showing the
+  // raw owner id from the agent (never a mock default member).
+  function ownerInfo(rawOwner: any) {
+    const member = (DB.teamById as Record<string, any>)[rawOwner];
+    if (member) return { name: member.name, member };
+    return { name: rawOwner || "Unassigned", member: null };
+  }
+
   // ---- Drive card ----
   function DriveCard({ d, go }: ScreenProps) {
-    const owner = DB.teamById[d.owner] || DB.teamById.founder || { name: "Studio" };
+    const owner = ownerInfo(d.owner);
     return h("div", { className: "card fade-up", onClick: () => go("drive", { id: d.id }),
       style: { cursor: "pointer", display: "flex", flexDirection: "column", transition: "border-color .14s, transform .1s" },
       onMouseEnter: (e: React.MouseEvent<HTMLDivElement>) => (e.currentTarget.style.borderColor = "var(--line-strong)"),
@@ -92,9 +100,10 @@ type AnyRecord = Record<string, any>;
         miniCell("Duplicates", d.dupTB > 0 ? fmtTB(d.dupTB) : "—", d.dupTB > 0 ? "var(--warn)" : "var(--tx-dim)"),
         miniCell("Cleanup", d.cleanTB > 0 ? fmtTB(d.cleanTB) : "—", d.cleanTB > 0 ? "var(--ok)" : "var(--tx-dim)")),
       h("div", { className: "spread", style: { padding: "11px 16px", borderTop: "1px solid var(--line)", background: "var(--bg-surface)", borderRadius: "0 0 var(--r-lg) var(--r-lg)" } },
-        h("div", { className: "row", style: { gap: 8 } }, h(Avatar, { id: d.owner, size: 22 }),
+        h("div", { className: "row", style: { gap: 8 } },
+          owner.member && h(Avatar, { id: d.owner, size: 22 }),
           h("span", { style: { fontSize: 12, color: "var(--tx-mut)" } }, owner.name.split(" ")[0]),
-          h("span", { className: "dim", style: { fontSize: 11.5 } }, "· " + d.location)),
+          d.location && h("span", { className: "dim", style: { fontSize: 11.5 } }, "· " + d.location)),
         h(RiskBadge, { risk: d.risk })));
   }
   function miniCell(label: React.ReactNode, value: React.ReactNode, color: string) {
@@ -158,13 +167,13 @@ type AnyRecord = Record<string, any>;
             h("th", { key: i, className: i >= 4 && i !== 6 ? "num" : "" }, c)))),
         h("tbody", null, list.map((d: any) => {
           const p = pct(d.usedTB, d.capTB);
-          const owner = DB.teamById[d.owner] || DB.teamById.founder || { name: "Studio" };
+          const owner = ownerInfo(d.owner);
           return h("tr", { key: d.id, onClick: () => go("drive", { id: d.id }) },
             h("td", null, h("div", { className: "row", style: { gap: 9 } },
               h(Icon, { name: driveIcon(d), size: 16, style: { color: "var(--tx-mut)" } }),
               h("span", { className: "hi", style: { fontWeight: 600 } }, d.name))),
-            h("td", null, h("div", { className: "row", style: { gap: 7 } }, h(Avatar, { id: d.owner, size: 20 }), owner.name.split(" ")[0])),
-            h("td", { className: "muted" }, d.location),
+            h("td", null, h("div", { className: "row", style: { gap: 7 } }, owner.member && h(Avatar, { id: d.owner, size: 20 }), owner.name.split(" ")[0])),
+            h("td", { className: "muted" }, d.location || "—"),
             h("td", null, h(StatusBadge, { status: d.status })),
             h("td", { className: "num" }, fmtTB(d.capTB)),
             h("td", { className: "num" }, h("div", { className: "row", style: { gap: 8, justifyContent: "flex-end" } },
