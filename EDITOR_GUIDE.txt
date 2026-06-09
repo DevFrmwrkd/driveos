@@ -1,0 +1,157 @@
+========================================
+   DRIVEOS - GUIDE FOR EDITORS
+========================================
+
+A simple guide to using the DriveOS app on your computer.
+
+
+----------------------------------------
+WHAT IS DRIVEOS?
+----------------------------------------
+
+DriveOS keeps track of the files on your hard drives, so the
+whole team can see in one place:
+
+   - How full each drive is
+   - Where the big files are
+   - What is safe to clean up
+
+No more digging through folders by hand.
+
+
+YOUR FILES ARE SAFE:
+
+   - DriveOS only looks at file INFO (names, sizes, dates).
+     It NEVER uploads your actual videos or footage.
+
+   - It NEVER deletes anything on its own. When you clean up,
+     files are moved to a recoverable "quarantine" first.
+     Nothing is ever gone for good.
+
+   - It runs quietly in the background and checks about
+     once an hour.
+
+
+----------------------------------------
+STEP 1: INSTALL THE APP
+----------------------------------------
+
+ON A MAC:
+   1. Open the file "DriveOS Agent.dmg" that you were sent.
+   2. Drag the DriveOS Agent icon into your Applications folder.
+   3. Open your Applications folder.
+   4. RIGHT-CLICK on DriveOS Agent, then click "Open".
+   5. Click "Open" again when it asks.
+
+   (You must right-click the very first time. If you just
+    double-click, your Mac will block it. This is normal for
+    new apps.)
+
+ON WINDOWS:
+   1. Run the "DriveOS Agent Setup.exe" installer.
+   2. Follow the simple prompts.
+
+After installing, a small DriveOS icon sits in the top-right
+menu bar (Mac) or the bottom-right tray (Windows). Click it
+anytime to open the app.
+
+
+----------------------------------------
+STEP 2: CONNECT YOUR COMPUTER (one time)
+----------------------------------------
+
+   1. Open the DriveOS app. You will see a "Connect" screen.
+
+   2. Ask your admin for a "connect token."
+      (They create it on the DriveOS website.)
+
+   3. Type a name for your computer, for example
+      "Editing-Bay-1".
+
+   4. Paste the token.
+
+   5. Click "Connect."
+
+That's it. DriveOS is now set up and will scan your drives
+automatically every hour.
+
+
+----------------------------------------
+STEP 3: USING THE APP
+----------------------------------------
+
+The main screen has a few simple buttons:
+
+   SCAN NOW
+      Check your drives right now, instead of waiting for
+      the hourly scan.
+
+   ADD DRIVE
+      Choose a folder or drive you want DriveOS to keep
+      track of.
+
+   PAUSE / RESUME
+      Temporarily stop the hourly scans (for example, during
+      a big render). Click Resume when you're ready again.
+
+   START AUTOMATICALLY AT LOGIN
+      Turn this on so DriveOS opens by itself when you start
+      your computer.
+
+The screen also shows:
+
+   - Status ............ Running or Paused
+   - Last sync ......... when it last checked your drives
+   - Tracked folders ... the drives it is watching
+   - Recent activity ... a simple log of what it has done
+
+
+----------------------------------------
+THE WEBSITE DASHBOARD
+----------------------------------------
+
+Everything DriveOS finds also shows up on the DriveOS website.
+Your admin will give you the link and your login.
+
+There you can see drive space, duplicates, large files, and
+cleanup suggestions. It is safe to look around - nothing on
+the website can delete your files.
+
+TO LOG IN THE FIRST TIME:
+   - Enter your email (the one your admin added for you).
+   - Choose any password you like.
+   - That becomes your password from then on.
+
+
+----------------------------------------
+COMMON QUESTIONS
+----------------------------------------
+
+Q: Will it slow down my computer?
+A: No. It scans lightly, once an hour, in the background.
+   You can Pause it anytime.
+
+Q: Will it upload my footage?
+A: Never. Only file info (names and sizes), never the
+   actual videos.
+
+Q: Can it delete my files?
+A: No. Cleanup only moves files to a recoverable quarantine.
+   You can always restore them.
+
+Q: It says a drive isn't found. Is something broken?
+A: No. That just means a drive is unplugged. DriveOS skips
+   it safely. Plug it back in and it picks up again.
+
+Q: How do I stop it for a while?
+A: Click Pause. Click Resume when you're done.
+
+
+----------------------------------------
+NEED HELP?
+----------------------------------------
+
+Ask your DriveOS admin. They can add your account, give you
+a connect token, and answer any questions.
+
+========================================
