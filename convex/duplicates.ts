@@ -1,11 +1,53 @@
 import { v } from "convex/values";
-import { mutation, query } from "./_generated/server";
+import { action, internalMutation, mutation, query } from "./_generated/server";
+import { internal } from "./_generated/api";
 import { requireMember } from "./access";
+
+// Mirrors the agent-side protection list: these classifications are never auto-quarantined.
+const PROTECTED_CLASSIFICATIONS = new Set(["RAW", "EXPORT_FINAL", "PROJECT_FILE", "ADMIN", "ARCHIVE_MANIFEST"]);
 
 export const list = query({
   args: {},
   handler: async (ctx) => {
-    return await ctx.db.query("duplicateClusters").collect();
+    const clusters = await ctx.db.query("duplicateClusters").collect();
+    const machineNames = new Map<string, string>();
+
+    const enriched = [];
+    for (const cluster of clusters) {
+      const locations = [];
+      for (const fId of cluster.fileIds) {
+        const fileId = ctx.db.normalizeId("files", fId);
+        if (!fileId) continue;
+        const file = await ctx.db.get(fileId);
+        if (!file || file.deletedAt) continue;
+
+        let drive = file.driveId || "";
+        if (!drive && file.machineId) {
+          if (!machineNames.has(file.machineId)) {
+            const machineId = ctx.db.normalizeId("machines", file.machineId);
+            const machine = machineId ? await ctx.db.get(machineId) : null;
+            machineNames.set(file.machineId, machine?.name || "Local machine");
+          }
+          drive = machineNames.get(file.machineId)!;
+        }
+        if (!drive) drive = file.source === "cloud" ? "Cloud" : "Local";
+
+        const isKeep = file._id === cluster.recommendedKeepFileId;
+        const isProtected = PROTECTED_CLASSIFICATIONS.has(file.classification);
+        const role = isKeep ? "keep" : isProtected || cluster.type !== "exact" ? "review" : "quarantine";
+
+        locations.push({
+          fileId: file._id,
+          path: file.path,
+          drive,
+          role,
+          tag: isKeep ? "Recommended keep" : isProtected ? "Protected " + file.classification : file.classification,
+          sizeBytes: file.sizeBytes,
+        });
+      }
+      enriched.push({ ...cluster, locations });
+    }
+    return enriched;
   },
 });
 
@@ -33,144 +75,152 @@ export const getCluster = query({
   },
 });
 
-export const runDuplicateDetection = mutation({
+// Trimmed file record the detection action accumulates in memory.
+interface AnalysisFile {
+  _id: string;
+  path: string;
+  name: string;
+  sizeBytes: number;
+  modifiedAtFile: number;
+  quickHash?: string;
+  fullHash?: string;
+  storageTier: string;
+  source: string;
+  isRaw: boolean;
+  isFinal: boolean;
+  projectId?: string;
+  riskLevel: string;
+  deletedAt?: number;
+}
+
+// Helper to evaluate trust score of a file
+function getTrustScore(file: AnalysisFile) {
+  let score = 0;
+  if (file.storageTier === "cold") score += 100; // archive drives are trusted
+  if (file.source === "cloud") score += 80;     // cloud copy is highly trusted
+  if (file.isRaw && file.path.includes("/RAW/")) score += 60; // RAW folder is trusted
+  if (file.isFinal) score += 50;                // Final deliverables are trusted
+  score += file.modifiedAtFile * 0.0000000001;  // Tie breaker: prefer newer edits
+  return score;
+}
+
+function buildCluster(type: "exact" | "likely", hash: string, files: AnalysisFile[]) {
+  files.sort((a, b) => getTrustScore(b) - getTrustScore(a));
+  const keepFile = files[0];
+  const sizeBytes = keepFile.sizeBytes;
+  const wastedBytes = sizeBytes * (files.length - 1);
+  const explanation = type === "exact"
+    ? `Found ${files.length} exact duplicates of "${keepFile.name}" across different locations. Wasting ${(wastedBytes / (1024 ** 3)).toFixed(1)} GB. Keep recommended: "${keepFile.path}"`
+    : `Found ${files.length} likely duplicates of "${keepFile.name}" based on quick hashing. Needs review.`;
+  return {
+    type,
+    hashKey: hash,
+    fileIds: files.map((f) => f._id),
+    projectIds: Array.from(new Set(files.map((f) => f.projectId).filter(Boolean) as string[])),
+    totalBytes: sizeBytes * files.length,
+    wastedBytes,
+    fileCount: files.length,
+    recommendedKeepFileId: keepFile._id,
+    riskLevel: type === "exact" ? keepFile.riskLevel : "yellow",
+    explanation,
+  };
+}
+
+// Detection is an action so the file catalog can be read in pages — a single
+// mutation hits Convex's per-transaction read limit once the catalog grows past
+// a few thousand files. The action accumulates hash groups in memory, then
+// writes clusters through small batched mutations.
+export const runDuplicateDetection = action({
   args: {},
-  handler: async (ctx) => {
-    // 1) Fetch all files larger than 1 MB that have hashes
-    const allFiles = await ctx.db.query("files").collect();
+  handler: async (ctx): Promise<{ success: boolean; clusterCount: number }> => {
+    const exactGroups = new Map<string, AnalysisFile[]>();
+    const likelyGroups = new Map<string, AnalysisFile[]>();
 
-    // Group files by fullHash
-    const exactGroups: Record<string, typeof allFiles> = {};
-    const likelyGroups: Record<string, typeof allFiles> = {};
-
-    for (const f of allFiles) {
-      if (f.fullHash) {
-        if (!exactGroups[f.fullHash]) exactGroups[f.fullHash] = [];
-        exactGroups[f.fullHash].push(f);
-      } else if (f.quickHash) {
-        if (!likelyGroups[f.quickHash]) likelyGroups[f.quickHash] = [];
-        likelyGroups[f.quickHash].push(f);
+    let cursor: string | null = null;
+    while (true) {
+      const page: any = await ctx.runQuery(internal.files.pageForAnalysis, { cursor, numItems: 1000 });
+      for (const f of page.files as AnalysisFile[]) {
+        if (f.deletedAt) continue; // quarantined/soft-deleted files never re-cluster
+        if (f.fullHash) {
+          const group = exactGroups.get(f.fullHash) || [];
+          group.push(f);
+          exactGroups.set(f.fullHash, group);
+        } else if (f.quickHash) {
+          const group = likelyGroups.get(f.quickHash) || [];
+          group.push(f);
+          likelyGroups.set(f.quickHash, group);
+        }
       }
+      if (page.isDone) break;
+      cursor = page.continueCursor;
     }
 
+    const clusters = [];
+    for (const [hash, files] of exactGroups) {
+      if (files.length > 1) clusters.push(buildCluster("exact", hash, files));
+    }
+    for (const [hash, files] of likelyGroups) {
+      if (files.length > 1) clusters.push(buildCluster("likely", hash, files));
+    }
+
+    // Upsert in small batches so each mutation stays well under transaction limits.
     const timestamp = Date.now();
+    for (let i = 0; i < clusters.length; i += 50) {
+      await ctx.runMutation(internal.duplicates.upsertClusters, {
+        clusters: clusters.slice(i, i + 50),
+        timestamp,
+      });
+    }
 
-    // Helper to evaluate trust score of a file
-    const getTrustScore = (file: typeof allFiles[0]) => {
-      let score = 0;
-      if (file.storageTier === "cold") score += 100; // archive drives are trusted
-      if (file.source === "cloud") score += 80;     // cloud copy is highly trusted
-      if (file.isRaw && file.path.includes("/RAW/")) score += 60; // RAW folder is trusted
-      if (file.isFinal) score += 50;                // Final deliverables are trusted
-      score += file.modifiedAtFile * 0.0000000001;  // Tie breaker: prefer newer edits
-      return score;
-    };
+    return { success: true, clusterCount: clusters.length };
+  },
+});
 
-    // 2) Process Exact Duplicates (fullHash)
-    for (const [hash, files] of Object.entries(exactGroups)) {
-      if (files.length <= 1) continue;
-
-      // Sort files by trust score descending
-      files.sort((a, b) => getTrustScore(b) - getTrustScore(a));
-
-      const keepFile = files[0];
-      const sizeBytes = keepFile.sizeBytes;
-      const totalBytes = sizeBytes * files.length;
-      const wastedBytes = sizeBytes * (files.length - 1);
-      const fileIds = files.map((f) => f._id);
-      const projectIdsSet = new Set(files.map((f) => f.projectId).filter(Boolean) as string[]);
-      const projectIds = Array.from(projectIdsSet);
-
-      // Check if cluster already exists for this hash
+export const upsertClusters = internalMutation({
+  args: {
+    timestamp: v.number(),
+    clusters: v.array(
+      v.object({
+        type: v.string(),
+        hashKey: v.string(),
+        fileIds: v.array(v.string()),
+        projectIds: v.array(v.string()),
+        totalBytes: v.number(),
+        wastedBytes: v.number(),
+        fileCount: v.number(),
+        recommendedKeepFileId: v.string(),
+        riskLevel: v.string(),
+        explanation: v.string(),
+      })
+    ),
+  },
+  handler: async (ctx, args) => {
+    for (const cluster of args.clusters) {
       const existing = await ctx.db
         .query("duplicateClusters")
-        .filter((q) => q.eq(q.field("hashKey"), hash))
+        .withIndex("by_hashKey", (q) => q.eq("hashKey", cluster.hashKey))
         .first();
-
-      const explanation = `Found ${files.length} exact duplicates of "${keepFile.name}" across different locations. Wasting ${(wastedBytes / (1024 ** 3)).toFixed(1)} GB. Keep recommended: "${keepFile.path}"`;
 
       if (existing) {
         await ctx.db.patch(existing._id, {
-          fileIds,
-          projectIds,
-          totalBytes,
-          wastedBytes,
-          fileCount: files.length,
-          recommendedKeepFileId: keepFile._id,
-          explanation,
-          updatedAt: timestamp,
+          fileIds: cluster.fileIds,
+          projectIds: cluster.projectIds,
+          totalBytes: cluster.totalBytes,
+          wastedBytes: cluster.wastedBytes,
+          fileCount: cluster.fileCount,
+          recommendedKeepFileId: cluster.recommendedKeepFileId,
+          explanation: cluster.explanation,
+          updatedAt: args.timestamp,
         });
       } else {
         await ctx.db.insert("duplicateClusters", {
-          type: "exact",
-          hashKey: hash,
-          fileIds,
-          projectIds,
-          totalBytes,
-          wastedBytes,
-          fileCount: files.length,
-          recommendedKeepFileId: keepFile._id,
-          riskLevel: keepFile.riskLevel,
-          explanation,
+          ...cluster,
           status: "open",
-          createdAt: timestamp,
-          updatedAt: timestamp,
+          createdAt: args.timestamp,
+          updatedAt: args.timestamp,
         });
       }
     }
-
-    // 3) Process Likely Duplicates (quickHash)
-    for (const [hash, files] of Object.entries(likelyGroups)) {
-      if (files.length <= 1) continue;
-
-      files.sort((a, b) => getTrustScore(b) - getTrustScore(a));
-
-      const keepFile = files[0];
-      const sizeBytes = keepFile.sizeBytes;
-      const totalBytes = sizeBytes * files.length;
-      const wastedBytes = sizeBytes * (files.length - 1);
-      const fileIds = files.map((f) => f._id);
-      const projectIdsSet = new Set(files.map((f) => f.projectId).filter(Boolean) as string[]);
-      const projectIds = Array.from(projectIdsSet);
-
-      const existing = await ctx.db
-        .query("duplicateClusters")
-        .filter((q) => q.eq(q.field("hashKey"), hash))
-        .first();
-
-      const explanation = `Found ${files.length} likely duplicates of "${keepFile.name}" based on quick hashing. Needs review.`;
-
-      if (existing) {
-        await ctx.db.patch(existing._id, {
-          fileIds,
-          projectIds,
-          totalBytes,
-          wastedBytes,
-          fileCount: files.length,
-          recommendedKeepFileId: keepFile._id,
-          explanation,
-          updatedAt: timestamp,
-        });
-      } else {
-        await ctx.db.insert("duplicateClusters", {
-          type: "likely",
-          hashKey: hash,
-          fileIds,
-          projectIds,
-          totalBytes,
-          wastedBytes,
-          fileCount: files.length,
-          recommendedKeepFileId: keepFile._id,
-          riskLevel: "yellow",
-          explanation,
-          status: "open",
-          createdAt: timestamp,
-          updatedAt: timestamp,
-        });
-      }
-    }
-
-    return { success: true };
   },
 });
 
