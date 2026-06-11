@@ -191,6 +191,17 @@ function saveHashCache(cache: Record<string, HashCacheEntry>) {
   fs.writeFileSync(HASH_CACHE_PATH, JSON.stringify(cache, null, 2), "utf-8");
 }
 
+// The cache is one JSON file; rewriting it after every 100-file batch is O(n²)
+// disk churn on big drives. Persist at most every 30s mid-scan — a crash only
+// loses the last interval of hashes, which the next scan recomputes.
+let lastHashCacheSaveAt = 0;
+function saveHashCacheThrottled(cache: Record<string, HashCacheEntry>) {
+  const now = Date.now();
+  if (now - lastHashCacheSaveAt < 30_000) return;
+  lastHashCacheSaveAt = now;
+  saveHashCache(cache);
+}
+
 const DEFAULT_STATE: AgentState = { paused: false };
 
 function loadState(): AgentState {
@@ -644,15 +655,19 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
     console.log(`[${final ? "Final " : ""}Batch Upload] Syncing ${fileBatch.length} file(s) to Convex`);
     await syncToConvex("uploadBatch", { scanSessionId: sessionId, machineId, driveId, files: fileBatch });
     fileBatch.length = 0;
-    saveHashCache(hashCache);
+    saveHashCacheThrottled(hashCache);
   }
 
   await walkFiles(
     scanDir,
     async (filePath, statObj) => {
       try {
-        // Skip files that are still being written so we never index a half-flushed export.
-        if (options.checkStability && !(await isFileStable(filePath))) {
+        // Skip files that are still being written so we never index a half-flushed
+        // export. Only files modified in the last minute can be mid-write, so the
+        // 2-second stability wait is skipped for everything else — otherwise a big
+        // drive pays 2s per file and a full scan takes hours.
+        const recentlyModified = Date.now() - statObj.mtimeMs < 60_000;
+        if (options.checkStability && recentlyModified && !(await isFileStable(filePath))) {
           result.skippedUnstable++;
           console.log(`[Scan Skip] File still changing, deferring to next cycle: ${filePath}`);
           return;

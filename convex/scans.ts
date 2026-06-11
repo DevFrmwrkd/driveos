@@ -1,6 +1,6 @@
 import { v } from "convex/values";
-import { mutation, query } from "./_generated/server";
-import { api } from "./_generated/api";
+import { action, internalMutation, mutation, query } from "./_generated/server";
+import { api, internal } from "./_generated/api";
 
 export const list = query({
   args: {},
@@ -101,18 +101,29 @@ export const complete = mutation({
 });
 
 // Post-scan analysis: rebuild duplicate clusters and regenerate recommendations
-// from the now-current file catalog. Both underlying mutations are idempotent
+// from the now-current file catalog. Both are actions that page through the
+// catalog (so they scale past per-transaction read limits) and are idempotent
 // (they patch/replace existing clusters and clear open recommendations), so a
 // re-run per scan session is safe and keeps Duplicates / Cleanup fresh.
-export const runPostScanAnalysis = mutation({
+export const runPostScanAnalysis = action({
+  args: {
+    scanSessionId: v.optional(v.string()),
+    machineId: v.optional(v.string()),
+  },
+  handler: async (ctx, args): Promise<{ success: boolean }> => {
+    await ctx.runAction(api.duplicates.runDuplicateDetection, {});
+    await ctx.runAction(api.recommendations.generateRecommendations, {});
+    await ctx.runMutation(internal.scans.recordAnalysisComplete, args);
+    return { success: true };
+  },
+});
+
+export const recordAnalysisComplete = internalMutation({
   args: {
     scanSessionId: v.optional(v.string()),
     machineId: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    await ctx.runMutation(api.duplicates.runDuplicateDetection, {});
-    await ctx.runMutation(api.recommendations.generateRecommendations, {});
-
     await ctx.db.insert("auditLogs", {
       machineId: args.machineId,
       action: "analysis_complete",
@@ -121,7 +132,5 @@ export const runPostScanAnalysis = mutation({
       message: "Auto-ran duplicate detection and recommendations after scan.",
       createdAt: Date.now(),
     });
-
-    return { success: true };
   },
 });

@@ -71,22 +71,31 @@ type AnyRecord = Record<string, any>;
     const approveJob = useMutation(api.cleanup.approveJob);
     const updateClusterStatus = useMutation(api.duplicates.updateStatus);
 
-    // Quarantine every copy in the cluster except the recommended keep file.
+    // Quarantine the copies the user marked, or every copy except the
+    // recommended keep file when the cluster has no resolved locations.
     const onQuarantine = async (label: string) => {
       if (busy) return;
       setBusy(true);
       try {
         const isConvexCluster = typeof c.id === "string" && c.id.length > 12;
-        const allIds: string[] = Array.isArray(c.fileIds) ? c.fileIds : [];
-        const keepId = c.recommendedKeepFileId;
-        const quarantineIds = allIds.filter((id) => id !== keepId);
+        const locs: any[] = Array.isArray(c.locations) ? c.locations : [];
+        let quarantineIds: string[];
+        let affectedBytes: number;
+        if (locs.some((l) => l.fileId)) {
+          const picked = locs.filter((_, i) => roles[i] === "quarantine");
+          quarantineIds = picked.map((l) => l.fileId).filter(Boolean);
+          affectedBytes = Math.round(picked.reduce((s, l) => s + (l.sizeBytes || c.sizeGB * (1024 ** 3)), 0));
+        } else {
+          const allIds: string[] = Array.isArray(c.fileIds) ? c.fileIds : [];
+          quarantineIds = allIds.filter((id) => id !== c.recommendedKeepFileId);
+          affectedBytes = Math.round(c.sizeGB * (1024 ** 3) * quarantineIds.length);
+        }
         if (isConvexCluster && quarantineIds.length > 0) {
-          const sizeBytes = c.sizeGB * (1024 ** 3);
           const jobId = await createJob({
             requestedBy: DUP_REQUESTER,
             action: "quarantine",
             affectedFileIds: quarantineIds,
-            affectedBytes: Math.round(sizeBytes * quarantineIds.length),
+            affectedBytes,
           });
           if (jobId) await approveJob({ jobId, approvedBy: DUP_REQUESTER });
         }

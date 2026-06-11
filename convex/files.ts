@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { mutation, query } from "./_generated/server";
+import { internalQuery, mutation, query } from "./_generated/server";
 
 export const list = query({
   args: {
@@ -111,19 +111,14 @@ export const uploadBatch = mutation({
         }
       }
 
-      // Check if file record already exists. Use the normalized driveId; when a
-      // drive is known, scope by the by_drive index, otherwise fall back to a
-      // path match so an undefined driveId can't dedupe against unrelated files.
-      const existing = driveIdObj
-        ? await ctx.db
-            .query("files")
-            .withIndex("by_drive", (q) => q.eq("driveId", driveIdObj))
-            .filter((q) => q.eq(q.field("path"), f.path))
-            .first()
-        : await ctx.db
-            .query("files")
-            .filter((q) => q.eq(q.field("path"), f.path))
-            .first();
+      // Check if file record already exists via the (driveId, path) index — a
+      // point lookup regardless of catalog size. An undefined driveId is a valid
+      // index key, so machine-only files dedupe among themselves, never against
+      // files that belong to a known drive.
+      const existing = await ctx.db
+        .query("files")
+        .withIndex("by_drive_path", (q) => q.eq("driveId", driveIdObj ?? args.driveId).eq("path", f.path))
+        .first();
 
       if (existing) {
         await ctx.db.patch(existing._id, {
@@ -194,5 +189,38 @@ export const uploadBatch = mutation({
     }
 
     return { success: true, uploaded: args.files.length, newFiles: newFilesCount };
+  },
+});
+
+// Paged, trimmed view of the file catalog for the analysis actions (duplicate
+// detection, recommendations). Each page stays far below the per-transaction
+// document read limit, so analysis scales to catalogs of any size.
+export const pageForAnalysis = internalQuery({
+  args: { cursor: v.union(v.string(), v.null()), numItems: v.number() },
+  handler: async (ctx, args) => {
+    const page = await ctx.db
+      .query("files")
+      .paginate({ cursor: args.cursor, numItems: args.numItems });
+    return {
+      isDone: page.isDone,
+      continueCursor: page.continueCursor,
+      files: page.page.map((f) => ({
+        _id: f._id,
+        path: f.path,
+        name: f.name,
+        sizeBytes: f.sizeBytes,
+        modifiedAtFile: f.modifiedAtFile,
+        quickHash: f.quickHash,
+        fullHash: f.fullHash,
+        storageTier: f.storageTier,
+        source: f.source,
+        isRaw: f.isRaw,
+        isFinal: f.isFinal,
+        projectId: f.projectId,
+        riskLevel: f.riskLevel,
+        classification: f.classification,
+        deletedAt: f.deletedAt,
+      })),
+    };
   },
 });

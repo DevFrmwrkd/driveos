@@ -364,7 +364,8 @@ function Workspace() {
       id: d._id,
       name: d.name || duplicateName(d),
       type: d.fileType || "unknown",
-      sizeGB: (d.totalBytes || 0) / (1024 ** 3),
+      // Per-copy size: the UI multiplies by copy count for totals (matches mock-data semantics).
+      sizeGB: (d.totalBytes || 0) / (d.fileCount || d.fileIds?.length || 1) / (1024 ** 3),
       recoverGB: (d.wastedBytes || 0) / (1024 ** 3),
       copies: d.fileCount || d.fileIds?.length || 0,
       kind: d.type,
