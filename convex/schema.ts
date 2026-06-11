@@ -165,7 +165,9 @@ export default defineSchema({
     status: v.string(), // "open" | "ignored" | "quarantined" | "resolved"
     createdAt: v.number(),
     updatedAt: v.number(),
-  }).index("by_hashKey", ["hashKey"]),
+  })
+    .index("by_hashKey", ["hashKey"])
+    .index("by_status_wasted", ["status", "wastedBytes"]),
 
   recommendations: defineTable({
     type: v.string(),
