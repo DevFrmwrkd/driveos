@@ -434,7 +434,8 @@ async function buildFileMetadata(
 async function walkFiles(
   dir: string,
   visitor: (filePath: string, statObj: fs.Stats) => Promise<void>,
-  minFileSizeBytes = 0
+  minFileSizeBytes = 0,
+  maxFileSizeBytes = Infinity
 ) {
   let entries: string[];
   try {
@@ -459,8 +460,8 @@ async function walkFiles(
         console.log(`[Ignored Folder] Skipping ${entry}`);
         continue;
       }
-      await walkFiles(fullPath, visitor, minFileSizeBytes);
-    } else if (statObj.isFile() && statObj.size >= minFileSizeBytes) {
+      await walkFiles(fullPath, visitor, minFileSizeBytes, maxFileSizeBytes);
+    } else if (statObj.isFile() && statObj.size >= minFileSizeBytes && statObj.size < maxFileSizeBytes) {
       await visitor(fullPath, statObj);
     }
   }
@@ -591,6 +592,11 @@ interface ScanOptions {
   fullHash?: boolean;
   allowCloudRoot?: boolean;
   checkStability?: boolean;
+  // Size window for progressive scanning: pass 1 covers >= maxFileSizeBytes
+  // (big media first, fast results), pass 2 fills in the rest.
+  minFileSizeBytes?: number;
+  maxFileSizeBytes?: number;
+  passLabel?: string;
 }
 
 interface ScanResult {
@@ -612,7 +618,12 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
   const driveMetrics = getDriveMetrics(scanDir);
   const cloudProvider = cloudSyncProvider(scanDir);
 
-  console.log(`[Scan Start] Crawling files larger than ${Math.round(config.minFileSizeBytes / ONE_MB)} MB in ${scanDir}`);
+  const minBytes = options.minFileSizeBytes ?? config.minFileSizeBytes;
+  const maxBytes = options.maxFileSizeBytes ?? Infinity;
+  const sizeRange = Number.isFinite(maxBytes)
+    ? `${Math.round(minBytes / ONE_MB)}–${Math.round(maxBytes / ONE_MB)} MB`
+    : `larger than ${Math.round(minBytes / ONE_MB)} MB`;
+  console.log(`[Scan Start]${options.passLabel ? ` (${options.passLabel})` : ""} Crawling files ${sizeRange} in ${scanDir}`);
   if (cloudProvider) {
     console.warn(`[Cloud Folder] ${scanDir} is in ${cloudProvider} — tracking as metadata-only (cloud tier), not a normal drive.`);
   }
@@ -650,40 +661,82 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
   const fileBatch: FileMetadata[] = [];
   const result: ScanResult = { fileCount: 0, byteCount: 0, errorsCount: 0, skippedUnstable: 0 };
 
+  // Uploads run as a background chain so hashing never stalls on the network.
+  // Each link catches its own error to keep the chain alive; backpressure in
+  // flushBatch keeps hashing from racing unboundedly ahead of slow uploads.
+  let uploadChain: Promise<void> = Promise.resolve();
+  let pendingUploads = 0;
+
   async function flushBatch(final = false) {
-    if (fileBatch.length === 0) return;
-    console.log(`[${final ? "Final " : ""}Batch Upload] Syncing ${fileBatch.length} file(s) to Convex`);
-    await syncToConvex("uploadBatch", { scanSessionId: sessionId, machineId, driveId, files: fileBatch });
-    fileBatch.length = 0;
-    saveHashCacheThrottled(hashCache);
+    const batch = fileBatch.splice(0, fileBatch.length);
+    if (batch.length > 0) {
+      pendingUploads++;
+      uploadChain = uploadChain
+        .then(async () => {
+          console.log(`[${final ? "Final " : ""}Batch Upload] Syncing ${batch.length} file(s) to Convex`);
+          await syncToConvex("uploadBatch", { scanSessionId: sessionId, machineId, driveId, files: batch });
+          saveHashCacheThrottled(hashCache);
+        })
+        .catch((err: any) => {
+          result.errorsCount++;
+          console.warn(`[Upload Error] Batch of ${batch.length} file(s) failed: ${err.message}`);
+        })
+        .finally(() => {
+          pendingUploads--;
+        });
+    }
+    if (final || pendingUploads > 3) await uploadChain;
   }
+
+  // Hash several files concurrently: per-file time on spinning disks is seek
+  // latency the drive can overlap, so a small pool gives a 2-4x faster walk.
+  const HASH_CONCURRENCY = 12;
+  let activeTasks = 0;
+  const slotWaiters: (() => void)[] = [];
+  const inFlight = new Set<Promise<void>>();
+
+  const processFile = async (filePath: string, statObj: fs.Stats) => {
+    try {
+      // Skip files that are still being written so we never index a half-flushed
+      // export. Only files modified in the last minute can be mid-write, so the
+      // 2-second stability wait is skipped for everything else — otherwise a big
+      // drive pays 2s per file and a full scan takes hours.
+      const recentlyModified = Date.now() - statObj.mtimeMs < 60_000;
+      if (options.checkStability && recentlyModified && !(await isFileStable(filePath))) {
+        result.skippedUnstable++;
+        console.log(`[Scan Skip] File still changing, deferring to next cycle: ${filePath}`);
+        return;
+      }
+      fileBatch.push(await buildFileMetadata(filePath, statObj, hashCache, calculateFull));
+      result.fileCount++;
+      result.byteCount += statObj.size;
+      if (fileBatch.length >= 100) await flushBatch();
+    } catch (err: any) {
+      result.errorsCount++;
+      console.warn(`[Scan Error] ${filePath}: ${err.message}`);
+    }
+  };
 
   await walkFiles(
     scanDir,
     async (filePath, statObj) => {
-      try {
-        // Skip files that are still being written so we never index a half-flushed
-        // export. Only files modified in the last minute can be mid-write, so the
-        // 2-second stability wait is skipped for everything else — otherwise a big
-        // drive pays 2s per file and a full scan takes hours.
-        const recentlyModified = Date.now() - statObj.mtimeMs < 60_000;
-        if (options.checkStability && recentlyModified && !(await isFileStable(filePath))) {
-          result.skippedUnstable++;
-          console.log(`[Scan Skip] File still changing, deferring to next cycle: ${filePath}`);
-          return;
-        }
-        fileBatch.push(await buildFileMetadata(filePath, statObj, hashCache, calculateFull));
-        result.fileCount++;
-        result.byteCount += statObj.size;
-        if (fileBatch.length >= 100) await flushBatch();
-      } catch (err: any) {
-        result.errorsCount++;
-        console.warn(`[Scan Error] ${filePath}: ${err.message}`);
+      if (activeTasks >= HASH_CONCURRENCY) {
+        await new Promise<void>((resolve) => slotWaiters.push(resolve));
       }
+      activeTasks++;
+      const task = processFile(filePath, statObj).finally(() => {
+        activeTasks--;
+        inFlight.delete(task);
+        const next = slotWaiters.shift();
+        if (next) next();
+      });
+      inFlight.add(task);
     },
-    config.minFileSizeBytes
+    minBytes,
+    maxBytes
   );
 
+  await Promise.all([...inFlight]);
   await flushBatch(true);
   saveHashCache(hashCache);
   await syncToConvex("completeScan", {
@@ -713,28 +766,42 @@ async function runSyncCycle(config: DriveOSConfig, options: ScanOptions = {}): P
   saveState({ lastSyncStartedAt: new Date().toISOString() });
   const totals: ScanResult = { fileCount: 0, byteCount: 0, errorsCount: 0, skippedUnstable: 0 };
 
-  for (const root of roots) {
-    // Roots must be absolute. A relative root can't be resolved reliably from a
-    // packaged app (cwd is the app folder, not the project), so flag it clearly.
-    if (!path.isAbsolute(root)) {
-      console.warn(`[Sync] Ignoring folder "${root}" — please re-add it as a full path via Add drive.`);
-      continue;
-    }
-    const resolved = path.resolve(root);
-    if (!fs.existsSync(resolved)) {
-      // Disconnected drive / missing root: skip safely, keep last-known catalog in Convex.
-      console.warn(`[Sync] Folder not found right now (skipped, last catalog kept): ${resolved}`);
-      continue;
-    }
-    try {
-      const res = await performScan(resolved, config, { ...options, checkStability: true });
-      totals.fileCount += res.fileCount;
-      totals.byteCount += res.byteCount;
-      totals.errorsCount += res.errorsCount;
-      totals.skippedUnstable += res.skippedUnstable;
-    } catch (err: any) {
-      console.error(`[Sync] Scan of ${resolved} failed: ${err.message}`);
-      totals.errorsCount++;
+  // Progressive scan: pass 1 covers big media (the bulk of duplicate bytes) on
+  // every root so duplicates surface on the dashboard within minutes; pass 2
+  // re-walks for the remaining small files, so nothing is ever skipped. Each
+  // pass completion triggers backend analysis, so results refresh after both.
+  const PROGRESSIVE_THRESHOLD = 50 * ONE_MB;
+  const passes = config.minFileSizeBytes < PROGRESSIVE_THRESHOLD
+    ? [
+        { passLabel: "pass 1/2: large media", minFileSizeBytes: PROGRESSIVE_THRESHOLD, maxFileSizeBytes: Infinity },
+        { passLabel: "pass 2/2: remaining files", minFileSizeBytes: config.minFileSizeBytes, maxFileSizeBytes: PROGRESSIVE_THRESHOLD },
+      ]
+    : [{ passLabel: undefined, minFileSizeBytes: config.minFileSizeBytes, maxFileSizeBytes: Infinity }];
+
+  for (const pass of passes) {
+    for (const root of roots) {
+      // Roots must be absolute. A relative root can't be resolved reliably from a
+      // packaged app (cwd is the app folder, not the project), so flag it clearly.
+      if (!path.isAbsolute(root)) {
+        console.warn(`[Sync] Ignoring folder "${root}" — please re-add it as a full path via Add drive.`);
+        continue;
+      }
+      const resolved = path.resolve(root);
+      if (!fs.existsSync(resolved)) {
+        // Disconnected drive / missing root: skip safely, keep last-known catalog in Convex.
+        console.warn(`[Sync] Folder not found right now (skipped, last catalog kept): ${resolved}`);
+        continue;
+      }
+      try {
+        const res = await performScan(resolved, config, { ...options, checkStability: true, ...pass });
+        totals.fileCount += res.fileCount;
+        totals.byteCount += res.byteCount;
+        totals.errorsCount += res.errorsCount;
+        totals.skippedUnstable += res.skippedUnstable;
+      } catch (err: any) {
+        console.error(`[Sync] Scan of ${resolved} failed: ${err.message}`);
+        totals.errorsCount++;
+      }
     }
   }
 
