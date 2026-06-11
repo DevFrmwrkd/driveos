@@ -111,7 +111,8 @@ export default defineSchema({
     .index("by_classification", ["classification"])
     .index("by_riskLevel", ["riskLevel"])
     .index("by_sizeBytes", ["sizeBytes"])
-    .index("by_lastSeenAt", ["lastSeenAt"]),
+    .index("by_lastSeenAt", ["lastSeenAt"])
+    .index("by_drive_path", ["driveId", "path"]),
 
   projects: defineTable({
     name: v.string(),
@@ -164,7 +165,7 @@ export default defineSchema({
     status: v.string(), // "open" | "ignored" | "quarantined" | "resolved"
     createdAt: v.number(),
     updatedAt: v.number(),
-  }),
+  }).index("by_hashKey", ["hashKey"]),
 
   recommendations: defineTable({
     type: v.string(),
