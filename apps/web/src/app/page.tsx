@@ -358,7 +358,10 @@ function Workspace() {
     }));
     (DB as any).projectById = Object.fromEntries((DB as any).projects.map((p: any) => [p.id, p]));
   }
-  if (convexDuplicates && convexDuplicates.length > 0) {
+  // Unlike the other sections, an empty live list is meaningful here (all
+  // clusters ignored/resolved/pruned) — never fall back to the mock demo data
+  // once Convex has answered, or "ghost" duplicates appear after cleanup.
+  if (convexDuplicates) {
     (DB as any).duplicates = convexDuplicates.map((d: any) => ({
       ...d,
       id: d._id,

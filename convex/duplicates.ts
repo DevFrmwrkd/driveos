@@ -9,7 +9,10 @@ const PROTECTED_CLASSIFICATIONS = new Set(["RAW", "EXPORT_FINAL", "PROJECT_FILE"
 export const list = query({
   args: {},
   handler: async (ctx) => {
-    const clusters = await ctx.db.query("duplicateClusters").collect();
+    // Only open clusters appear in the Duplicate Center; ignored, resolved and
+    // quarantined ones drop out of the list (and the dashboard totals) live.
+    const allClusters = await ctx.db.query("duplicateClusters").collect();
+    const clusters = allClusters.filter((c) => c.status === "open");
     const machineNames = new Map<string, string>();
 
     const enriched = [];
@@ -172,7 +175,27 @@ export const runDuplicateDetection = action({
       });
     }
 
+    // Drop clusters whose hash no longer maps to duplicates — files were
+    // deleted, quarantined, or their drive was removed. Without this, stale
+    // clusters from old scans linger in the Duplicate Center forever.
+    await ctx.runMutation(internal.duplicates.pruneStaleClusters, {
+      validHashKeys: clusters.map((c) => c.hashKey),
+    });
+
     return { success: true, clusterCount: clusters.length };
+  },
+});
+
+export const pruneStaleClusters = internalMutation({
+  args: { validHashKeys: v.array(v.string()) },
+  handler: async (ctx, args) => {
+    const valid = new Set(args.validHashKeys);
+    const existing = await ctx.db.query("duplicateClusters").collect();
+    for (const cluster of existing) {
+      if (!valid.has(cluster.hashKey)) {
+        await ctx.db.delete(cluster._id);
+      }
+    }
   },
 });
 
