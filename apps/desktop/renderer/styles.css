@@ -70,7 +70,11 @@ p { line-height: 1.5; margin: 0 0 14px; }
 .toggle { display: flex; align-items: center; gap: 9px; font-size: 12.5px; margin-bottom: 16px; cursor: pointer; }
 .drives { margin-bottom: 16px; }
 .roots { list-style: none; padding: 0; margin: 0; }
-.roots li { font-size: 12px; padding: 7px 11px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px; word-break: break-all; }
+.roots li { font-size: 12px; padding: 7px 11px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px; word-break: break-all; display: flex; align-items: center; gap: 10px; }
+.roots li .root-path { flex: 1; min-width: 0; }
+.roots li .root-remove { flex-shrink: 0; font-size: 11px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--danger, #e5704b); cursor: pointer; }
+.roots li .root-remove:hover:not(:disabled) { background: rgba(229, 112, 75, 0.12); }
+.roots li .root-remove:disabled { opacity: 0.5; cursor: default; }
 
 .logwrap { }
 .log {

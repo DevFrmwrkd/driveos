@@ -35,9 +35,28 @@ async function refresh() {
 
     const roots = $("roots");
     roots.innerHTML = "";
-    (s.scanRoots && s.scanRoots.length ? s.scanRoots : ["No folders tracked yet"]).forEach((r) => {
+    const hasRoots = s.scanRoots && s.scanRoots.length;
+    (hasRoots ? s.scanRoots : ["No folders tracked yet"]).forEach((r) => {
       const li = document.createElement("li");
-      li.textContent = r;
+      if (hasRoots) {
+        const label = document.createElement("span");
+        label.className = "root-path";
+        label.textContent = r;
+        li.appendChild(label);
+
+        const btn = document.createElement("button");
+        btn.className = "root-remove";
+        btn.textContent = "Remove";
+        btn.title = "Stop tracking this drive (files on disk are not deleted)";
+        btn.addEventListener("click", async () => {
+          btn.disabled = true; btn.textContent = "Removing…";
+          await api.removeDrive({ path: r });
+          refresh();
+        });
+        li.appendChild(btn);
+      } else {
+        li.textContent = r;
+      }
       roots.appendChild(li);
     });
   } else {

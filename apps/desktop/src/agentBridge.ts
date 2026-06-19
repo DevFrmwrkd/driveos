@@ -105,6 +105,12 @@ export async function addDrive(opts: { path: string; name?: string; allowCloud?:
   return { ok: code === 0 && /\[Success\]/i.test(out), message: out.split("\n").filter(Boolean).slice(-1)[0] || "Done." };
 }
 
+export async function removeDrive(opts: { path: string }): Promise<{ ok: boolean; message: string }> {
+  const { stdout, stderr, code } = await runAgent(["forget-drive", "--path", opts.path], 30000);
+  const out = (stdout + stderr).trim();
+  return { ok: code === 0 && /\[Success\]/i.test(out), message: out.split("\n").filter(Boolean).slice(-1)[0] || "Done." };
+}
+
 // Long-running scheduler. Returns the child so the caller can stop it on quit.
 export function startSyncDaemon(onLog: (line: string) => void) {
   const child = spawn(nodeBin(), [agentEntry(), "sync", "--interval-minutes", "60"], {
