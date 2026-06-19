@@ -123,6 +123,19 @@ ipcMain.handle("agent:addDrive", async (_e, { name, allowCloud }) => {
   const r = await agent.addDrive({ path: picked.filePaths[0], name, allowCloud });
   pushLog(r.message); refreshTrayMenu(); return r;
 });
+ipcMain.handle("agent:removeDrive", async (_e, { path: drivePath }) => {
+  const choice = await dialog.showMessageBox({
+    type: "warning",
+    buttons: ["Stop tracking", "Cancel"],
+    defaultId: 1,
+    cancelId: 1,
+    message: "Stop tracking this drive?",
+    detail: `${drivePath}\n\nDriveOS will stop scanning it and remove it from the dashboard. The actual files on the drive are NOT deleted.`,
+  });
+  if (choice.response !== 0) return { ok: false, message: "Cancelled." };
+  const r = await agent.removeDrive({ path: drivePath });
+  pushLog(r.message); refreshTrayMenu(); return r;
+});
 ipcMain.handle("autolaunch:get", async () => { try { return await autoLauncher.isEnabled(); } catch { return false; } });
 ipcMain.handle("autolaunch:set", async (_e, enabled: boolean) => {
   try { enabled ? await autoLauncher.enable() : await autoLauncher.disable(); return true; } catch { return false; }

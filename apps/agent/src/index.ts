@@ -967,6 +967,38 @@ program
   });
 
 program
+  .command("forget-drive")
+  .description("Stop tracking a drive/folder: drop it from scan roots and remove its DriveOS catalog (files on disk are untouched)")
+  .requiredOption("-p, --path <dir>", "Tracked drive or folder root to forget")
+  .action(async (options) => {
+    const root = path.resolve(options.path);
+    const config = loadConfig();
+
+    // Drop from scan roots so the scheduler stops re-adding/re-scanning it.
+    const before = config.scanRoots.length;
+    config.scanRoots = config.scanRoots.filter((r) => path.resolve(r) !== root);
+    const dropped = before - config.scanRoots.length;
+    saveConfig(config);
+    if (dropped > 0) console.log(`[Forget Drive] Removed ${root} from scan roots.`);
+    else console.warn(`[Forget Drive] ${root} was not in scan roots (removing catalog anyway).`);
+
+    // Remove the catalog from the backend, matched by the same volumeId
+    // performScan registers the drive with. Local untrack already succeeded, so
+    // an offline backend is a soft warning rather than a failure.
+    const res = await syncToConvex("removeDrive", {
+      volumeId: `${process.platform}:${root}`,
+      machineId: config.machineName,
+    });
+    if ((res as any).offline) {
+      console.warn("[Forget Drive] Untracked locally, but the backend was offline. The catalog will clear on the next successful sync or when you remove it from the dashboard.");
+    } else if ((res as any).removed) {
+      console.log(`[Success] Stopped tracking ${root}. Removed ${(res as any).filesRemoved ?? 0} file record(s) from DriveOS. Files on disk are untouched.`);
+    } else {
+      console.log(`[Success] Stopped tracking ${root} locally. No catalog existed in the backend for it.`);
+    }
+  });
+
+program
   .command("scan")
   .description("Recursively scan directory metadata and upload to Convex (one-shot)")
   .requiredOption("-p, --path <dir>", "Directory path to scan")

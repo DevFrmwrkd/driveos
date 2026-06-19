@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld("driveos", {
   pause: () => ipcRenderer.invoke("agent:pause"),
   resume: () => ipcRenderer.invoke("agent:resume"),
   addDrive: (opts: { name?: string; allowCloud?: boolean }) => ipcRenderer.invoke("agent:addDrive", opts),
+  removeDrive: (opts: { path: string }) => ipcRenderer.invoke("agent:removeDrive", opts),
   getAutoLaunch: () => ipcRenderer.invoke("autolaunch:get"),
   setAutoLaunch: (enabled: boolean) => ipcRenderer.invoke("autolaunch:set", enabled),
   openDashboard: (url: string) => ipcRenderer.invoke("app:openDashboard", url),
