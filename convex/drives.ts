@@ -9,9 +9,31 @@ export const list = query({
   },
 });
 
-// Stop tracking a drive: removes the drive and its file records (and any
-// now-empty duplicate clusters). Requires a signed-in team member. This only
-// affects DriveOS's catalog — it never touches the actual disk.
+// Shared catalog removal: drop the drive and its file records. Used by both the
+// web "Stop tracking" button and the agent's forget-drive command. Only affects
+// DriveOS's catalog — never touches the actual disk.
+async function deleteDriveCatalog(ctx: any, driveId: any, actorId: string | undefined, label: string) {
+  const files = await ctx.db
+    .query("files")
+    .withIndex("by_drive", (q: any) => q.eq("driveId", driveId))
+    .collect();
+  for (const f of files) await ctx.db.delete(f._id);
+
+  await ctx.db.delete(driveId);
+
+  await ctx.db.insert("auditLogs", {
+    actorId,
+    action: "drive_remove",
+    entityType: "drive",
+    entityId: driveId,
+    message: `Stopped tracking drive "${label}" and removed ${files.length} file record(s).`,
+    createdAt: Date.now(),
+  });
+
+  return files.length;
+}
+
+// Stop tracking a drive from the web dashboard. Requires a signed-in team member.
 export const remove = mutation({
   args: { driveId: v.string() },
   handler: async (ctx, args) => {
@@ -22,25 +44,25 @@ export const remove = mutation({
     const drive = await ctx.db.get(driveId);
     if (!drive) return { removed: false };
 
-    // Delete the drive's file records.
-    const files = await ctx.db
-      .query("files")
-      .withIndex("by_drive", (q) => q.eq("driveId", driveId))
-      .collect();
-    for (const f of files) await ctx.db.delete(f._id);
+    const filesRemoved = await deleteDriveCatalog(ctx, driveId, member.email, drive.label);
+    return { removed: true, filesRemoved };
+  },
+});
 
-    await ctx.db.delete(driveId);
+// Stop tracking a drive from the agent, matched by volumeId (how registerDrive
+// keys drives). Auth is enforced at the HTTP layer via the machine token, so no
+// requireMember here. Idempotent: a drive already gone returns removed:false.
+export const removeByVolumeId = mutation({
+  args: { volumeId: v.string(), machineId: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const drive = await ctx.db
+      .query("drives")
+      .filter((q) => q.eq(q.field("volumeId"), args.volumeId))
+      .first();
+    if (!drive) return { removed: false };
 
-    await ctx.db.insert("auditLogs", {
-      actorId: member.email,
-      action: "drive_remove",
-      entityType: "drive",
-      entityId: driveId,
-      message: `Stopped tracking drive "${drive.label}" and removed ${files.length} file record(s).`,
-      createdAt: Date.now(),
-    });
-
-    return { removed: true, filesRemoved: files.length };
+    const filesRemoved = await deleteDriveCatalog(ctx, drive._id, args.machineId, drive.label);
+    return { removed: true, filesRemoved };
   },
 });
 

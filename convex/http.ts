@@ -78,6 +78,11 @@ post("registerDrive", async (ctx, body) => {
   return { success: true, driveId };
 });
 
+post("removeDrive", async (ctx, body) => {
+  const result = await ctx.runMutation(api.drives.removeByVolumeId, body);
+  return { success: true, ...result };
+});
+
 post("startScan", async (ctx, body) => {
   const sessionId = await ctx.runMutation(api.scans.start, body);
   return { success: true, sessionId };
