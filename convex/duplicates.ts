@@ -1,7 +1,7 @@
 import { v } from "convex/values";
-import { action, internalMutation, internalQuery, mutation, query } from "./_generated/server";
+import { internalAction, internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
-import { requireMember } from "./access";
+import { requireMember, inTenant } from "./access";
 
 // Mirrors the agent-side protection list: these classifications are never auto-quarantined.
 const PROTECTED_CLASSIFICATIONS = new Set(["RAW", "EXPORT_FINAL", "PROJECT_FILE", "ADMIN", "ARCHIVE_MANIFEST"]);
@@ -9,14 +9,13 @@ const PROTECTED_CLASSIFICATIONS = new Set(["RAW", "EXPORT_FINAL", "PROJECT_FILE"
 export const list = query({
   args: {},
   handler: async (ctx) => {
-    // Only open clusters appear in the Duplicate Center; ignored, resolved and
-    // quarantined ones drop out of the list (and the dashboard totals) live.
-    // Indexed + capped: Convex limits a query to 4096 reads, so fetch the top
-    // clusters by wasted bytes and resolve a bounded number of files per
-    // cluster — an uncapped version crashed once real catalogs grew.
+    const { tenantId } = await requireMember(ctx);
+    // Only this tenant's open clusters appear in the Duplicate Center. Indexed +
+    // capped: fetch the top clusters by wasted bytes and resolve a bounded number
+    // of files per cluster (an uncapped version crashed once catalogs grew).
     const clusters = await ctx.db
       .query("duplicateClusters")
-      .withIndex("by_status_wasted", (q) => q.eq("status", "open"))
+      .withIndex("by_tenant_status_wasted", (q) => q.eq("tenantId", tenantId).eq("status", "open"))
       .order("desc")
       .take(100);
     const machineNames = new Map<string, string>();
@@ -24,14 +23,11 @@ export const list = query({
     const enriched = [];
     for (const cluster of clusters) {
       const locations = [];
-      // Cap resolved copies per cluster; fileCount still reports the true total.
-      // A >20-copy quarantine processes the listed copies now and the rest
-      // re-surface on the next detection pass.
       for (const fId of cluster.fileIds.slice(0, 20)) {
         const fileId = ctx.db.normalizeId("files", fId);
         if (!fileId) continue;
         const file = await ctx.db.get(fileId);
-        if (!file || file.deletedAt) continue;
+        if (!file || file.deletedAt || file.tenantId !== tenantId) continue;
 
         let drive = file.driveId || "";
         if (!drive && file.machineId) {
@@ -66,18 +62,18 @@ export const list = query({
 export const getCluster = query({
   args: { clusterId: v.string() },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     const id = ctx.db.normalizeId("duplicateClusters", args.clusterId);
     if (!id) return null;
-    const cluster = await ctx.db.get(id);
+    const cluster = inTenant(await ctx.db.get(id), tenantId);
     if (!cluster) return null;
 
-    // Resolve details of duplicate files
     const resolvedFiles = [];
     for (const fId of cluster.fileIds) {
       const fileIdObj = ctx.db.normalizeId("files", fId);
       if (fileIdObj) {
         const file = await ctx.db.get(fileIdObj);
-        if (file) {
+        if (file && file.tenantId === tenantId) {
           resolvedFiles.push(file);
         }
       }
@@ -105,7 +101,6 @@ interface AnalysisFile {
   deletedAt?: number;
 }
 
-// Helper to evaluate trust score of a file
 function getTrustScore(file: AnalysisFile) {
   let score = 0;
   if (file.storageTier === "cold") score += 100; // archive drives are trusted
@@ -138,19 +133,21 @@ function buildCluster(type: "exact" | "likely", hash: string, files: AnalysisFil
   };
 }
 
-// Detection is an action so the file catalog can be read in pages — a single
-// mutation hits Convex's per-transaction read limit once the catalog grows past
-// a few thousand files. The action accumulates hash groups in memory, then
-// writes clusters through small batched mutations.
-export const runDuplicateDetection = action({
-  args: {},
-  handler: async (ctx): Promise<{ success: boolean; clusterCount: number }> => {
+// Detection runs per tenant (internal): page that tenant's catalog, accumulate
+// hash groups in memory, then upsert clusters through small batched mutations.
+export const runDuplicateDetection = internalAction({
+  args: { tenantId: v.string() },
+  handler: async (ctx, args): Promise<{ success: boolean; clusterCount: number }> => {
     const exactGroups = new Map<string, AnalysisFile[]>();
     const likelyGroups = new Map<string, AnalysisFile[]>();
 
     let cursor: string | null = null;
     while (true) {
-      const page: any = await ctx.runQuery(internal.files.pageForAnalysis, { cursor, numItems: 1000 });
+      const page: any = await ctx.runQuery(internal.files.pageForAnalysis, {
+        tenantId: args.tenantId,
+        cursor,
+        numItems: 1000,
+      });
       for (const f of page.files as AnalysisFile[]) {
         if (f.deletedAt) continue; // quarantined/soft-deleted files never re-cluster
         if (f.fullHash) {
@@ -175,24 +172,22 @@ export const runDuplicateDetection = action({
       if (files.length > 1) clusters.push(buildCluster("likely", hash, files));
     }
 
-    // Upsert in small batches so each mutation stays well under transaction limits.
     const timestamp = Date.now();
     for (let i = 0; i < clusters.length; i += 50) {
       await ctx.runMutation(internal.duplicates.upsertClusters, {
+        tenantId: args.tenantId,
         clusters: clusters.slice(i, i + 50),
         timestamp,
       });
     }
 
-    // Drop clusters whose hash no longer maps to duplicates — files were
-    // deleted, quarantined, or their drive was removed. Without this, stale
-    // clusters from old scans linger in the Duplicate Center forever. Paged
-    // like the file walk so it scales to any cluster count.
+    // Drop this tenant's clusters whose hash no longer maps to duplicates.
     const validHashKeys = new Set(clusters.map((c) => c.hashKey));
     const staleIds: string[] = [];
     let clusterCursor: string | null = null;
     while (true) {
       const page: any = await ctx.runQuery(internal.duplicates.pageClusterKeys, {
+        tenantId: args.tenantId,
         cursor: clusterCursor,
         numItems: 1000,
       });
@@ -203,7 +198,10 @@ export const runDuplicateDetection = action({
       clusterCursor = page.continueCursor;
     }
     for (let i = 0; i < staleIds.length; i += 200) {
-      await ctx.runMutation(internal.duplicates.deleteClusters, { clusterIds: staleIds.slice(i, i + 200) });
+      await ctx.runMutation(internal.duplicates.deleteClusters, {
+        clusterIds: staleIds.slice(i, i + 200),
+        tenantId: args.tenantId,
+      });
     }
 
     return { success: true, clusterCount: clusters.length };
@@ -211,10 +209,11 @@ export const runDuplicateDetection = action({
 });
 
 export const pageClusterKeys = internalQuery({
-  args: { cursor: v.union(v.string(), v.null()), numItems: v.number() },
+  args: { tenantId: v.string(), cursor: v.union(v.string(), v.null()), numItems: v.number() },
   handler: async (ctx, args) => {
     const page = await ctx.db
       .query("duplicateClusters")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", args.tenantId))
       .paginate({ cursor: args.cursor, numItems: args.numItems });
     return {
       isDone: page.isDone,
@@ -225,17 +224,20 @@ export const pageClusterKeys = internalQuery({
 });
 
 export const deleteClusters = internalMutation({
-  args: { clusterIds: v.array(v.string()) },
+  args: { clusterIds: v.array(v.string()), tenantId: v.optional(v.string()) },
   handler: async (ctx, args) => {
     for (const clusterId of args.clusterIds) {
       const id = ctx.db.normalizeId("duplicateClusters", clusterId);
-      if (id) await ctx.db.delete(id);
+      if (!id) continue;
+      const doc = await ctx.db.get(id);
+      if (doc && doc.tenantId === (args.tenantId || "")) await ctx.db.delete(id);
     }
   },
 });
 
 export const upsertClusters = internalMutation({
   args: {
+    tenantId: v.string(),
     timestamp: v.number(),
     clusters: v.array(
       v.object({
@@ -256,7 +258,9 @@ export const upsertClusters = internalMutation({
     for (const cluster of args.clusters) {
       const existing = await ctx.db
         .query("duplicateClusters")
-        .withIndex("by_hashKey", (q) => q.eq("hashKey", cluster.hashKey))
+        .withIndex("by_tenant_hashKey", (q) =>
+          q.eq("tenantId", args.tenantId).eq("hashKey", cluster.hashKey)
+        )
         .first();
 
       if (existing) {
@@ -273,6 +277,7 @@ export const upsertClusters = internalMutation({
       } else {
         await ctx.db.insert("duplicateClusters", {
           ...cluster,
+          tenantId: args.tenantId,
           status: "open",
           createdAt: args.timestamp,
           updatedAt: args.timestamp,
@@ -288,9 +293,11 @@ export const updateStatus = mutation({
     status: v.string(), // "open" | "ignored" | "quarantined" | "resolved"
   },
   handler: async (ctx, args) => {
-    await requireMember(ctx);
+    const { tenantId } = await requireMember(ctx);
     const id = ctx.db.normalizeId("duplicateClusters", args.clusterId);
     if (!id) return;
+    const cluster = inTenant(await ctx.db.get(id), tenantId);
+    if (!cluster) return;
     await ctx.db.patch(id, {
       status: args.status,
       updatedAt: Date.now(),

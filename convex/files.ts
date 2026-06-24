@@ -1,5 +1,6 @@
 import { v } from "convex/values";
-import { internalQuery, mutation, query } from "./_generated/server";
+import { internalMutation, internalQuery, query } from "./_generated/server";
+import { requireMember, inTenant } from "./access";
 
 export const list = query({
   args: {
@@ -10,52 +11,73 @@ export const list = query({
     riskLevel: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
+    const limit = args.limit || 50;
+
     if (args.projectId) {
+      // A tenant's project owns only that tenant's files. Verify ownership first.
+      const projectId = ctx.db.normalizeId("projects", args.projectId);
+      const project = projectId ? inTenant(await ctx.db.get(projectId), tenantId) : null;
+      if (!project) return [];
       return await ctx.db
         .query("files")
         .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
-        .take(args.limit || 50);
+        .take(limit);
     }
     if (args.driveId) {
+      const driveId = ctx.db.normalizeId("drives", args.driveId);
+      const drive = driveId ? inTenant(await ctx.db.get(driveId), tenantId) : null;
+      if (!drive) return [];
       return await ctx.db
         .query("files")
         .withIndex("by_drive", (q) => q.eq("driveId", args.driveId))
-        .take(args.limit || 50);
+        .take(limit);
     }
     if (args.classification) {
       const classification = args.classification;
       return await ctx.db
         .query("files")
-        .withIndex("by_classification", (q) => q.eq("classification", classification))
-        .take(args.limit || 50);
+        .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+        .filter((q) => q.eq(q.field("classification"), classification))
+        .take(limit);
     }
     if (args.riskLevel) {
       const riskLevel = args.riskLevel;
       return await ctx.db
         .query("files")
-        .withIndex("by_riskLevel", (q) => q.eq("riskLevel", riskLevel))
-        .take(args.limit || 50);
+        .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+        .filter((q) => q.eq(q.field("riskLevel"), riskLevel))
+        .take(limit);
     }
 
-    return await ctx.db.query("files").take(args.limit || 50);
+    return await ctx.db
+      .query("files")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .take(limit);
   },
 });
 
 export const getByHash = query({
   args: { fullHash: v.string() },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     return await ctx.db
       .query("files")
-      .withIndex("by_fullHash", (q) => q.eq("fullHash", args.fullHash))
+      .withIndex("by_tenant_fullHash", (q) =>
+        q.eq("tenantId", tenantId).eq("fullHash", args.fullHash)
+      )
       .collect();
   },
 });
 
-export const uploadBatch = mutation({
+// Agent-only (internal): bulk-upsert scanned file metadata into the agent's
+// tenant. Reached solely via the token-authenticated HTTP route.
+export const uploadBatch = internalMutation({
   args: {
     scanSessionId: v.string(),
     machineId: v.string(),
     driveId: v.optional(v.string()),
+    tenantId: v.optional(v.string()),
     files: v.array(
       v.object({
         path: v.string(),
@@ -79,6 +101,7 @@ export const uploadBatch = mutation({
     ),
   },
   handler: async (ctx, args) => {
+    const tenantId = args.tenantId || "";
     const timestamp = Date.now();
     const driveIdObj = args.driveId ? ctx.db.normalizeId("drives", args.driveId) : undefined;
     const scanSessionIdObj = ctx.db.normalizeId("scanSessions", args.scanSessionId);
@@ -86,8 +109,11 @@ export const uploadBatch = mutation({
     let newFilesCount = 0;
     let totalBytesUploaded = 0;
 
-    // Get all projects to try and guess projectId from folder paths if missing
-    const allProjects = await ctx.db.query("projects").collect();
+    // Only this tenant's projects can match for projectId guessing.
+    const allProjects = await ctx.db
+      .query("projects")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .collect();
 
     for (const f of args.files) {
       totalBytesUploaded += f.sizeBytes;
@@ -111,14 +137,14 @@ export const uploadBatch = mutation({
         }
       }
 
-      // Check if file record already exists via the (driveId, path) index — a
-      // point lookup regardless of catalog size. An undefined driveId is a valid
-      // index key, so machine-only files dedupe among themselves, never against
-      // files that belong to a known drive.
-      const existing = await ctx.db
+      // Existing-file lookup via the (driveId, path) index — a point lookup
+      // regardless of catalog size. For machine-only files (no driveId) the path
+      // could collide across tenants, so reject a match from another tenant.
+      const existingRaw = await ctx.db
         .query("files")
         .withIndex("by_drive_path", (q) => q.eq("driveId", driveIdObj ?? args.driveId).eq("path", f.path))
         .first();
+      const existing = existingRaw && existingRaw.tenantId === tenantId ? existingRaw : null;
 
       if (existing) {
         await ctx.db.patch(existing._id, {
@@ -139,6 +165,7 @@ export const uploadBatch = mutation({
       } else {
         newFilesCount++;
         await ctx.db.insert("files", {
+          tenantId,
           projectId: resolvedProjectId,
           driveId: driveIdObj ?? args.driveId,
           machineId: args.machineId,
@@ -166,10 +193,11 @@ export const uploadBatch = mutation({
       }
     }
 
-    // Update scanSession progress
+    // Update scanSession progress (only if it belongs to this tenant — the id
+    // arrives in the request body and must never let one tenant touch another's).
     if (scanSessionIdObj) {
       const session = await ctx.db.get(scanSessionIdObj);
-      if (session) {
+      if (session && session.tenantId === tenantId) {
         await ctx.db.patch(scanSessionIdObj, {
           filesScanned: session.filesScanned + args.files.length,
           bytesScanned: session.bytesScanned + totalBytesUploaded,
@@ -177,11 +205,10 @@ export const uploadBatch = mutation({
       }
     }
 
-    // Run simple post-upload hook to update drive metrics
+    // Run simple post-upload hook to update drive metrics (same tenant guard).
     if (driveIdObj) {
       const drive = await ctx.db.get(driveIdObj);
-      if (drive) {
-        // Compute duplicates and safe cleanup totals later via separate trigger or job
+      if (drive && drive.tenantId === tenantId) {
         await ctx.db.patch(driveIdObj, {
           lastSeenAt: timestamp,
         });
@@ -192,14 +219,15 @@ export const uploadBatch = mutation({
   },
 });
 
-// Paged, trimmed view of the file catalog for the analysis actions (duplicate
-// detection, recommendations). Each page stays far below the per-transaction
-// document read limit, so analysis scales to catalogs of any size.
+// Paged, trimmed view of ONE tenant's file catalog for the analysis actions
+// (duplicate detection, recommendations). Each page stays far below the
+// per-transaction document read limit, so analysis scales to any catalog size.
 export const pageForAnalysis = internalQuery({
-  args: { cursor: v.union(v.string(), v.null()), numItems: v.number() },
+  args: { tenantId: v.string(), cursor: v.union(v.string(), v.null()), numItems: v.number() },
   handler: async (ctx, args) => {
     const page = await ctx.db
       .query("files")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", args.tenantId))
       .paginate({ cursor: args.cursor, numItems: args.numItems });
     return {
       isDone: page.isDone,

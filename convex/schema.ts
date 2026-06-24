@@ -2,9 +2,14 @@ import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 import { authTables } from "@convex-dev/auth/server";
 
+// DriveOS is multi-tenant: every signup creates an isolated `tenant`
+// (organization). Each domain row carries a `tenantId` and the dashboard/agent
+// only ever read or write rows for the caller's tenant. `tenantId` is optional
+// at the schema level so pre-multitenant rows still validate; a one-time
+// backfill (tenants.backfillExistingData) stamps them onto a default tenant.
 export default defineSchema({
   // Convex Auth tables (users, authAccounts, authSessions, …). We override the
-  // built-in `users` table below to link it to our team member records.
+  // built-in `users` table below to link it to our team member + tenant.
   ...authTables,
   users: defineTable({
     name: v.optional(v.string()),
@@ -15,9 +20,20 @@ export default defineSchema({
     image: v.optional(v.string()),
     isAnonymous: v.optional(v.boolean()),
     teamMemberId: v.optional(v.string()),
+    tenantId: v.optional(v.string()),
   }).index("email", ["email"]),
 
+  // An organization / workspace. One is created per first-time signup.
+  tenants: defineTable({
+    name: v.string(),
+    slug: v.string(),
+    plan: v.optional(v.string()), // "free" | "pro" | ...
+    ownerUserId: v.optional(v.string()),
+    createdAt: v.number(),
+  }).index("by_slug", ["slug"]),
+
   teamMembers: defineTable({
+    tenantId: v.optional(v.string()),
     name: v.string(),
     email: v.string(),
     role: v.string(), // "admin" | "producer" | "editor" | "assistant_editor" | "viewer"
@@ -26,9 +42,12 @@ export default defineSchema({
     usedTB: v.optional(v.number()),
     drives: v.optional(v.number()),
     createdAt: v.number(),
-  }),
+  })
+    .index("by_tenant", ["tenantId"])
+    .index("by_email", ["email"]),
 
   machines: defineTable({
+    tenantId: v.optional(v.string()),
     name: v.string(),
     ownerId: v.string(), // matches teamMember ID or "local-system"
     agentVersion: v.string(),
@@ -37,9 +56,12 @@ export default defineSchema({
     status: v.string(), // "online" | "offline" | "unknown"
     authTokenHash: v.optional(v.string()),
     createdAt: v.number(),
-  }),
+  })
+    .index("by_tenant", ["tenantId"])
+    .index("by_tokenHash", ["authTokenHash"]),
 
   drives: defineTable({
+    tenantId: v.optional(v.string()),
     label: v.string(),
     volumeId: v.string(),
     machineId: v.optional(v.string()),
@@ -58,9 +80,13 @@ export default defineSchema({
     dupTB: v.optional(v.number()),
     cleanTB: v.optional(v.number()),
     scans: v.optional(v.number()),
-  }).index("by_owner", ["ownerId"]),
+  })
+    .index("by_owner", ["ownerId"])
+    .index("by_tenant", ["tenantId"])
+    .index("by_tenant_volume", ["tenantId", "volumeId"]),
 
   scanSessions: defineTable({
+    tenantId: v.optional(v.string()),
     machineId: v.string(),
     driveId: v.optional(v.string()),
     rootPath: v.string(),
@@ -71,9 +97,10 @@ export default defineSchema({
     bytesScanned: v.number(),
     errorsCount: v.number(),
     agentVersion: v.string(),
-  }),
+  }).index("by_tenant", ["tenantId"]),
 
   files: defineTable({
+    tenantId: v.optional(v.string()),
     projectId: v.optional(v.string()),
     driveId: v.optional(v.string()),
     machineId: v.optional(v.string()),
@@ -112,9 +139,13 @@ export default defineSchema({
     .index("by_riskLevel", ["riskLevel"])
     .index("by_sizeBytes", ["sizeBytes"])
     .index("by_lastSeenAt", ["lastSeenAt"])
-    .index("by_drive_path", ["driveId", "path"]),
+    .index("by_drive_path", ["driveId", "path"])
+    .index("by_tenant", ["tenantId"])
+    .index("by_tenant_fullHash", ["tenantId", "fullHash"])
+    .index("by_tenant_quickHash", ["tenantId", "quickHash"]),
 
   projects: defineTable({
+    tenantId: v.optional(v.string()),
     name: v.string(),
     client: v.string(),
     showName: v.optional(v.string()),
@@ -139,9 +170,11 @@ export default defineSchema({
     template: v.optional(v.string()), // friendly template name
   })
     .index("by_status", ["status"])
-    .index("by_owner", ["ownerId"]),
+    .index("by_owner", ["ownerId"])
+    .index("by_tenant", ["tenantId"]),
 
   folderTemplates: defineTable({
+    tenantId: v.optional(v.string()),
     name: v.string(),
     description: v.string(),
     tree: v.array(v.object({ name: v.string(), lvl: v.number() })),
@@ -149,9 +182,10 @@ export default defineSchema({
     createdAt: v.number(),
     updatedAt: v.number(),
     isDefault: v.boolean(),
-  }),
+  }).index("by_tenant", ["tenantId"]),
 
   duplicateClusters: defineTable({
+    tenantId: v.optional(v.string()),
     type: v.string(), // "exact" | "likely" | "same_name" | "same_size" | "stock_reuse"
     hashKey: v.string(),
     fileIds: v.array(v.string()),
@@ -167,9 +201,13 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_hashKey", ["hashKey"])
-    .index("by_status_wasted", ["status", "wastedBytes"]),
+    .index("by_status_wasted", ["status", "wastedBytes"])
+    .index("by_tenant", ["tenantId"])
+    .index("by_tenant_status_wasted", ["tenantId", "status", "wastedBytes"])
+    .index("by_tenant_hashKey", ["tenantId", "hashKey"]),
 
   recommendations: defineTable({
+    tenantId: v.optional(v.string()),
     type: v.string(),
     title: v.string(),
     explanation: v.string(),
@@ -182,9 +220,13 @@ export default defineSchema({
     status: v.string(), // "open" | "approved" | "ignored" | "completed" | "failed"
     createdAt: v.number(),
     updatedAt: v.number(),
-  }).index("by_status", ["status"]),
+  })
+    .index("by_status", ["status"])
+    .index("by_tenant", ["tenantId"])
+    .index("by_tenant_status", ["tenantId", "status"]),
 
   cleanupJobs: defineTable({
+    tenantId: v.optional(v.string()),
     recommendationId: v.optional(v.string()),
     machineId: v.optional(v.string()),
     requestedBy: v.string(), // teamMember ID
@@ -197,9 +239,13 @@ export default defineSchema({
     result: v.optional(v.any()),
     createdAt: v.number(),
     updatedAt: v.number(),
-  }).index("by_status", ["status"]),
+  })
+    .index("by_status", ["status"])
+    .index("by_tenant", ["tenantId"])
+    .index("by_tenant_status", ["tenantId", "status"]),
 
   quarantineItems: defineTable({
+    tenantId: v.optional(v.string()),
     cleanupJobId: v.string(),
     originalPath: v.string(),
     quarantinePath: v.string(),
@@ -210,9 +256,12 @@ export default defineSchema({
     status: v.string(), // "quarantined" | "restored" | "permanently_deleted"
     restoredAt: v.optional(v.number()),
     deletedAt: v.optional(v.number()),
-  }).index("by_status", ["status"]),
+  })
+    .index("by_status", ["status"])
+    .index("by_tenant", ["tenantId"]),
 
   cloudConnections: defineTable({
+    tenantId: v.optional(v.string()),
     provider: v.string(), // "google_drive"
     accountEmail: v.string(),
     status: v.string(), // "connected" | "disconnected" | "error" | "demo"
@@ -220,9 +269,10 @@ export default defineSchema({
     quotaBytesUsed: v.number(),
     lastSyncAt: v.number(),
     createdAt: v.number(),
-  }),
+  }).index("by_tenant", ["tenantId"]),
 
   cloudFiles: defineTable({
+    tenantId: v.optional(v.string()),
     provider: v.string(),
     providerFileId: v.string(),
     cloudConnectionId: v.string(),
@@ -239,9 +289,11 @@ export default defineSchema({
     metadata: v.optional(v.any()),
   })
     .index("by_providerFileId", ["providerFileId"])
-    .index("by_project", ["projectId"]),
+    .index("by_project", ["projectId"])
+    .index("by_tenant", ["tenantId"]),
 
   archiveManifests: defineTable({
+    tenantId: v.optional(v.string()),
     projectId: v.string(),
     driveId: v.optional(v.string()),
     createdBy: v.string(),
@@ -252,9 +304,10 @@ export default defineSchema({
     checksum: v.string(),
     status: v.string(), // "generated" | "verified" | "failed"
     verificationResult: v.optional(v.any()),
-  }),
+  }).index("by_tenant", ["tenantId"]),
 
   auditLogs: defineTable({
+    tenantId: v.optional(v.string()),
     actorId: v.optional(v.string()),
     machineId: v.optional(v.string()),
     action: v.string(),
@@ -263,5 +316,7 @@ export default defineSchema({
     message: v.string(),
     metadata: v.optional(v.any()),
     createdAt: v.number(),
-  }).index("by_createdAt", ["createdAt"]),
+  })
+    .index("by_createdAt", ["createdAt"])
+    .index("by_tenant_createdAt", ["tenantId", "createdAt"]),
 });

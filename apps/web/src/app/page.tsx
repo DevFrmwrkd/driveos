@@ -8,6 +8,7 @@ import { useQuery, Authenticated, Unauthenticated, AuthLoading } from "convex/re
 import { useAuthActions } from "@convex-dev/auth/react";
 import { api } from "@/convexApi";
 import { LoginScreen } from "@/screens/screens-login";
+import { DownloadScreen } from "@/screens/screens-download";
 
 // Import all modularized screens
 import { Dashboard } from "@/screens/screens-dashboard";
@@ -39,6 +40,7 @@ const NAV = [
   { group: "System", items: [
     { id: "search", label: "Search", icon: "search" },
     { id: "settings", label: "Settings", icon: "settings" },
+    { id: "download", label: "Get the app", icon: "download" },
   ]},
 ];
 
@@ -58,6 +60,7 @@ const SCREEN_IDS = new Set([
   "search",
   "settings",
   "wizard",
+  "download",
 ]);
 const DEFAULT_OWNER = "founder";
 
@@ -119,9 +122,10 @@ function duplicateName(cluster: any) {
 interface SidebarProps {
   route: { screen: string; params: any };
   go: (screen: string, params?: any) => void;
+  tenantName?: string;
 }
 
-function Sidebar({ route, go }: SidebarProps) {
+function Sidebar({ route, go, tenantName }: SidebarProps) {
   const active = ROUTE_NAV[route.screen] || route.screen;
   return (
     <div className="sidebar">
@@ -129,9 +133,11 @@ function Sidebar({ route, go }: SidebarProps) {
         <div className="brand-mark">
           <Icon name="database" size={17} style={{ color: "#fff" }} stroke={2.4} />
         </div>
-        <div>
+        <div style={{ minWidth: 0 }}>
           <div className="brand-name">DriveOS</div>
-          <div className="brand-sub">Storage Command</div>
+          <div className="brand-sub" style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {tenantName || "Storage Command"}
+          </div>
         </div>
       </div>
       <div className="nav">
@@ -232,6 +238,7 @@ function useCrumbs(route: { screen: string; params: any }) {
     archive: [{ label: "Archive" }],
     search: [{ label: "Search" }],
     settings: [{ label: "Settings" }],
+    download: [{ label: "Get the app" }],
     wizard: [{ label: "Projects" }, { label: "New Project" }],
   };
 
@@ -261,6 +268,19 @@ function Placeholder({ title }: { title: string }) {
 }
 
 export default function App() {
+  // Track the hash at the top level so the public "#download" page is reachable
+  // without an account (and the dashboard's own routing still works once signed in).
+  const [hash, setHash] = useState(
+    typeof window !== "undefined" ? window.location.hash.replace(/^#/, "") : ""
+  );
+  useEffect(() => {
+    const on = () => setHash(window.location.hash.replace(/^#/, ""));
+    window.addEventListener("hashchange", on);
+    on();
+    return () => window.removeEventListener("hashchange", on);
+  }, []);
+  const showPublicDownload = hash.split("/")[0] === "download";
+
   return (
     <>
       <AuthLoading>
@@ -269,7 +289,7 @@ export default function App() {
         </div>
       </AuthLoading>
       <Unauthenticated>
-        <LoginScreen />
+        {showPublicDownload ? <DownloadScreen /> : <LoginScreen />}
       </Unauthenticated>
       <Authenticated>
         <Workspace />
@@ -294,6 +314,8 @@ function Workspace() {
   const convexFiles = useQuery(api.files.list, { limit: 200 });
   const convexScans = useQuery(api.scans.list);
   const convexTeam = useQuery(api.admin.listTeamMembers);
+  const convexContext = useQuery(api.tenants.currentContext);
+  const tenantName = convexContext?.tenant?.name;
 
   // Sync back to our local DB data layer reactively!
   // Real team members from Convex replace the mock team list everywhere.
@@ -498,6 +520,7 @@ function Workspace() {
     search: SearchScreen,
     settings: SettingsScreen,
     wizard: CreateWizard,
+    download: () => <DownloadScreen embedded />,
   };
 
   const Screen = SCREENS[route.screen];
@@ -505,7 +528,7 @@ function Workspace() {
 
   return (
     <div className={"app" + (dense ? " dense" : "")}>
-      <Sidebar route={route} go={go} />
+      <Sidebar route={route} go={go} tenantName={tenantName} />
       <div className="main">
         <TopBar go={go} route={route} />
         <div className="page" ref={pageRef}>

@@ -1,36 +1,47 @@
 import { v } from "convex/values";
-import { mutation, query } from "./_generated/server";
-import { requireMember } from "./access";
+import { internalMutation, internalQuery, mutation, query } from "./_generated/server";
+import { requireMember, inTenant } from "./access";
 
 export const listJobs = query({
   args: {},
   handler: async (ctx) => {
-    return await ctx.db.query("cleanupJobs").order("desc").collect();
+    const { tenantId } = await requireMember(ctx);
+    return await ctx.db
+      .query("cleanupJobs")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .order("desc")
+      .collect();
   },
 });
 
 export const listQuarantine = query({
   args: {},
   handler: async (ctx) => {
-    return await ctx.db.query("quarantineItems").collect();
+    const { tenantId } = await requireMember(ctx);
+    return await ctx.db
+      .query("quarantineItems")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .collect();
   },
 });
 
-export const getJob = query({
-  args: { jobId: v.string() },
+// Agent-only (internal): fetch a job + its files, scoped to the agent's tenant.
+export const getJob = internalQuery({
+  args: { jobId: v.string(), tenantId: v.optional(v.string()) },
   handler: async (ctx, args) => {
+    const tenantId = args.tenantId || "";
     const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
     if (!id) return null;
 
     const job = await ctx.db.get(id);
-    if (!job) return null;
+    if (!job || job.tenantId !== tenantId) return null;
 
     const files = [];
     for (const fId of job.affectedFileIds) {
       const fileId = ctx.db.normalizeId("files", fId);
       if (fileId) {
         const file = await ctx.db.get(fileId);
-        if (file) files.push(file);
+        if (file && file.tenantId === tenantId) files.push(file);
       }
     }
 
@@ -38,12 +49,16 @@ export const getJob = query({
   },
 });
 
-export const getQuarantineItem = query({
-  args: { quarantineId: v.string() },
+// Agent-only (internal).
+export const getQuarantineItem = internalQuery({
+  args: { quarantineId: v.string(), tenantId: v.optional(v.string()) },
   handler: async (ctx, args) => {
+    const tenantId = args.tenantId || "";
     const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
     if (!id) return null;
-    return await ctx.db.get(id);
+    const item = await ctx.db.get(id);
+    if (!item || item.tenantId !== tenantId) return null;
+    return item;
   },
 });
 
@@ -58,12 +73,12 @@ export const createJob = mutation({
     result: v.optional(v.any()),
   },
   handler: async (ctx, args) => {
-    await requireMember(ctx);
+    const { tenantId } = await requireMember(ctx);
     const timestamp = Date.now();
-    // Default rollback duration: 14 days (14 * 24 * 60 * 60 * 1000)
     const rollbackPeriod = 14 * 24 * 60 * 60 * 1000;
 
     const jobId = await ctx.db.insert("cleanupJobs", {
+      tenantId,
       recommendationId: args.recommendationId,
       machineId: args.machineId,
       requestedBy: args.requestedBy,
@@ -78,6 +93,7 @@ export const createJob = mutation({
     });
 
     await ctx.db.insert("auditLogs", {
+      tenantId,
       actorId: args.requestedBy,
       machineId: args.machineId,
       action: "job_create",
@@ -97,11 +113,11 @@ export const approveJob = mutation({
     approvedBy: v.string(),
   },
   handler: async (ctx, args) => {
-    await requireMember(ctx);
+    const { tenantId } = await requireMember(ctx);
     const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
     if (!id) return;
 
-    const job = await ctx.db.get(id);
+    const job = inTenant(await ctx.db.get(id), tenantId);
     if (!job) return;
 
     const timestamp = Date.now();
@@ -111,10 +127,10 @@ export const approveJob = mutation({
       updatedAt: timestamp,
     });
 
-    // Mark recommendation as completed or approved
     if (job.recommendationId) {
       const recId = ctx.db.normalizeId("recommendations", job.recommendationId);
-      if (recId) {
+      const rec = recId ? inTenant(await ctx.db.get(recId), tenantId) : null;
+      if (recId && rec) {
         await ctx.db.patch(recId, {
           status: "approved",
           updatedAt: timestamp,
@@ -123,6 +139,7 @@ export const approveJob = mutation({
     }
 
     await ctx.db.insert("auditLogs", {
+      tenantId,
       actorId: args.approvedBy,
       action: "job_approve",
       entityType: "cleanupJob",
@@ -133,27 +150,24 @@ export const approveJob = mutation({
   },
 });
 
-// ---- CLI Agent Endpoints ----
+// ---- CLI Agent Endpoints (internal: reached only via the authenticated HTTP route) ----
 
-export const pollPendingJobs = query({
-  args: { machineId: v.string() },
+export const pollPendingJobs = internalQuery({
+  args: { machineId: v.string(), tenantId: v.optional(v.string()) },
   handler: async (ctx, args) => {
-    // Return approved or queued jobs for this machine
-    const approvedJobs = await ctx.db
+    const tenantId = args.tenantId || "";
+    // Approved/queued jobs for this tenant, then narrowed to this machine.
+    const tenantJobs = await ctx.db
       .query("cleanupJobs")
-      .withIndex("by_status", (q) => q.eq("status", "approved"))
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
       .collect();
 
-    const queuedJobs = await ctx.db
-      .query("cleanupJobs")
-      .withIndex("by_status", (q) => q.eq("status", "queued"))
-      .collect();
-
-    const machineJobs = [...approvedJobs, ...queuedJobs].filter(
-      (job) => !job.machineId || job.machineId === args.machineId
+    const machineJobs = tenantJobs.filter(
+      (job) =>
+        (job.status === "approved" || job.status === "queued") &&
+        (!job.machineId || job.machineId === args.machineId)
     );
 
-    // Hydrate job files if needed
     const hydratedJobs = [];
     for (const job of machineJobs) {
       const filesList = [];
@@ -161,7 +175,7 @@ export const pollPendingJobs = query({
         const fileIdObj = ctx.db.normalizeId("files", fId);
         if (fileIdObj) {
           const file = await ctx.db.get(fileIdObj);
-          if (file) filesList.push(file);
+          if (file && file.tenantId === tenantId) filesList.push(file);
         }
       }
       hydratedJobs.push({ ...job, files: filesList });
@@ -171,11 +185,12 @@ export const pollPendingJobs = query({
   },
 });
 
-export const updateJobStatus = mutation({
+export const updateJobStatus = internalMutation({
   args: {
     jobId: v.string(),
     status: v.string(), // "running" | "completed" | "failed"
     result: v.optional(v.any()),
+    tenantId: v.optional(v.string()),
     quarantineFiles: v.optional(
       v.array(
         v.object({
@@ -188,11 +203,12 @@ export const updateJobStatus = mutation({
     ),
   },
   handler: async (ctx, args) => {
+    const tenantId = args.tenantId || "";
     const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
     if (!id) return;
 
     const job = await ctx.db.get(id);
-    if (!job) return;
+    if (!job || job.tenantId !== tenantId) return;
 
     const timestamp = Date.now();
     await ctx.db.patch(id, {
@@ -202,12 +218,12 @@ export const updateJobStatus = mutation({
     });
 
     if (args.status === "completed") {
-      // If it's a quarantine job, insert the quarantineItems
       if (job.action === "quarantine" && args.quarantineFiles) {
         for (const qf of args.quarantineFiles) {
           const fileIdObj = ctx.db.normalizeId("files", qf.fileId);
 
           await ctx.db.insert("quarantineItems", {
+            tenantId,
             cleanupJobId: args.jobId,
             originalPath: qf.originalPath,
             quarantinePath: qf.quarantinePath,
@@ -218,29 +234,29 @@ export const updateJobStatus = mutation({
             status: "quarantined",
           });
 
-          // Soft delete file from active listing
           if (fileIdObj) {
-            await ctx.db.patch(fileIdObj, {
-              deletedAt: timestamp,
-            });
+            const file = await ctx.db.get(fileIdObj);
+            if (file && file.tenantId === tenantId) {
+              await ctx.db.patch(fileIdObj, { deletedAt: timestamp });
+            }
           }
         }
       }
 
-      // If it's a restore job, restore quarantine items
       if (job.action === "restore") {
         const fileId = job.affectedFileIds[0];
         if (fileId) {
           const fileIdObj = ctx.db.normalizeId("files", fileId);
           if (fileIdObj) {
-            await ctx.db.patch(fileIdObj, {
-              deletedAt: undefined, // restore it
-            });
+            const file = await ctx.db.get(fileIdObj);
+            if (file && file.tenantId === tenantId) {
+              await ctx.db.patch(fileIdObj, { deletedAt: undefined });
+            }
           }
 
-          // Mark quarantine item as restored
           const qItems = await ctx.db
             .query("quarantineItems")
+            .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
             .filter((q) => q.eq(q.field("fileId"), fileId))
             .collect();
 
@@ -253,19 +269,19 @@ export const updateJobStatus = mutation({
         }
       }
 
-      // Update recommendation status to completed
       if (job.recommendationId) {
         const recId = ctx.db.normalizeId("recommendations", job.recommendationId);
         if (recId) {
-          await ctx.db.patch(recId, {
-            status: "completed",
-            updatedAt: timestamp,
-          });
+          const rec = await ctx.db.get(recId);
+          if (rec && rec.tenantId === tenantId) {
+            await ctx.db.patch(recId, { status: "completed", updatedAt: timestamp });
+          }
         }
       }
     }
 
     await ctx.db.insert("auditLogs", {
+      tenantId,
       machineId: job.machineId,
       action: `job_${args.status}`,
       entityType: "cleanupJob",
@@ -276,35 +292,53 @@ export const updateJobStatus = mutation({
   },
 });
 
+// Dashboard "Restore" button — restores a quarantined file in the caller's tenant.
 export const markQuarantineRestored = mutation({
   args: { quarantineId: v.string() },
   handler: async (ctx, args) => {
-    const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
-    if (!id) return;
+    const { tenantId } = await requireMember(ctx);
+    await restoreQuarantine(ctx, args.quarantineId, tenantId);
+  },
+});
 
-    const item = await ctx.db.get(id);
-    if (!item) return;
+// Agent variant (internal): same restore, tenant from the verified machine token.
+export const markQuarantineRestoredAgent = internalMutation({
+  args: { quarantineId: v.string(), tenantId: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    await restoreQuarantine(ctx, args.quarantineId, args.tenantId || "");
+  },
+});
 
-    const timestamp = Date.now();
-    await ctx.db.patch(id, {
-      status: "restored",
-      restoredAt: timestamp,
-    });
+async function restoreQuarantine(ctx: any, quarantineId: string, tenantId: string) {
+  const id = ctx.db.normalizeId("quarantineItems", quarantineId);
+  if (!id) return;
 
-    const fileId = ctx.db.normalizeId("files", item.fileId);
-    if (fileId) {
+  const item = await ctx.db.get(id);
+  if (!item || item.tenantId !== tenantId) return;
+
+  const timestamp = Date.now();
+  await ctx.db.patch(id, {
+    status: "restored",
+    restoredAt: timestamp,
+  });
+
+  const fileId = ctx.db.normalizeId("files", item.fileId);
+  if (fileId) {
+    const file = await ctx.db.get(fileId);
+    if (file && file.tenantId === tenantId) {
       await ctx.db.patch(fileId, {
         deletedAt: undefined,
         lastSeenAt: timestamp,
       });
     }
+  }
 
-    await ctx.db.insert("auditLogs", {
-      action: "quarantine_restore",
-      entityType: "quarantineItem",
-      entityId: id,
-      message: `Restored quarantined file ${item.originalPath}`,
-      createdAt: timestamp,
-    });
-  },
-});
+  await ctx.db.insert("auditLogs", {
+    tenantId,
+    action: "quarantine_restore",
+    entityType: "quarantineItem",
+    entityId: id,
+    message: `Restored quarantined file ${item.originalPath}`,
+    createdAt: timestamp,
+  });
+}

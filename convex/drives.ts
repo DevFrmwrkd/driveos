@@ -1,18 +1,28 @@
 import { v } from "convex/values";
-import { mutation, query } from "./_generated/server";
-import { requireMember } from "./access";
+import { internalMutation, mutation, query } from "./_generated/server";
+import { requireMember, inTenant } from "./access";
 
 export const list = query({
   args: {},
   handler: async (ctx) => {
-    return await ctx.db.query("drives").collect();
+    const { tenantId } = await requireMember(ctx);
+    return await ctx.db
+      .query("drives")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .collect();
   },
 });
 
 // Shared catalog removal: drop the drive and its file records. Used by both the
 // web "Stop tracking" button and the agent's forget-drive command. Only affects
 // DriveOS's catalog — never touches the actual disk.
-async function deleteDriveCatalog(ctx: any, driveId: any, actorId: string | undefined, label: string) {
+async function deleteDriveCatalog(
+  ctx: any,
+  driveId: any,
+  tenantId: string,
+  actorId: string | undefined,
+  label: string
+) {
   const files = await ctx.db
     .query("files")
     .withIndex("by_drive", (q: any) => q.eq("driveId", driveId))
@@ -22,6 +32,7 @@ async function deleteDriveCatalog(ctx: any, driveId: any, actorId: string | unde
   await ctx.db.delete(driveId);
 
   await ctx.db.insert("auditLogs", {
+    tenantId,
     actorId,
     action: "drive_remove",
     entityType: "drive",
@@ -33,35 +44,39 @@ async function deleteDriveCatalog(ctx: any, driveId: any, actorId: string | unde
   return files.length;
 }
 
-// Stop tracking a drive from the web dashboard. Requires a signed-in team member.
+// Stop tracking a drive from the web dashboard. Requires a signed-in team member
+// and the drive must belong to their workspace.
 export const remove = mutation({
   args: { driveId: v.string() },
   handler: async (ctx, args) => {
-    const member = await requireMember(ctx);
+    const { tenantId, email } = await requireMember(ctx);
     const driveId = ctx.db.normalizeId("drives", args.driveId);
     if (!driveId) return { removed: false };
 
-    const drive = await ctx.db.get(driveId);
+    const drive = inTenant(await ctx.db.get(driveId), tenantId);
     if (!drive) return { removed: false };
 
-    const filesRemoved = await deleteDriveCatalog(ctx, driveId, member.email, drive.label);
+    const filesRemoved = await deleteDriveCatalog(ctx, driveId, tenantId, email, drive.label);
     return { removed: true, filesRemoved };
   },
 });
 
-// Stop tracking a drive from the agent, matched by volumeId (how registerDrive
-// keys drives). Auth is enforced at the HTTP layer via the machine token, so no
-// requireMember here. Idempotent: a drive already gone returns removed:false.
-export const removeByVolumeId = mutation({
-  args: { volumeId: v.string(), machineId: v.optional(v.string()) },
+// Stop tracking a drive from the agent, matched by volumeId within the agent's
+// tenant. Internal-only: reached solely through the token-authenticated HTTP
+// route, which injects the verified machine's tenantId. Idempotent.
+export const removeByVolumeId = internalMutation({
+  args: { volumeId: v.string(), machineId: v.optional(v.string()), tenantId: v.optional(v.string()) },
   handler: async (ctx, args) => {
+    const tenantId = args.tenantId || "";
     const drive = await ctx.db
       .query("drives")
-      .filter((q) => q.eq(q.field("volumeId"), args.volumeId))
+      .withIndex("by_tenant_volume", (q) =>
+        q.eq("tenantId", tenantId).eq("volumeId", args.volumeId)
+      )
       .first();
     if (!drive) return { removed: false };
 
-    const filesRemoved = await deleteDriveCatalog(ctx, drive._id, args.machineId, drive.label);
+    const filesRemoved = await deleteDriveCatalog(ctx, drive._id, tenantId, args.machineId, drive.label);
     return { removed: true, filesRemoved };
   },
 });
@@ -69,13 +84,15 @@ export const removeByVolumeId = mutation({
 export const get = query({
   args: { driveId: v.string() },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     const id = ctx.db.normalizeId("drives", args.driveId);
     if (!id) return null;
-    return await ctx.db.get(id);
+    return inTenant(await ctx.db.get(id), tenantId);
   },
 });
 
-export const register = mutation({
+// Agent-only (internal): register/update a drive in the authenticated tenant.
+export const register = internalMutation({
   args: {
     label: v.string(),
     volumeId: v.string(),
@@ -88,11 +105,15 @@ export const register = mutation({
     mountPath: v.string(),
     location: v.optional(v.string()),
     tier: v.string(), // "hot" | "warm" | "cloud" | "cold" | "unknown"
+    tenantId: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
+    const tenantId = args.tenantId || "";
     const existing = await ctx.db
       .query("drives")
-      .filter((q) => q.eq(q.field("volumeId"), args.volumeId))
+      .withIndex("by_tenant_volume", (q) =>
+        q.eq("tenantId", tenantId).eq("volumeId", args.volumeId)
+      )
       .first();
 
     const timestamp = Date.now();
@@ -114,6 +135,7 @@ export const register = mutation({
       });
 
       await ctx.db.insert("auditLogs", {
+        tenantId,
         actorId: args.ownerId,
         machineId: args.machineId,
         action: "drive_update",
@@ -126,6 +148,7 @@ export const register = mutation({
       return existing._id;
     } else {
       const driveId = await ctx.db.insert("drives", {
+        tenantId,
         label: args.label,
         volumeId: args.volumeId,
         machineId: args.machineId,
@@ -144,6 +167,7 @@ export const register = mutation({
       });
 
       await ctx.db.insert("auditLogs", {
+        tenantId,
         actorId: args.ownerId,
         machineId: args.machineId,
         action: "drive_register",
@@ -164,8 +188,11 @@ export const updateStatus = mutation({
     status: v.string(), // "online" | "offline"
   },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     const driveId = ctx.db.normalizeId("drives", args.driveId);
     if (!driveId) return;
+    const drive = inTenant(await ctx.db.get(driveId), tenantId);
+    if (!drive) return;
     await ctx.db.patch(driveId, {
       status: args.status,
       lastSeenAt: Date.now(),
@@ -176,22 +203,30 @@ export const updateStatus = mutation({
 export const listMachines = query({
   args: {},
   handler: async (ctx) => {
-    return await ctx.db.query("machines").collect();
+    const { tenantId } = await requireMember(ctx);
+    return await ctx.db
+      .query("machines")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .collect();
   },
 });
 
-export const registerMachine = mutation({
+// Agent-only (internal): register/update the calling machine in its tenant.
+export const registerMachine = internalMutation({
   args: {
     name: v.string(),
     ownerId: v.string(),
     agentVersion: v.string(),
     platform: v.string(),
+    tenantId: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    const existing = await ctx.db
+    const tenantId = args.tenantId || "";
+    const tenantMachines = await ctx.db
       .query("machines")
-      .filter((q) => q.eq(q.field("name"), args.name))
-      .first();
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .collect();
+    const existing = tenantMachines.find((m) => m.name === args.name);
 
     const timestamp = Date.now();
 
@@ -205,6 +240,7 @@ export const registerMachine = mutation({
       return existing._id;
     } else {
       const machineId = await ctx.db.insert("machines", {
+        tenantId,
         name: args.name,
         ownerId: args.ownerId,
         agentVersion: args.agentVersion,

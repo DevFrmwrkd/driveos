@@ -1,6 +1,6 @@
 import { httpRouter } from "convex/server";
 import { httpAction } from "./_generated/server";
-import { api } from "./_generated/api";
+import { internal } from "./_generated/api";
 import { auth } from "./auth";
 import { hashToken } from "./agentAuth";
 
@@ -23,7 +23,7 @@ async function authenticateAgent(ctx: any, request: Request) {
   const match = header.match(/^Bearer\s+(.+)$/i);
   if (!match) return null;
   const tokenHash = await hashToken(match[1].trim());
-  return await ctx.runQuery(api.agentAuth.verifyMachineToken, { tokenHash });
+  return await ctx.runQuery(internal.agentAuth.verifyMachineToken, { tokenHash });
 }
 
 function clientIp(request: Request) {
@@ -44,7 +44,7 @@ function post(path: string, handler: (ctx: any, body: any, machine?: any) => Pro
       // Rate limit (defense-in-depth + avoid spamming Convex). Authenticated
       // traffic is keyed per machine with generous headroom; unauthenticated
       // calls are keyed per IP and throttled harder to slow token guessing.
-      const rl = await ctx.runMutation(api.rateLimits.checkAgentRateLimit, {
+      const rl = await ctx.runMutation(internal.rateLimits.checkAgentRateLimit, {
         authenticated: Boolean(machine),
         key: machine ? machine.machineId : clientIp(request),
       });
@@ -58,6 +58,12 @@ function post(path: string, handler: (ctx: any, body: any, machine?: any) => Pro
       if (!machine) {
         return json({ error: "Unauthorized: missing or invalid agent token. Run `driveos-agent connect`." }, 401);
       }
+      // Fail closed: a machine that isn't linked to a workspace must never write.
+      // (Post-migration every machine carries a tenantId; an empty one would
+      // otherwise fall into the un-scoped legacy pool.)
+      if (!machine.tenantId) {
+        return json({ error: "This device isn't linked to a workspace. Reconnect it with `driveos-agent connect`." }, 401);
+      }
       try {
         const body = await request.json();
         return json(await handler(ctx, body, machine));
@@ -68,66 +74,70 @@ function post(path: string, handler: (ctx: any, body: any, machine?: any) => Pro
   });
 }
 
-post("registerMachine", async (ctx, body) => {
-  const machineId = await ctx.runMutation(api.drives.registerMachine, body);
+// Every agent write/read is stamped/scoped with the authenticated machine's
+// tenantId, so a token for one workspace can never touch another's data.
+const scoped = (body: any, machine: any) => ({ ...body, tenantId: machine.tenantId });
+
+post("registerMachine", async (ctx, body, machine) => {
+  const machineId = await ctx.runMutation(internal.drives.registerMachine, scoped(body, machine));
   return { success: true, machineId };
 });
 
-post("registerDrive", async (ctx, body) => {
-  const driveId = await ctx.runMutation(api.drives.register, body);
+post("registerDrive", async (ctx, body, machine) => {
+  const driveId = await ctx.runMutation(internal.drives.register, scoped(body, machine));
   return { success: true, driveId };
 });
 
-post("removeDrive", async (ctx, body) => {
-  const result = await ctx.runMutation(api.drives.removeByVolumeId, body);
+post("removeDrive", async (ctx, body, machine) => {
+  const result = await ctx.runMutation(internal.drives.removeByVolumeId, scoped(body, machine));
   return { success: true, ...result };
 });
 
-post("startScan", async (ctx, body) => {
-  const sessionId = await ctx.runMutation(api.scans.start, body);
+post("startScan", async (ctx, body, machine) => {
+  const sessionId = await ctx.runMutation(internal.scans.start, scoped(body, machine));
   return { success: true, sessionId };
 });
 
-post("completeScan", async (ctx, body) => {
-  await ctx.runMutation(api.scans.complete, body);
+post("completeScan", async (ctx, body, machine) => {
+  await ctx.runMutation(internal.scans.complete, scoped(body, machine));
   return { success: true };
 });
 
-post("uploadBatch", async (ctx, body) => {
-  return await ctx.runMutation(api.files.uploadBatch, body);
+post("uploadBatch", async (ctx, body, machine) => {
+  return await ctx.runMutation(internal.files.uploadBatch, scoped(body, machine));
 });
 
-post("createManifest", async (ctx, body) => {
-  const manifestId = await ctx.runMutation(api.archive.createManifest, body);
+post("createManifest", async (ctx, body, machine) => {
+  const manifestId = await ctx.runMutation(internal.archive.createManifest, scoped(body, machine));
   return { success: true, manifestId };
 });
 
-post("pollPendingJobs", async (ctx, body) => {
-  return await ctx.runQuery(api.cleanup.pollPendingJobs, body);
+post("pollPendingJobs", async (ctx, body, machine) => {
+  return await ctx.runQuery(internal.cleanup.pollPendingJobs, scoped(body, machine));
 });
 
-post("getJob", async (ctx, body) => {
-  const job = await ctx.runQuery(api.cleanup.getJob, body);
+post("getJob", async (ctx, body, machine) => {
+  const job = await ctx.runQuery(internal.cleanup.getJob, scoped(body, machine));
   return { success: true, job };
 });
 
-post("updateJobStatus", async (ctx, body) => {
-  await ctx.runMutation(api.cleanup.updateJobStatus, body);
+post("updateJobStatus", async (ctx, body, machine) => {
+  await ctx.runMutation(internal.cleanup.updateJobStatus, scoped(body, machine));
   return { success: true };
 });
 
-post("getQuarantineItem", async (ctx, body) => {
-  const item = await ctx.runQuery(api.cleanup.getQuarantineItem, body);
+post("getQuarantineItem", async (ctx, body, machine) => {
+  const item = await ctx.runQuery(internal.cleanup.getQuarantineItem, scoped(body, machine));
   return { success: true, item };
 });
 
-post("markQuarantineRestored", async (ctx, body) => {
-  await ctx.runMutation(api.cleanup.markQuarantineRestored, body);
+post("markQuarantineRestored", async (ctx, body, machine) => {
+  await ctx.runMutation(internal.cleanup.markQuarantineRestoredAgent, scoped(body, machine));
   return { success: true };
 });
 
-post("getProject", async (ctx, body) => {
-  const project = await ctx.runQuery(api.projects.get, body);
+post("getProject", async (ctx, body, machine) => {
+  const project = await ctx.runQuery(internal.projects.getForAgent, scoped(body, machine));
   return { success: true, project };
 });
 

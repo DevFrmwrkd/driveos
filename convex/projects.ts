@@ -1,20 +1,37 @@
 import { v } from "convex/values";
-import { mutation, query } from "./_generated/server";
-import { requireMember } from "./access";
+import { internalQuery, mutation, query } from "./_generated/server";
+import { requireMember, inTenant } from "./access";
 
 export const list = query({
   args: {},
   handler: async (ctx) => {
-    return await ctx.db.query("projects").collect();
+    const { tenantId } = await requireMember(ctx);
+    return await ctx.db
+      .query("projects")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .collect();
   },
 });
 
 export const get = query({
   args: { projectId: v.string() },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     const id = ctx.db.normalizeId("projects", args.projectId);
     if (!id) return null;
-    return await ctx.db.get(id);
+    return inTenant(await ctx.db.get(id), tenantId);
+  },
+});
+
+// Agent-only (internal): fetch a project scoped to the agent's tenant.
+export const getForAgent = internalQuery({
+  args: { projectId: v.string(), tenantId: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const id = ctx.db.normalizeId("projects", args.projectId);
+    if (!id) return null;
+    const project = await ctx.db.get(id);
+    if (!project || project.tenantId !== (args.tenantId || "")) return null;
+    return project;
   },
 });
 
@@ -34,11 +51,12 @@ export const create = mutation({
     notes: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    await requireMember(ctx);
+    const { tenantId } = await requireMember(ctx);
     const timestamp = Date.now();
     const slug = args.name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
 
     const projectId = await ctx.db.insert("projects", {
+      tenantId,
       name: args.name,
       client: args.client,
       showName: args.showName,
@@ -63,6 +81,7 @@ export const create = mutation({
     // Create a background job for local agent to create the folder structure if rootPath is specified
     if (args.rootPath) {
       await ctx.db.insert("cleanupJobs", {
+        tenantId,
         action: "create_folder_structure",
         status: "pending_approval", // auto-approving below to queued
         requestedBy: args.ownerId,
@@ -83,6 +102,7 @@ export const create = mutation({
     }
 
     await ctx.db.insert("auditLogs", {
+      tenantId,
       actorId: args.ownerId,
       action: "project_create",
       entityType: "project",
@@ -101,10 +121,11 @@ export const updateStatus = mutation({
     status: v.string(),
   },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     const projectId = ctx.db.normalizeId("projects", args.projectId);
     if (!projectId) return;
 
-    const project = await ctx.db.get(projectId);
+    const project = inTenant(await ctx.db.get(projectId), tenantId);
     if (!project) return;
 
     await ctx.db.patch(projectId, {
@@ -113,6 +134,7 @@ export const updateStatus = mutation({
     });
 
     await ctx.db.insert("auditLogs", {
+      tenantId,
       actorId: project.ownerId,
       action: "project_status_update",
       entityType: "project",
@@ -133,8 +155,11 @@ export const updateStats = mutation({
     storageHealthScore: v.number(),
   },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     const projectId = ctx.db.normalizeId("projects", args.projectId);
     if (!projectId) return;
+    const project = inTenant(await ctx.db.get(projectId), tenantId);
+    if (!project) return;
 
     await ctx.db.patch(projectId, {
       totalBytes: args.totalBytes,
@@ -149,6 +174,16 @@ export const updateStats = mutation({
 export const listTemplates = query({
   args: {},
   handler: async (ctx) => {
-    return await ctx.db.query("folderTemplates").collect();
+    const { tenantId } = await requireMember(ctx);
+    const own = await ctx.db
+      .query("folderTemplates")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .collect();
+    if (own.length > 0) return own;
+    // Fall back to shared/global default templates (no tenant assigned).
+    return await ctx.db
+      .query("folderTemplates")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", undefined))
+      .collect();
   },
 });
