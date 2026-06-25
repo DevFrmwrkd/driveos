@@ -162,7 +162,17 @@ function ensureAgentHome() {
 
 function readJsonFile<T>(filePath: string): T | null {
   if (!fs.existsSync(filePath)) return null;
-  return JSON.parse(fs.readFileSync(filePath, "utf-8")) as T;
+  // Tolerate an empty or truncated file (e.g. a hash-cache write interrupted by
+  // a force-quit or an external volume unmounting mid-write). A corrupt cache
+  // must never crash a scan — treat it as missing and rebuild it.
+  try {
+    const content = fs.readFileSync(filePath, "utf-8");
+    if (!content.trim()) return null;
+    return JSON.parse(content) as T;
+  } catch (err: any) {
+    console.warn(`[Config Warning] Ignoring unreadable JSON at ${filePath}: ${err.message}`);
+    return null;
+  }
 }
 
 function loadConfig(): DriveOSConfig {
@@ -188,7 +198,12 @@ function loadHashCache(): Record<string, HashCacheEntry> {
 
 function saveHashCache(cache: Record<string, HashCacheEntry>) {
   ensureAgentHome();
-  fs.writeFileSync(HASH_CACHE_PATH, JSON.stringify(cache, null, 2), "utf-8");
+  // Atomic write: serialize to a temp file then rename over the target. A rename
+  // is atomic on the same volume, so a concurrent reader (another volume's scan)
+  // never observes a half-written cache — the previous fix's root cause.
+  const tmp = `${HASH_CACHE_PATH}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(cache, null, 2), "utf-8");
+  fs.renameSync(tmp, HASH_CACHE_PATH);
 }
 
 // The cache is one JSON file; rewriting it after every 100-file batch is O(n²)
@@ -597,6 +612,9 @@ interface ScanOptions {
   minFileSizeBytes?: number;
   maxFileSizeBytes?: number;
   passLabel?: string;
+  // In-memory hash cache shared across all volumes in one sync cycle, so they
+  // don't reload each other's mid-scan writes.
+  sharedHashCache?: Record<string, HashCacheEntry>;
 }
 
 interface ScanResult {
@@ -613,7 +631,10 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
   enforceTrackableRoot("Scan target", scanDir, Boolean(options.allowCloudRoot));
   validateRuntimeConfig(config);
 
-  const hashCache = loadHashCache();
+  // A sync cycle scanning several volumes shares one in-memory cache (passed via
+  // options.sharedHashCache) so volumes don't reload each other's mid-scan
+  // writes. A one-shot `scan` loads its own.
+  const hashCache = options.sharedHashCache ?? loadHashCache();
   const calculateFull = Boolean(options.fullHash || config.fullHash);
   const driveMetrics = getDriveMetrics(scanDir);
   const cloudProvider = cloudSyncProvider(scanDir);
@@ -766,6 +787,11 @@ async function runSyncCycle(config: DriveOSConfig, options: ScanOptions = {}): P
   saveState({ lastSyncStartedAt: new Date().toISOString() });
   const totals: ScanResult = { fileCount: 0, byteCount: 0, errorsCount: 0, skippedUnstable: 0 };
 
+  // One shared hash cache for the whole cycle: every volume reads and writes the
+  // same in-memory object, so a mid-scan save by one volume can't corrupt what
+  // the next volume loads from disk.
+  const sharedHashCache = loadHashCache();
+
   // Progressive scan: pass 1 covers big media (the bulk of duplicate bytes) on
   // every root so duplicates surface on the dashboard within minutes; pass 2
   // re-walks for the remaining small files, so nothing is ever skipped. Each
@@ -793,7 +819,7 @@ async function runSyncCycle(config: DriveOSConfig, options: ScanOptions = {}): P
         continue;
       }
       try {
-        const res = await performScan(resolved, config, { ...options, checkStability: true, ...pass });
+        const res = await performScan(resolved, config, { ...options, checkStability: true, sharedHashCache, ...pass });
         totals.fileCount += res.fileCount;
         totals.byteCount += res.byteCount;
         totals.errorsCount += res.errorsCount;
