@@ -97,6 +97,16 @@ export const register = mutation({
 
     const timestamp = Date.now();
 
+    // A drive's location is the location of the machine it's plugged into. Fall
+    // back to that (not a hardcoded city) when the agent doesn't send one.
+    let machineLocation: string | undefined;
+    if (args.machineId) {
+      const machineIdObj = ctx.db.normalizeId("machines", args.machineId);
+      const machine = machineIdObj ? await ctx.db.get(machineIdObj) : null;
+      machineLocation = machine?.location ?? undefined;
+    }
+    const resolvedLocation = args.location || machineLocation;
+
     if (existing) {
       await ctx.db.patch(existing._id, {
         label: args.label,
@@ -107,7 +117,7 @@ export const register = mutation({
         usedBytes: args.usedBytes,
         filesystem: args.filesystem,
         mountPath: args.mountPath,
-        location: args.location || existing.location,
+        location: resolvedLocation || existing.location,
         tier: args.tier,
         status: "online",
         lastSeenAt: timestamp,
@@ -135,7 +145,7 @@ export const register = mutation({
         usedBytes: args.usedBytes,
         filesystem: args.filesystem,
         mountPath: args.mountPath,
-        location: args.location || "Los Angeles",
+        location: resolvedLocation,
         tier: args.tier,
         status: "online",
         firstSeenAt: timestamp,
@@ -186,6 +196,7 @@ export const registerMachine = mutation({
     ownerId: v.string(),
     agentVersion: v.string(),
     platform: v.string(),
+    location: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const existing = await ctx.db
@@ -199,6 +210,8 @@ export const registerMachine = mutation({
       await ctx.db.patch(existing._id, {
         agentVersion: args.agentVersion,
         platform: args.platform,
+        // Keep a location the user set; only fill it from the agent if unset.
+        location: existing.location || args.location,
         lastSeenAt: timestamp,
         status: "online",
       });
@@ -209,6 +222,7 @@ export const registerMachine = mutation({
         ownerId: args.ownerId,
         agentVersion: args.agentVersion,
         platform: args.platform,
+        location: args.location,
         lastSeenAt: timestamp,
         status: "online",
         createdAt: timestamp,

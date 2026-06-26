@@ -322,7 +322,9 @@ function Workspace() {
       id: d._id,
       name: d.label,
       owner: resolveOwnerId(d),
-      location: d.location || "Studio",
+      // Drive location comes from the backend (inherited from its machine);
+      // only show "Unknown location" when nothing has been set yet.
+      location: d.location || "Unknown location",
       status: d.status || "online",
       tier: d.tier || "hot",
       bus: d.bus || d.filesystem || "Local volume",

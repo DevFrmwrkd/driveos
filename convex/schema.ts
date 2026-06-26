@@ -33,6 +33,7 @@ export default defineSchema({
     ownerId: v.string(), // matches teamMember ID or "local-system"
     agentVersion: v.string(),
     platform: v.string(),
+    location: v.optional(v.string()), // where this machine physically is; drives inherit it
     lastSeenAt: v.number(),
     status: v.string(), // "online" | "offline" | "unknown"
     authTokenHash: v.optional(v.string()),
