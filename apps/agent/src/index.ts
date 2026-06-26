@@ -1061,14 +1061,27 @@ program
     };
     const intervalMs = Math.max(1, Number(options.intervalMinutes) || 60) * 60 * 1000;
 
-    // Always run an immediate catch-up cycle on start (unless paused).
+    // Always run an immediate catch-up cycle on start (unless paused), then pick
+    // up any jobs approved in the dashboard.
     await runSyncCycle(config, scanOpts);
+    await runPendingJobs(config);
     if (options.once) return;
 
     console.log(`[Scheduler Started] Next sync in ${Math.round(intervalMs / 60000)} minute(s). Convex receives one batched update per cycle — no constant streaming.`);
-    const timer = setInterval(() => { void runSyncCycle(config, scanOpts); }, intervalMs);
+    const syncTimer = setInterval(() => { void runSyncCycle(config, scanOpts); }, intervalMs);
 
-    const shutdown = () => { clearInterval(timer); console.log("\n[Scheduler Stopped]"); process.exit(0); };
+    // Poll for approved jobs (quarantine, folder creation) far more often than we
+    // scan, so a Quarantine clicked in the web dashboard runs within a minute
+    // rather than waiting for the next hourly sync. One job at a time; overlapping
+    // ticks are skipped via the busy guard.
+    let jobsBusy = false;
+    const jobsTimer = setInterval(() => {
+      if (jobsBusy) return;
+      jobsBusy = true;
+      void runPendingJobs(config).catch((err) => console.error(`[Agent Queue] Poll failed: ${err.message}`)).finally(() => { jobsBusy = false; });
+    }, 60 * 1000);
+
+    const shutdown = () => { clearInterval(syncTimer); clearInterval(jobsTimer); console.log("\n[Scheduler Stopped]"); process.exit(0); };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
   });
@@ -1259,6 +1272,28 @@ program
     console.log(`[Wizard Success] Manifest: ${manifestPath}`);
   });
 
+// Poll the backend once for approved jobs and execute them. Shared by the
+// `run-jobs` CLI command and the background scheduler so a Quarantine approved
+// in the web dashboard runs on its own — no manual command needed. Respects the
+// pause flag and never throws: a failed job is marked failed and the rest run.
+async function runPendingJobs(config: DriveOSConfig): Promise<number> {
+  if (loadState().paused) return 0;
+  const jobs = await syncToConvex("pollPendingJobs", { machineId: config.machineName });
+  if ((jobs as any).offline || !Array.isArray(jobs) || jobs.length === 0) return 0;
+
+  let executed = 0;
+  for (const job of jobs) {
+    try {
+      await executeJob(job, config);
+      executed++;
+    } catch (err: any) {
+      console.error(`[Agent Execution Error] Job ${job._id} failed: ${err.message}`);
+      await syncToConvex("updateJobStatus", { jobId: job._id, status: "failed", result: { error: err.message } });
+    }
+  }
+  return executed;
+}
+
 program
   .command("run-jobs")
   .description("Poll Convex backend for pending cleanup and folder-creation actions and execute them")
@@ -1266,21 +1301,9 @@ program
     const config = loadConfig();
     validateRuntimeConfig(config);
     console.log(`[Agent Queue] Polling pending actions for machine "${config.machineName}"`);
-
-    const jobs = await syncToConvex("pollPendingJobs", { machineId: config.machineName });
-    if ((jobs as any).offline || !Array.isArray(jobs) || jobs.length === 0) {
-      console.log("[Agent Queue] No pending approved jobs. Queue is idle.");
-      return;
-    }
-
-    for (const job of jobs) {
-      try {
-        await executeJob(job, config);
-      } catch (err: any) {
-        console.error(`[Agent Execution Error] Job ${job._id} failed: ${err.message}`);
-        await syncToConvex("updateJobStatus", { jobId: job._id, status: "failed", result: { error: err.message } });
-      }
-    }
+    const executed = await runPendingJobs(config);
+    if (executed === 0) console.log("[Agent Queue] No pending approved jobs. Queue is idle.");
+    else console.log(`[Agent Queue] Executed ${executed} job(s).`);
   });
 
 program
