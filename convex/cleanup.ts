@@ -25,6 +25,79 @@ export const listQuarantine = query({
   },
 });
 
+// How many quarantined items in the caller's tenant are past their rollback
+// window and safe to purge. Drives the "Empty expired" button count/disabled.
+export const purgeableCount = query({
+  args: {},
+  handler: async (ctx) => {
+    const { tenantId } = await requireMember(ctx);
+    const now = Date.now();
+    const items = await ctx.db
+      .query("quarantineItems")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .collect();
+    const expired = items.filter((i) => i.status === "quarantined" && i.rollbackUntil <= now);
+    return {
+      count: expired.length,
+      bytes: expired.reduce((s, i) => s + i.sizeBytes, 0),
+    };
+  },
+});
+
+// Permanently delete quarantined files past their 14-day window, scoped to the
+// caller's tenant. Manual only (a human clicks the button) — never auto-runs.
+// Creates an approved purge job carrying the file paths so the per-machine agent
+// can delete them off disk; items flip to "pending_purge" so they can't double-queue.
+export const purgeExpired = mutation({
+  args: { requestedBy: v.string() },
+  handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
+    const now = Date.now();
+
+    const items = await ctx.db
+      .query("quarantineItems")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .collect();
+    const expired = items.filter((i) => i.status === "quarantined" && i.rollbackUntil <= now);
+    if (expired.length === 0) return { queued: 0 };
+
+    const purgeItems = expired.map((i) => ({
+      quarantineItemId: String(i._id),
+      quarantinePath: i.quarantinePath,
+    }));
+    const totalBytes = expired.reduce((s, i) => s + i.sizeBytes, 0);
+
+    const jobId = await ctx.db.insert("cleanupJobs", {
+      tenantId,
+      requestedBy: args.requestedBy,
+      action: "purge",
+      status: "approved", // skips pending_approval: the button click IS the approval
+      approvedBy: args.requestedBy,
+      affectedFileIds: expired.map((i) => i.fileId),
+      affectedBytes: totalBytes,
+      result: { purgeItems },
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    for (const item of expired) {
+      await ctx.db.patch(item._id, { status: "pending_purge" });
+    }
+
+    await ctx.db.insert("auditLogs", {
+      tenantId,
+      actorId: args.requestedBy,
+      action: "purge_request",
+      entityType: "cleanupJob",
+      entityId: jobId,
+      message: `Queued permanent deletion of ${expired.length} expired quarantine item(s), freeing ${(totalBytes / (1024 ** 3)).toFixed(1)} GB`,
+      createdAt: now,
+    });
+
+    return { queued: expired.length, jobId };
+  },
+});
+
 // Agent-only (internal): fetch a job + its files, scoped to the agent's tenant.
 export const getJob = internalQuery({
   args: { jobId: v.string(), tenantId: v.optional(v.string()) },
@@ -265,6 +338,21 @@ export const updateJobStatus = internalMutation({
               status: "restored",
               restoredAt: timestamp,
             });
+          }
+        }
+      }
+
+      // Purge job finalize: only the items the agent confirms deleted flip to
+      // permanently_deleted, so a partial failure leaves the rest recoverable.
+      // Each item is re-checked against the tenant before mutating.
+      if (job.action === "purge") {
+        const purgedIds: string[] = (args.result && args.result.purgedItemIds) || [];
+        for (const itemId of purgedIds) {
+          const qid = ctx.db.normalizeId("quarantineItems", itemId);
+          if (!qid) continue;
+          const item = await ctx.db.get(qid);
+          if (item && item.tenantId === tenantId) {
+            await ctx.db.patch(qid, { status: "permanently_deleted", deletedAt: timestamp });
           }
         }
       }

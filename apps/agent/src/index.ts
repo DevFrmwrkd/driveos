@@ -17,7 +17,15 @@ interface DriveOSConfig {
   ownerId: string;
   convexUrl: string;
   authToken?: string;
+  // Physical location of this machine (e.g. "Manila Office", "Home Studio").
+  // Drives plugged into it inherit this on the dashboard.
+  location?: string;
   quarantineRoot: string;
+  // When true (default), quarantined files move into a .driveos-quarantine
+  // folder at the root of their own volume — a fast same-disk rename that works
+  // on external drives and never floods the system disk. When false, everything
+  // goes to quarantineRoot (the legacy single-folder behaviour).
+  quarantineOnSourceVolume?: boolean;
   scanRoots: string[];
   minFileSizeBytes: number;
   fullHash: boolean;
@@ -85,10 +93,16 @@ const DEFAULT_CONFIG: DriveOSConfig = {
   ownerId: "cj",
   convexUrl: DEFAULT_CONVEX_URL,
   quarantineRoot: path.join(AGENT_HOME, "quarantine"),
+  quarantineOnSourceVolume: true,
   scanRoots: [],
   minFileSizeBytes: ONE_MB,
   fullHash: false,
 };
+
+// Per-volume quarantine folder name. Lives at the root of each scanned volume
+// when quarantineOnSourceVolume is on, and is in IGNORED_FOLDERS so scans never
+// re-catalog files that were just quarantined.
+const QUARANTINE_FOLDER_NAME = ".driveos-quarantine";
 
 const IGNORED_FOLDERS = new Set([
   ".TRASH",
@@ -101,6 +115,7 @@ const IGNORED_FOLDERS = new Set([
   ".DS_STORE",
   "TEMPORARY",
   "TMP",
+  QUARANTINE_FOLDER_NAME.toUpperCase(),
 ]);
 
 // Substring markers matched against the lowercased, resolved path.
@@ -534,6 +549,52 @@ function preserveOriginalPath(originalPath: string) {
   return path.join(parsed.root.replace(/[:/\\]+/g, "_"), path.relative(parsed.root, path.resolve(originalPath)));
 }
 
+// Resolve the volume mount root a path lives on, so quarantine can stay on the
+// same disk (a fast rename, no cross-volume copy). macOS external drives mount
+// at /Volumes/<Name>; Windows volumes are a drive-letter root like E:\. Falls
+// back to the filesystem root when nothing more specific matches.
+function volumeRootForPath(targetPath: string): string {
+  const resolved = path.resolve(targetPath);
+  if (process.platform === "darwin") {
+    const m = resolved.match(/^(\/Volumes\/[^/]+)/);
+    if (m) return m[1];
+  }
+  return path.parse(resolved).root;
+}
+
+// Where a quarantined file should land. Per-volume by default (same-disk move,
+// works on external drives); otherwise the single configured quarantineRoot.
+function quarantineDestination(filePath: string, config: DriveOSConfig, jobId: string, timestamp: string): string {
+  if (config.quarantineOnSourceVolume !== false) {
+    const volRoot = volumeRootForPath(filePath);
+    return path.join(volRoot, QUARANTINE_FOLDER_NAME, timestamp, jobId, path.basename(filePath));
+  }
+  return path.join(config.quarantineRoot, timestamp, jobId, preserveOriginalPath(filePath));
+}
+
+// Move a file to quarantine, surviving cross-volume moves. A plain rename fails
+// with EXDEV when source and destination are on different volumes (the reason
+// quarantine never worked on external drives), so fall back to copy → verify
+// size → delete original. The original is only removed after the copy is
+// confirmed byte-for-byte the same size, so an interrupted move never loses data.
+function moveFileSafely(src: string, dest: string) {
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  try {
+    fs.renameSync(src, dest);
+    return;
+  } catch (err: any) {
+    if (err.code !== "EXDEV") throw err;
+  }
+  const srcSize = fs.statSync(src).size;
+  fs.copyFileSync(src, dest);
+  const destSize = fs.statSync(dest).size;
+  if (destSize !== srcSize) {
+    try { fs.unlinkSync(dest); } catch {}
+    throw new Error(`Cross-volume copy size mismatch for ${src} (${srcSize} vs ${destSize}); original left in place`);
+  }
+  fs.unlinkSync(src);
+}
+
 async function executeQuarantineJob(job: any, config: DriveOSConfig) {
   validateRuntimeConfig(config);
   const quarantineFiles = [];
@@ -545,16 +606,20 @@ async function executeQuarantineJob(job: any, config: DriveOSConfig) {
       continue;
     }
 
-    const destination = path.join(config.quarantineRoot, timestamp, job._id, preserveOriginalPath(file.path));
-    fs.mkdirSync(path.dirname(destination), { recursive: true });
-
     if (!fs.existsSync(file.path)) {
       console.warn(`[Quarantine Warning] File was missing: ${file.path}`);
       continue;
     }
 
+    const destination = quarantineDestination(file.path, config, job._id, timestamp);
+
     console.log(`[Quarantine Execute] ${file.path} -> ${destination}`);
-    fs.renameSync(file.path, destination);
+    try {
+      moveFileSafely(file.path, destination);
+    } catch (err: any) {
+      console.error(`[Quarantine Error] Could not move ${file.path}: ${err.message}`);
+      continue;
+    }
     quarantineFiles.push({
       fileId: file._id,
       originalPath: file.path,
@@ -572,12 +637,51 @@ async function executeQuarantineJob(job: any, config: DriveOSConfig) {
   console.log(`[Success] Relocated ${quarantineFiles.length} file(s) to quarantine.`);
 }
 
+// Permanently delete quarantined files whose rollback window expired. The backend
+// only ever queues items already past 14 days, so this is the point of no return.
+// Reports back exactly which items were removed, so a file that's already gone or
+// fails to delete simply isn't marked deleted (it stays recoverable in the UI).
+async function executePurgeJob(job: any) {
+  const purgeItems: { quarantineItemId: string; quarantinePath: string }[] = job.result?.purgeItems || [];
+  const purgedItemIds: string[] = [];
+  let freedBytes = 0;
+
+  for (const item of purgeItems) {
+    try {
+      if (fs.existsSync(item.quarantinePath)) {
+        const size = fs.statSync(item.quarantinePath).size;
+        fs.rmSync(item.quarantinePath, { force: true });
+        freedBytes += size;
+        console.log(`[Purge] Permanently deleted ${item.quarantinePath}`);
+      } else {
+        console.warn(`[Purge] Already gone, marking deleted: ${item.quarantinePath}`);
+      }
+      // Either way the file is no longer on disk, so the item is settled.
+      purgedItemIds.push(item.quarantineItemId);
+    } catch (err: any) {
+      console.error(`[Purge Error] Could not delete ${item.quarantinePath}: ${err.message}`);
+    }
+  }
+
+  await syncToConvex("updateJobStatus", {
+    jobId: job._id,
+    status: "completed",
+    result: { purgedItemIds },
+  });
+  console.log(`[Success] Purged ${purgedItemIds.length} item(s), freed ${(freedBytes / (1024 ** 3)).toFixed(2)} GB.`);
+}
+
 async function executeJob(job: any, config: DriveOSConfig) {
   console.log(`[Agent Queue] Executing job ${job._id}: ${job.action}`);
   await syncToConvex("updateJobStatus", { jobId: job._id, status: "running" });
 
   if (job.action === "quarantine") {
     await executeQuarantineJob(job, config);
+    return;
+  }
+
+  if (job.action === "purge") {
+    await executePurgeJob(job);
     return;
   }
 
@@ -654,6 +758,7 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
     ownerId: config.ownerId,
     agentVersion: AGENT_VERSION,
     platform: process.platform,
+    location: config.location,
   });
   const machineId = machineRes.machineId || config.machineName;
 
@@ -853,7 +958,9 @@ program
   .option("-m, --machine <name>", "Machine workstation name", DEFAULT_CONFIG.machineName)
   .option("-o, --owner <ownerId>", "Owner / Lead Editor ID", DEFAULT_CONFIG.ownerId)
   .option("-c, --convex <url>", "Convex deployment URL (.convex.cloud or .convex.site)", DEFAULT_CONFIG.convexUrl)
-  .option("-q, --quarantine <path>", "Quarantine storage folder", DEFAULT_CONFIG.quarantineRoot)
+  .option("-l, --location <location>", "Physical location of this machine (e.g. \"Manila Office\")")
+  .option("-q, --quarantine <path>", "Fallback quarantine folder (used only with --central-quarantine)", DEFAULT_CONFIG.quarantineRoot)
+  .option("--central-quarantine", "Quarantine all drives into one folder instead of per-volume (per-volume is default and required for external drives)")
   .option("-r, --roots <paths>", "Comma-separated default scan roots")
   .option("--auth-token <token>", "Optional bearer token for Convex HTTP endpoints")
   .option("--min-size-mb <mb>", "Minimum file size to scan", "1")
@@ -871,7 +978,9 @@ program
       ownerId: options.owner,
       convexUrl: options.convex,
       authToken: options.authToken,
+      location: options.location,
       quarantineRoot: options.quarantine,
+      quarantineOnSourceVolume: !options.centralQuarantine,
       scanRoots,
       minFileSizeBytes: Math.max(0, Number(options.minSizeMb) * ONE_MB),
       fullHash: Boolean(options.fullHash),
@@ -903,6 +1012,7 @@ program
   .requiredOption("--machine <name>", "Machine name this token was issued for")
   .option("-c, --convex <url>", "Convex deployment URL (.convex.cloud or .convex.site)", DEFAULT_CONVEX_URL)
   .option("-o, --owner <ownerId>", "Owner / Lead Editor ID")
+  .option("-l, --location <location>", "Physical location of this machine (e.g. \"Manila Office\")")
   .action(async (options) => {
     const config = loadConfig();
     const next: DriveOSConfig = {
@@ -911,6 +1021,7 @@ program
       machineName: options.machine,
       authToken: String(options.token).trim(),
       ownerId: options.owner || config.ownerId,
+      location: options.location || config.location,
     };
     enforceLocalStatePath("Agent data directory", AGENT_HOME);
 
@@ -926,6 +1037,7 @@ program
           ownerId: next.ownerId,
           agentVersion: AGENT_VERSION,
           platform: process.platform,
+          location: next.location,
         }),
       });
       if (res.status === 401) {
@@ -1338,8 +1450,9 @@ program
       process.exit(1);
     }
 
-    fs.mkdirSync(path.dirname(item.originalPath), { recursive: true });
-    fs.renameSync(item.quarantinePath, item.originalPath);
+    // Cross-volume safe, so a file quarantined under the legacy single-folder
+    // mode still restores onto its source drive.
+    moveFileSafely(item.quarantinePath, item.originalPath);
     await syncToConvex("markQuarantineRestored", { quarantineId: options.quarantineId });
     console.log(`[Restore Success] ${item.quarantinePath} -> ${item.originalPath}`);
   });
