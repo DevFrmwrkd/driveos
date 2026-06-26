@@ -1,24 +1,32 @@
 import { v } from "convex/values";
-import { mutation, query } from "./_generated/server";
+import { internalMutation, mutation, query } from "./_generated/server";
+import { requireMember, inTenant } from "./access";
 
 export const listManifests = query({
   args: {},
   handler: async (ctx) => {
-    return await ctx.db.query("archiveManifests").collect();
+    const { tenantId } = await requireMember(ctx);
+    return await ctx.db
+      .query("archiveManifests")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .collect();
   },
 });
 
 export const getManifest = query({
   args: { projectId: v.string() },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     return await ctx.db
       .query("archiveManifests")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
       .filter((q) => q.eq(q.field("projectId"), args.projectId))
       .first();
   },
 });
 
-export const createManifest = mutation({
+// Agent-only (internal): record an archive manifest in the agent's tenant.
+export const createManifest = internalMutation({
   args: {
     projectId: v.string(),
     driveId: v.optional(v.string()),
@@ -27,10 +35,13 @@ export const createManifest = mutation({
     totalBytes: v.number(),
     manifestPath: v.string(),
     checksum: v.string(),
+    tenantId: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
+    const tenantId = args.tenantId || "";
     const timestamp = Date.now();
     const manifestId = await ctx.db.insert("archiveManifests", {
+      tenantId,
       projectId: args.projectId,
       driveId: args.driveId,
       createdBy: args.createdBy,
@@ -43,6 +54,7 @@ export const createManifest = mutation({
     });
 
     await ctx.db.insert("auditLogs", {
+      tenantId,
       actorId: args.createdBy,
       action: "manifest_generate",
       entityType: "archiveManifest",
@@ -62,10 +74,11 @@ export const verifyManifest = mutation({
     verificationResult: v.any(),
   },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     const id = ctx.db.normalizeId("archiveManifests", args.manifestId);
     if (!id) return;
 
-    const manifest = await ctx.db.get(id);
+    const manifest = inTenant(await ctx.db.get(id), tenantId);
     if (!manifest) return;
 
     await ctx.db.patch(id, {
@@ -74,6 +87,7 @@ export const verifyManifest = mutation({
     });
 
     await ctx.db.insert("auditLogs", {
+      tenantId,
       action: "manifest_verify",
       entityType: "archiveManifest",
       entityId: id,

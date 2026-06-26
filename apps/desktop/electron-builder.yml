@@ -40,6 +40,9 @@ mac:
       arch: universal
     - target: zip
       arch: universal
+  # Stable, version-independent file name so the web download page's
+  # /releases/latest/download/DriveOS-Agent-mac.dmg URL never breaks.
+  artifactName: "DriveOS-Agent-mac.${ext}"
   # Unsigned by default — see INSTALLER.md for signing/notarization.
 
 win:
@@ -48,6 +51,8 @@ win:
     # Portable zip fallback — needs no code-sign cache, so it always builds even
     # if the NSIS installer step hits a signing-tool issue on a runner.
     - zip
+  # Stable name → /releases/latest/download/DriveOS-Agent-win.exe
+  artifactName: "DriveOS-Agent-win.${ext}"
 
 nsis:
   oneClick: false

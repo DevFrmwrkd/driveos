@@ -1,20 +1,26 @@
 import { v } from "convex/values";
-import { action, internalMutation, internalQuery, mutation, query } from "./_generated/server";
+import { internalAction, internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
+import { requireMember, inTenant } from "./access";
 
 export const list = query({
   args: {},
   handler: async (ctx) => {
-    return await ctx.db.query("recommendations").collect();
+    const { tenantId } = await requireMember(ctx);
+    return await ctx.db
+      .query("recommendations")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .collect();
   },
 });
 
 export const get = query({
   args: { recommendationId: v.string() },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     const id = ctx.db.normalizeId("recommendations", args.recommendationId);
     if (!id) return null;
-    return await ctx.db.get(id);
+    return inTenant(await ctx.db.get(id), tenantId);
   },
 });
 
@@ -40,13 +46,11 @@ function addToAggregate(agg: FileAggregate, fileId: string, sizeBytes: number) {
   agg.count++;
 }
 
-// Generation is an action so the file catalog can be read in pages — a single
-// mutation hits Convex's per-transaction read limit once the catalog grows past
-// a few thousand files. Files are reduced to per-category/per-project
-// aggregates on the fly, then written through one small mutation.
-export const generateRecommendations = action({
-  args: {},
-  handler: async (ctx): Promise<{ success: boolean; count: number }> => {
+// Generation runs per tenant (internal): page that tenant's catalog, reduce to
+// per-category/per-project aggregates, then write through one small mutation.
+export const generateRecommendations = internalAction({
+  args: { tenantId: v.string() },
+  handler: async (ctx, args): Promise<{ success: boolean; count: number }> => {
     const timestamp = Date.now();
 
     const cache = newAggregate();
@@ -66,7 +70,11 @@ export const generateRecommendations = action({
 
     let cursor: string | null = null;
     while (true) {
-      const page: any = await ctx.runQuery(internal.files.pageForAnalysis, { cursor, numItems: 1000 });
+      const page: any = await ctx.runQuery(internal.files.pageForAnalysis, {
+        tenantId: args.tenantId,
+        cursor,
+        numItems: 1000,
+      });
       for (const f of page.files) {
         if (f.deletedAt) continue;
 
@@ -91,8 +99,12 @@ export const generateRecommendations = action({
       cursor = page.continueCursor;
     }
 
-    const allProjects: any[] = await ctx.runQuery(internal.recommendations.listProjectsForAnalysis, {});
-    const openExactClusters: any[] = await ctx.runQuery(internal.recommendations.listOpenExactClusters, {});
+    const allProjects: any[] = await ctx.runQuery(internal.recommendations.listProjectsForAnalysis, {
+      tenantId: args.tenantId,
+    });
+    const openExactClusters: any[] = await ctx.runQuery(internal.recommendations.listOpenExactClusters, {
+      tenantId: args.tenantId,
+    });
 
     const recommendations = [];
 
@@ -141,7 +153,6 @@ export const generateRecommendations = action({
       const totalWastedBytes = openExactClusters.reduce((acc, c) => acc + c.wastedBytes, 0);
       const duplicateFileIds: string[] = [];
       for (const cluster of openExactClusters) {
-        // Collect files recommended for quarantine (the ones that are not the keep copy)
         const keepId = cluster.recommendedKeepFileId;
         for (const id of cluster.fileIds) {
           if (id !== keepId && duplicateFileIds.length < MAX_REC_FILE_IDS) duplicateFileIds.push(id);
@@ -214,6 +225,7 @@ export const generateRecommendations = action({
     }
 
     await ctx.runMutation(internal.recommendations.replaceOpenRecommendations, {
+      tenantId: args.tenantId,
       timestamp,
       recommendations,
     });
@@ -223,22 +235,29 @@ export const generateRecommendations = action({
 });
 
 export const listProjectsForAnalysis = internalQuery({
-  args: {},
-  handler: async (ctx) => {
-    return await ctx.db.query("projects").collect();
+  args: { tenantId: v.string() },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("projects")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", args.tenantId))
+      .collect();
   },
 });
 
 export const listOpenExactClusters = internalQuery({
-  args: {},
-  handler: async (ctx) => {
-    const clusters = await ctx.db.query("duplicateClusters").collect();
+  args: { tenantId: v.string() },
+  handler: async (ctx, args) => {
+    const clusters = await ctx.db
+      .query("duplicateClusters")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", args.tenantId))
+      .collect();
     return clusters.filter((c) => c.status === "open" && c.type === "exact");
   },
 });
 
 export const replaceOpenRecommendations = internalMutation({
   args: {
+    tenantId: v.string(),
     timestamp: v.number(),
     recommendations: v.array(
       v.object({
@@ -254,10 +273,10 @@ export const replaceOpenRecommendations = internalMutation({
     ),
   },
   handler: async (ctx, args) => {
-    // Clear open recommendations to regenerate freshly
+    // Clear this tenant's open recommendations to regenerate freshly.
     const openRecommendations = await ctx.db
       .query("recommendations")
-      .filter((q) => q.eq(q.field("status"), "open"))
+      .withIndex("by_tenant_status", (q) => q.eq("tenantId", args.tenantId).eq("status", "open"))
       .collect();
     for (const rec of openRecommendations) {
       await ctx.db.delete(rec._id);
@@ -266,6 +285,7 @@ export const replaceOpenRecommendations = internalMutation({
     for (const rec of args.recommendations) {
       await ctx.db.insert("recommendations", {
         ...rec,
+        tenantId: args.tenantId,
         status: "open",
         createdAt: args.timestamp,
         updatedAt: args.timestamp,
@@ -280,8 +300,11 @@ export const updateStatus = mutation({
     status: v.string(), // "open" | "approved" | "ignored" | "completed" | "failed"
   },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     const id = ctx.db.normalizeId("recommendations", args.recommendationId);
     if (!id) return;
+    const rec = inTenant(await ctx.db.get(id), tenantId);
+    if (!rec) return;
     await ctx.db.patch(id, {
       status: args.status,
       updatedAt: Date.now(),

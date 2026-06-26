@@ -8,6 +8,7 @@
  * @module
  */
 
+import type * as ResendOTP from "../ResendOTP.js";
 import type * as access from "../access.js";
 import type * as admin from "../admin.js";
 import type * as agentAuth from "../agentAuth.js";
@@ -18,6 +19,7 @@ import type * as cleanup from "../cleanup.js";
 import type * as cloud from "../cloud.js";
 import type * as drives from "../drives.js";
 import type * as duplicates from "../duplicates.js";
+import type * as emails from "../emails.js";
 import type * as files from "../files.js";
 import type * as http from "../http.js";
 import type * as projects from "../projects.js";
@@ -25,6 +27,7 @@ import type * as rateLimits from "../rateLimits.js";
 import type * as recommendations from "../recommendations.js";
 import type * as scans from "../scans.js";
 import type * as seed from "../seed.js";
+import type * as tenants from "../tenants.js";
 
 import type {
   ApiFromModules,
@@ -33,6 +36,7 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  ResendOTP: typeof ResendOTP;
   access: typeof access;
   admin: typeof admin;
   agentAuth: typeof agentAuth;
@@ -43,6 +47,7 @@ declare const fullApi: ApiFromModules<{
   cloud: typeof cloud;
   drives: typeof drives;
   duplicates: typeof duplicates;
+  emails: typeof emails;
   files: typeof files;
   http: typeof http;
   projects: typeof projects;
@@ -50,6 +55,7 @@ declare const fullApi: ApiFromModules<{
   recommendations: typeof recommendations;
   scans: typeof scans;
   seed: typeof seed;
+  tenants: typeof tenants;
 }>;
 
 /**

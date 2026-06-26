@@ -94,3 +94,30 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.glob }}
           if-no-files-found: warn
+
+  # Publish the built installers to a public GitHub Release so the web download
+  # page's /releases/latest/download/DriveOS-Agent-mac.dmg (and -win.exe) URLs
+  # resolve. Runs only on a desktop-v* tag, after both platform builds finish.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: DriveOS Agent ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: |
+            artifacts/**/DriveOS-Agent-mac.dmg
+            artifacts/**/DriveOS-Agent-win.exe
+            artifacts/**/*.zip

@@ -1,7 +1,7 @@
 import { RateLimiter, MINUTE, HOUR } from "@convex-dev/rate-limiter";
 import { v } from "convex/values";
 import { components } from "./_generated/api";
-import { mutation } from "./_generated/server";
+import { internalMutation } from "./_generated/server";
 
 // Application-layer rate limits (defense-in-depth + keeps Convex from being
 // hammered). Login brute-force is already handled by Convex Auth's built-in
@@ -24,8 +24,9 @@ export const rateLimiter = new RateLimiter(components.rateLimiter, {
 });
 
 // Called from the HTTP layer (httpActions can't use the rate limiter directly —
-// it needs db access). Returns { ok, retryAfter } so http.ts can answer 429.
-export const checkAgentRateLimit = mutation({
+// it needs db access). Internal-only. Returns { ok, retryAfter } so http.ts can
+// answer 429.
+export const checkAgentRateLimit = internalMutation({
   args: {
     authenticated: v.boolean(),
     key: v.string(), // machine id when authenticated, else client IP

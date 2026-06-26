@@ -1,23 +1,33 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { requireMember, inTenant } from "./access";
 
 export const listConnections = query({
   args: {},
   handler: async (ctx) => {
-    return await ctx.db.query("cloudConnections").collect();
+    const { tenantId } = await requireMember(ctx);
+    return await ctx.db
+      .query("cloudConnections")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .collect();
   },
 });
 
 export const listFiles = query({
   args: { projectId: v.optional(v.string()) },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     if (args.projectId) {
       return await ctx.db
         .query("cloudFiles")
-        .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+        .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+        .filter((q) => q.eq(q.field("projectId"), args.projectId))
         .collect();
     }
-    return await ctx.db.query("cloudFiles").collect();
+    return await ctx.db
+      .query("cloudFiles")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+      .collect();
   },
 });
 
@@ -29,9 +39,11 @@ export const addConnection = mutation({
     status: v.string(), // "connected" | "disconnected" | "demo"
   },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     const timestamp = Date.now();
     const existing = await ctx.db
       .query("cloudConnections")
+      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
       .filter((q) => q.eq(q.field("accountEmail"), args.accountEmail))
       .first();
 
@@ -45,6 +57,7 @@ export const addConnection = mutation({
       return existing._id;
     } else {
       const connId = await ctx.db.insert("cloudConnections", {
+        tenantId,
         provider: "google_drive",
         accountEmail: args.accountEmail,
         status: args.status,
@@ -55,6 +68,7 @@ export const addConnection = mutation({
       });
 
       await ctx.db.insert("auditLogs", {
+        tenantId,
         action: "cloud_connect",
         entityType: "cloudConnection",
         entityId: connId,
@@ -86,15 +100,19 @@ export const uploadCloudFileBatch = mutation({
     ),
   },
   handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
     const connectionIdObj = ctx.db.normalizeId("cloudConnections", args.connectionId);
     if (!connectionIdObj) return { success: false };
+    const connection = inTenant(await ctx.db.get(connectionIdObj), tenantId);
+    if (!connection) return { success: false };
 
     const timestamp = Date.now();
 
     for (const f of args.files) {
       const existing = await ctx.db
         .query("cloudFiles")
-        .withIndex("by_providerFileId", (q) => q.eq("providerFileId", f.providerFileId))
+        .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+        .filter((q) => q.eq(q.field("providerFileId"), f.providerFileId))
         .first();
 
       if (existing) {
@@ -111,6 +129,7 @@ export const uploadCloudFileBatch = mutation({
         });
       } else {
         await ctx.db.insert("cloudFiles", {
+          tenantId,
           provider: "google_drive",
           providerFileId: f.providerFileId,
           cloudConnectionId: args.connectionId,
@@ -133,6 +152,7 @@ export const uploadCloudFileBatch = mutation({
     });
 
     await ctx.db.insert("auditLogs", {
+      tenantId,
       action: "cloud_sync",
       entityType: "cloudConnection",
       entityId: args.connectionId,
