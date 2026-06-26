@@ -17,6 +17,9 @@ interface DriveOSConfig {
   ownerId: string;
   convexUrl: string;
   authToken?: string;
+  // Physical location of this machine (e.g. "Manila Office", "Home Studio").
+  // Drives plugged into it inherit this on the dashboard.
+  location?: string;
   quarantineRoot: string;
   // When true (default), quarantined files move into a .driveos-quarantine
   // folder at the root of their own volume — a fast same-disk rename that works
@@ -634,12 +637,51 @@ async function executeQuarantineJob(job: any, config: DriveOSConfig) {
   console.log(`[Success] Relocated ${quarantineFiles.length} file(s) to quarantine.`);
 }
 
+// Permanently delete quarantined files whose rollback window expired. The backend
+// only ever queues items already past 14 days, so this is the point of no return.
+// Reports back exactly which items were removed, so a file that's already gone or
+// fails to delete simply isn't marked deleted (it stays recoverable in the UI).
+async function executePurgeJob(job: any) {
+  const purgeItems: { quarantineItemId: string; quarantinePath: string }[] = job.result?.purgeItems || [];
+  const purgedItemIds: string[] = [];
+  let freedBytes = 0;
+
+  for (const item of purgeItems) {
+    try {
+      if (fs.existsSync(item.quarantinePath)) {
+        const size = fs.statSync(item.quarantinePath).size;
+        fs.rmSync(item.quarantinePath, { force: true });
+        freedBytes += size;
+        console.log(`[Purge] Permanently deleted ${item.quarantinePath}`);
+      } else {
+        console.warn(`[Purge] Already gone, marking deleted: ${item.quarantinePath}`);
+      }
+      // Either way the file is no longer on disk, so the item is settled.
+      purgedItemIds.push(item.quarantineItemId);
+    } catch (err: any) {
+      console.error(`[Purge Error] Could not delete ${item.quarantinePath}: ${err.message}`);
+    }
+  }
+
+  await syncToConvex("updateJobStatus", {
+    jobId: job._id,
+    status: "completed",
+    result: { purgedItemIds },
+  });
+  console.log(`[Success] Purged ${purgedItemIds.length} item(s), freed ${(freedBytes / (1024 ** 3)).toFixed(2)} GB.`);
+}
+
 async function executeJob(job: any, config: DriveOSConfig) {
   console.log(`[Agent Queue] Executing job ${job._id}: ${job.action}`);
   await syncToConvex("updateJobStatus", { jobId: job._id, status: "running" });
 
   if (job.action === "quarantine") {
     await executeQuarantineJob(job, config);
+    return;
+  }
+
+  if (job.action === "purge") {
+    await executePurgeJob(job);
     return;
   }
 
@@ -716,6 +758,7 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
     ownerId: config.ownerId,
     agentVersion: AGENT_VERSION,
     platform: process.platform,
+    location: config.location,
   });
   const machineId = machineRes.machineId || config.machineName;
 
@@ -915,6 +958,7 @@ program
   .option("-m, --machine <name>", "Machine workstation name", DEFAULT_CONFIG.machineName)
   .option("-o, --owner <ownerId>", "Owner / Lead Editor ID", DEFAULT_CONFIG.ownerId)
   .option("-c, --convex <url>", "Convex deployment URL (.convex.cloud or .convex.site)", DEFAULT_CONFIG.convexUrl)
+  .option("-l, --location <location>", "Physical location of this machine (e.g. \"Manila Office\")")
   .option("-q, --quarantine <path>", "Fallback quarantine folder (used only with --central-quarantine)", DEFAULT_CONFIG.quarantineRoot)
   .option("--central-quarantine", "Quarantine all drives into one folder instead of per-volume (per-volume is default and required for external drives)")
   .option("-r, --roots <paths>", "Comma-separated default scan roots")
@@ -934,6 +978,7 @@ program
       ownerId: options.owner,
       convexUrl: options.convex,
       authToken: options.authToken,
+      location: options.location,
       quarantineRoot: options.quarantine,
       quarantineOnSourceVolume: !options.centralQuarantine,
       scanRoots,
@@ -967,6 +1012,7 @@ program
   .requiredOption("--machine <name>", "Machine name this token was issued for")
   .option("-c, --convex <url>", "Convex deployment URL (.convex.cloud or .convex.site)", DEFAULT_CONVEX_URL)
   .option("-o, --owner <ownerId>", "Owner / Lead Editor ID")
+  .option("-l, --location <location>", "Physical location of this machine (e.g. \"Manila Office\")")
   .action(async (options) => {
     const config = loadConfig();
     const next: DriveOSConfig = {
@@ -975,6 +1021,7 @@ program
       machineName: options.machine,
       authToken: String(options.token).trim(),
       ownerId: options.owner || config.ownerId,
+      location: options.location || config.location,
     };
     enforceLocalStatePath("Agent data directory", AGENT_HOME);
 
@@ -990,6 +1037,7 @@ program
           ownerId: next.ownerId,
           agentVersion: AGENT_VERSION,
           platform: process.platform,
+          location: next.location,
         }),
       });
       if (res.status === 401) {

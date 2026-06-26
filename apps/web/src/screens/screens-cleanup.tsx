@@ -1,5 +1,5 @@
 import React from "react";
-import { useMutation } from "convex/react";
+import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convexApi";
 import { DB } from "@/data";
 import {
@@ -259,10 +259,16 @@ type QuarantineItem = any;
   // ============================================================
   //  QUARANTINE
   // ============================================================
+  const PURGE_REQUESTER = "founder";
+
   function QuarantineScreen({ go, toast }: ScreenProps) {
     const [items, setItems] = React.useState<QuarantineItem[]>(DB.quarantine);
     const [busyId, setBusyId] = React.useState<any>(null);
+    const [purging, setPurging] = React.useState(false);
     const markRestored = useMutation(api.cleanup.markQuarantineRestored);
+    const purgeExpired = useMutation(api.cleanup.purgeExpired);
+    // Live count of items past their rollback window, safe to permanently delete.
+    const purgeable = useQuery(api.cleanup.purgeableCount) || { count: 0, bytes: 0 };
     // Keep local list in sync when the live Convex query updates DB.quarantine.
     React.useEffect(() => { setItems(DB.quarantine); }, [DB.quarantine]);
     const totalGB = items.reduce((s, q) => s + q.sizeGB, 0);
@@ -279,11 +285,30 @@ type QuarantineItem = any;
         setBusyId(null);
       }
     };
-    const purge = (id: any) => { setItems((x) => x.filter((q) => q.id !== id)); toast("Permanently deleted", "trash", "risk"); };
+    // Permanently delete every item past its 14-day window. Irreversible, so it
+    // confirms first and only ever targets expired items (the backend enforces
+    // this too). The agent does the actual on-disk deletion on its next poll.
+    const onPurgeExpired = async () => {
+      if (purging || purgeable.count === 0) return;
+      if (!window.confirm(`Permanently delete ${purgeable.count} expired file(s) and free ${fmtGB(purgeable.bytes / (1024 ** 3))}? This cannot be undone.`)) return;
+      setPurging(true);
+      try {
+        const r = await purgeExpired({ requestedBy: PURGE_REQUESTER });
+        toast(`Queued ${r.queued} file(s) for permanent deletion`, "trash", "risk");
+      } catch (err: any) {
+        toast(err?.message || "Could not queue purge", "alert", "risk");
+      } finally {
+        setPurging(false);
+      }
+    };
 
     return h("div", { className: "page-inner" },
-      h(PageHead, { eyebrow: "Maintenance", title: "Quarantine", desc: "A safe deletion buffer. Files stay restorable for 30 days before they can be permanently removed.",
-        actions: [h("button", { key: 1, className: "btn", onClick: () => go("cleanup") }, h(Icon, { name: "chevL", size: 15 }), "Back to Cleanup")] }),
+      h(PageHead, { eyebrow: "Maintenance", title: "Quarantine", desc: "A safe deletion buffer. Files stay restorable for 14 days, then can be permanently removed to free disk space.",
+        actions: [
+          h("button", { key: 1, className: "btn", onClick: () => go("cleanup") }, h(Icon, { name: "chevL", size: 15 }), "Back to Cleanup"),
+          h("button", { key: 2, className: "btn danger", disabled: purging || purgeable.count === 0, onClick: onPurgeExpired },
+            h(Icon, { name: "trash", size: 15 }), purging ? "Queuing…" : purgeable.count > 0 ? `Empty expired (${purgeable.count})` : "Empty expired"),
+        ] }),
 
       h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "var(--gap)", marginBottom: "var(--gap)" } },
         qkpi("In Quarantine", fmtGB(totalGB), "shield", "var(--warn)"),
@@ -306,8 +331,7 @@ type QuarantineItem = any;
                 h("td", null, h("span", { className: "mono", style: { fontSize: 11.5, color: "var(--warn)" } }, q.deadline)),
                 h("td", { className: "num mono hi" }, fmtGB(q.sizeGB)),
                 h("td", null, h("div", { className: "row", style: { gap: 6, justifyContent: "flex-end" } },
-                  h("button", { className: "btn sm", disabled: busyId === q.id, onClick: () => restore(q.id) }, h(Icon, { name: "rotate", size: 13 }), busyId === q.id ? "…" : "Restore"),
-                  h("button", { className: "btn sm danger icon", title: "Permanently delete", onClick: () => purge(q.id) }, h(Icon, { name: "trash", size: 14 })))))))) ),
+                  h("button", { className: "btn sm", disabled: busyId === q.id, onClick: () => restore(q.id) }, h(Icon, { name: "rotate", size: 13 }), busyId === q.id ? "…" : "Restore"))))))) ),
 
       // audit log
       cardShell("Audit Log", "list", "var(--tx-mut)", null,
