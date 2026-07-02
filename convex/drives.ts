@@ -25,7 +25,7 @@ async function deleteDriveCatalog(
 ) {
   const files = await ctx.db
     .query("files")
-    .withIndex("by_drive", (q: any) => q.eq("driveId", driveId))
+    .withIndex("by_drive_path", (q: any) => q.eq("driveId", driveId))
     .collect();
   for (const f of files) await ctx.db.delete(f._id);
 
@@ -129,6 +129,15 @@ export const register = internalMutation({
     const resolvedLocation = args.location || machineLocation;
 
     if (existing) {
+      // One indexed read tells an upgrading agent whether it can trust its
+      // existing local hash cache as the delta baseline. Without this signal,
+      // agent 1.1 would re-send every row once just to establish uploadedFp —
+      // more than 10 million records in the current production catalog.
+      const catalogFile = await ctx.db
+        .query("files")
+        .withIndex("by_drive_path", (q) => q.eq("driveId", existing._id))
+        .first();
+
       await ctx.db.patch(existing._id, {
         label: args.label,
         machineId: args.machineId,
@@ -155,7 +164,10 @@ export const register = internalMutation({
         createdAt: timestamp,
       });
 
-      return existing._id;
+      // isNew tells the agent whether the backend already holds a catalog for
+      // this volume. A fresh row means any local "already uploaded" markers
+      // are stale (drive was forgotten/removed) and must be ignored.
+      return { driveId: existing._id, isNew: false, hasCatalog: Boolean(catalogFile) };
     } else {
       const driveId = await ctx.db.insert("drives", {
         tenantId,
@@ -187,7 +199,7 @@ export const register = internalMutation({
         createdAt: timestamp,
       });
 
-      return driveId;
+      return { driveId, isNew: true, hasCatalog: false };
     }
   },
 });

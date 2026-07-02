@@ -100,6 +100,17 @@ export default defineSchema({
     agentVersion: v.string(),
   }).index("by_tenant", ["tenantId"]),
 
+  // One row per tenant: gates the expensive post-scan analysis (duplicate
+  // detection + recommendations page the ENTIRE catalog). Automatic analysis
+  // is kill-switched by default; if explicitly enabled, it only runs when
+  // dirtyCount > 0 and at most once per tenant per day.
+  analysisState: defineTable({
+    tenantId: v.string(),
+    dirtyCount: v.number(), // files inserted/materially changed since last run
+    scheduled: v.boolean(), // an analysis run is already queued
+    lastRunAt: v.number(), // when analysis last STARTED (0 = never)
+  }).index("by_tenant", ["tenantId"]),
+
   files: defineTable({
     tenantId: v.optional(v.string()),
     projectId: v.optional(v.string()),
@@ -109,8 +120,11 @@ export default defineSchema({
     cloudFileId: v.optional(v.string()),
     source: v.string(), // "local" | "cloud"
     path: v.string(),
-    normalizedPath: v.string(),
-    parentPath: v.string(),
+    // Legacy denormalized copies of `path` (lowercased / dirname). Never queried
+    // anywhere; kept optional so old rows validate, but no longer written —
+    // together they roughly doubled per-document path bytes.
+    normalizedPath: v.optional(v.string()),
+    parentPath: v.optional(v.string()),
     name: v.string(),
     extension: v.string(),
     sizeBytes: v.number(),
@@ -131,19 +145,12 @@ export default defineSchema({
     scanSessionId: v.optional(v.string()),
     metadata: v.optional(v.any()),
   })
-    .index("by_fullHash", ["fullHash"])
-    .index("by_quickHash", ["quickHash"])
+    // Keep this index list minimal: `files` is by far the biggest table and
+    // every index multiplies its storage and write cost. Only indexes with an
+    // actual query site exist — resist adding "might need it" indexes here.
     .index("by_project", ["projectId"])
-    .index("by_drive", ["driveId"])
-    .index("by_machine", ["machineId"])
-    .index("by_classification", ["classification"])
-    .index("by_riskLevel", ["riskLevel"])
-    .index("by_sizeBytes", ["sizeBytes"])
-    .index("by_lastSeenAt", ["lastSeenAt"])
     .index("by_drive_path", ["driveId", "path"])
-    .index("by_tenant", ["tenantId"])
-    .index("by_tenant_fullHash", ["tenantId", "fullHash"])
-    .index("by_tenant_quickHash", ["tenantId", "quickHash"]),
+    .index("by_tenant", ["tenantId"]),
 
   projects: defineTable({
     tenantId: v.optional(v.string()),

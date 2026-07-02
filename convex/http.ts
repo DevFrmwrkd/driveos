@@ -32,7 +32,7 @@ function clientIp(request: Request) {
   return request.headers.get("cf-connecting-ip") || "unknown";
 }
 
-function post(path: string, handler: (ctx: any, body: any, machine?: any) => Promise<unknown>) {
+function post(path: string, handler: (ctx: any, body: any, machine?: any) => Promise<unknown | Response>) {
   http.route({
     path: `/api/${path}`,
     method: "POST",
@@ -66,7 +66,11 @@ function post(path: string, handler: (ctx: any, body: any, machine?: any) => Pro
       }
       try {
         const body = await request.json();
-        return json(await handler(ctx, body, machine));
+        const result = await handler(ctx, body, machine);
+        // Route handlers use Response for non-200 outcomes such as the upload
+        // circuit breaker. Wrapping a Response in json() turns it into "{}"
+        // with status 200 and silently defeats the safety limit.
+        return result instanceof Response ? result : json(result);
       } catch (err: any) {
         return json({ error: err.message || "Unknown DriveOS agent API error" }, 500);
       }
@@ -84,8 +88,13 @@ post("registerMachine", async (ctx, body, machine) => {
 });
 
 post("registerDrive", async (ctx, body, machine) => {
-  const driveId = await ctx.runMutation(internal.drives.register, scoped(body, machine));
-  return { success: true, driveId };
+  const result = await ctx.runMutation(internal.drives.register, scoped(body, machine));
+  return {
+    success: true,
+    driveId: result.driveId,
+    isNew: result.isNew,
+    hasCatalog: result.hasCatalog,
+  };
 });
 
 post("removeDrive", async (ctx, body, machine) => {
@@ -104,6 +113,28 @@ post("completeScan", async (ctx, body, machine) => {
 });
 
 post("uploadBatch", async (ctx, body, machine) => {
+  if (!Array.isArray(body?.files) || body.files.length < 1 || body.files.length > 100) {
+    return json({ error: "uploadBatch requires between 1 and 100 files." }, 400);
+  }
+
+  // Hard daily budget per tenant, consumed per file. A 429 here tells the
+  // agent to abort the scan pass — the general per-call limit above can't
+  // catch well-paced agents that re-upload an entire catalog. Tenant scope
+  // prevents several machines from multiplying the ceiling.
+  const fileCount = body.files.length;
+  const budget = await ctx.runMutation(internal.rateLimits.checkUploadBudget, {
+    tenantId: machine.tenantId,
+    count: fileCount,
+  });
+  if (!budget.ok) {
+    return new Response(
+      JSON.stringify({
+        error: "Daily file sync budget exhausted for this workspace. The scan will resume on a later cycle.",
+        code: "UPLOAD_BUDGET_EXCEEDED",
+      }),
+      { status: 429, headers: { "Content-Type": "application/json", "Retry-After": String(Math.ceil((budget.retryAfter || 60_000) / 1000)) } }
+    );
+  }
   return await ctx.runMutation(internal.files.uploadBatch, scoped(body, machine));
 });
 

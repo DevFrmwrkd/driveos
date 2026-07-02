@@ -16,6 +16,15 @@ export const rateLimiter = new RateLimiter(components.rateLimiter, {
   // to slow token-guessing against the /api/* routes.
   agentApiAnon: { kind: "token bucket", rate: 20, period: MINUTE, capacity: 20 },
 
+  // Hard daily budget on file-metadata upserts, keyed per tenant and consumed
+  // per FILE (not per call). This is the backstop that makes a runaway agent
+  // (or a bug reintroducing full-catalog re-uploads) physically unable to burn
+  // database bandwidth. The 250k burst permits a large initial catalog; after
+  // that the whole workspace can submit at most 100k changed records/day.
+  // At the observed document sizes this caps this path well below 1% of the
+  // incident's ~41 GB/day while healthy delta sync uses a tiny fraction.
+  agentFileSync: { kind: "token bucket", rate: 100_000, period: 24 * HOUR, capacity: 250_000 },
+
   // Dashboard: issuing/rotating machine tokens, keyed per team member.
   issueToken: { kind: "token bucket", rate: 20, period: HOUR, capacity: 10 },
 
@@ -34,5 +43,21 @@ export const checkAgentRateLimit = internalMutation({
   handler: async (ctx, args) => {
     const name = args.authenticated ? "agentApi" : "agentApiAnon";
     return await rateLimiter.limit(ctx, name, { key: args.key });
+  },
+});
+
+// Per-tenant daily file-upsert budget, consumed per file in the batch. Called
+// from the uploadBatch HTTP route; a failure means the workspace exhausted its
+// quota and every agent should stop sending catalog rows until refill.
+export const checkUploadBudget = internalMutation({
+  args: {
+    tenantId: v.string(),
+    count: v.number(),
+  },
+  handler: async (ctx, args) => {
+    return await rateLimiter.limit(ctx, "agentFileSync", {
+      key: args.tenantId,
+      count: Math.max(1, args.count),
+    });
   },
 });

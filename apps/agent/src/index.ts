@@ -36,6 +36,11 @@ interface HashCacheEntry {
   modifiedAt: number;
   quickHash: string;
   fullHash?: string;
+  // Fingerprint of the metadata last SUCCESSFULLY uploaded to Convex. When the
+  // current fingerprint matches, the file is skipped entirely during sync —
+  // re-uploading the whole unchanged catalog every hour is what once burned
+  // ~250 GB of database bandwidth in a week. Unset (or stale) → upload.
+  uploadedFp?: string;
 }
 
 // Persisted scheduler state. Survives restart so pause/resume and the
@@ -68,8 +73,12 @@ interface FileMetadata {
   isProjectFile: boolean;
 }
 
-const AGENT_VERSION = "1.0.0";
+const AGENT_VERSION = "1.1.0";
 const ONE_MB = 1024 * 1024;
+// Metadata for sub-megabyte generic files costs more than the records are
+// worth and cache trees can contain millions of them. This floor is enforced
+// even if a legacy config requested a smaller minimum.
+const MIN_CATALOG_FILE_SIZE_BYTES = ONE_MB;
 const DEFAULT_CONVEX_URL = process.env.NEXT_PUBLIC_CONVEX_URL || process.env.DRIVEOS_CONVEX_URL || "https://determined-anaconda-827.convex.cloud";
 
 const LEGACY_CONFIG_PATH = path.resolve("./driveos-config.json");
@@ -306,38 +315,81 @@ function resolveConvexHttpUrl(convexUrl: string) {
   return trimmed.replace(".convex.cloud", ".convex.site");
 }
 
+// The backend answered 429: this machine or workspace hit its safety budget.
+// The caller must stop sending, not log-and-continue.
+class RateLimitedError extends Error {
+  retryAfterSeconds: number;
+  constructor(message: string, retryAfterSeconds: number) {
+    super(message);
+    this.name = "RateLimitedError";
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+class BackendSyncError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BackendSyncError";
+  }
+}
+
+function recordSyncFailure(endpoint: string, message: string) {
+  ensureAgentHome();
+  // Never persist the request payload here. A failed uploadBatch can contain
+  // hundreds of KB of metadata and the old offline log could fill the disk
+  // while Convex was unavailable.
+  fs.appendFileSync(
+    OFFLINE_LOG_PATH,
+    `[${new Date().toISOString()}] ${endpoint}: ${message}\n`,
+    "utf-8"
+  );
+}
+
 async function syncToConvex(endpoint: string, payload: any) {
   const config = loadConfig();
   const baseUrl = resolveConvexHttpUrl(config.convexUrl);
   const url = `${baseUrl}/api/${endpoint}`;
   console.log(`[Convex Sync] POST ${url}`);
 
+  let response: Response;
+  let text: string;
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (config.authToken) headers.Authorization = `Bearer ${config.authToken}`;
 
-    const response = await fetch(url, {
+    response = await fetch(url, {
       method: "POST",
       headers,
       body: JSON.stringify(payload),
     });
-
-    const text = await response.text();
-    const body = text ? JSON.parse(text) : {};
-    if (!response.ok) {
-      throw new Error(body.error || `HTTP Error: ${response.status} ${response.statusText}`);
-    }
-    return body;
+    text = await response.text();
   } catch (err: any) {
-    console.warn(`[Convex Offline Mode] ${endpoint} failed: ${err.message}`);
-    ensureAgentHome();
-    fs.appendFileSync(
-      OFFLINE_LOG_PATH,
-      `[${new Date().toISOString()}] ${endpoint}: ${JSON.stringify(payload)}\n`,
-      "utf-8"
-    );
-    return { success: true, offline: true };
+    const message = err?.message || "Network request failed";
+    console.warn(`[Convex Sync Stopped] ${endpoint} failed: ${message}`);
+    recordSyncFailure(endpoint, message);
+    throw new BackendSyncError(message);
   }
+
+  let body: any = {};
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    // Non-JSON error page; fall through with the raw status below.
+  }
+
+  if (response.status === 429) {
+    const retryAfter = Number(response.headers.get("Retry-After")) || 60;
+    throw new RateLimitedError(body.error || "Rate limited by backend", retryAfter);
+  }
+
+  if (!response.ok) {
+    const message = body.error || `HTTP Error: ${response.status} ${response.statusText}`;
+    console.warn(`[Convex Sync Stopped] ${endpoint} failed: ${message}`);
+    recordSyncFailure(endpoint, message);
+    throw new BackendSyncError(message);
+  }
+
+  return body;
 }
 
 async function calculateQuickHash(filePath: string, sizeBytes: number): Promise<string> {
@@ -431,7 +483,10 @@ async function buildFileMetadata(
     fullHash = await calculateFullHash(filePath);
   }
 
+  // Spread first: a plain overwrite would drop uploadedFp and silently turn
+  // every scan back into a full re-upload.
   hashCache[cacheKey] = {
+    ...hashCache[cacheKey],
     sizeBytes: statObj.size,
     modifiedAt: statObj.mtimeMs,
     quickHash,
@@ -459,6 +514,45 @@ async function buildFileMetadata(
     isFinal: classification === "EXPORT_FINAL",
     isProjectFile: isProjectFileName(entry),
   };
+}
+
+// Everything the backend stores about a file, in one comparable string. If the
+// current fingerprint equals the one recorded at the last successful upload,
+// the backend already has identical data and the file is skipped. The derived
+// flags (isGenerated/isRaw/isFinal) follow classification, so covering
+// classification covers them too.
+function metadataFingerprint(meta: FileMetadata): string {
+  return [
+    meta.sizeBytes,
+    meta.modifiedAtFile,
+    meta.quickHash ?? "",
+    meta.fullHash ?? "",
+    meta.classification,
+    meta.riskLevel,
+    meta.isProjectFile ? 1 : 0,
+  ].join("|");
+}
+
+// Must mirror the cacheKey built in buildFileMetadata.
+function cacheKeyFor(meta: FileMetadata): string {
+  return `${meta.path}-${meta.sizeBytes}`;
+}
+
+// Record a successful upload in the hash cache so the next scan skips these
+// files. Only called after the backend confirmed the batch (never in offline
+// mode) — an unstamped file simply retries on the next cycle.
+function stampUploaded(hashCache: Record<string, HashCacheEntry>, files: FileMetadata[]) {
+  for (const meta of files) {
+    const key = cacheKeyFor(meta);
+    hashCache[key] = {
+      ...hashCache[key],
+      sizeBytes: meta.sizeBytes,
+      modifiedAt: meta.modifiedAtFile,
+      quickHash: meta.quickHash || hashCache[key]?.quickHash || "",
+      fullHash: meta.fullHash ?? hashCache[key]?.fullHash,
+      uploadedFp: metadataFingerprint(meta),
+    };
+  }
 }
 
 async function walkFiles(
@@ -719,6 +813,9 @@ interface ScanOptions {
   // In-memory hash cache shared across all volumes in one sync cycle, so they
   // don't reload each other's mid-scan writes.
   sharedHashCache?: Record<string, HashCacheEntry>;
+  // Ignore uploadedFp and re-send every file (first sync or explicit
+  // --force-full). Normal cycles upload only what changed.
+  forceFullUpload?: boolean;
 }
 
 interface ScanResult {
@@ -726,6 +823,9 @@ interface ScanResult {
   byteCount: number;
   errorsCount: number;
   skippedUnstable: number;
+  uploadedCount: number;
+  skippedUnchanged: number;
+  baselinedCount: number;
 }
 
 // Single batched scan of one directory: register machine/drive, open a scan
@@ -743,7 +843,12 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
   const driveMetrics = getDriveMetrics(scanDir);
   const cloudProvider = cloudSyncProvider(scanDir);
 
-  const minBytes = options.minFileSizeBytes ?? config.minFileSizeBytes;
+  // A legacy config may contain 0 here. Never allow it to turn cache crumbs and
+  // sidecar files into millions of database documents again.
+  const minBytes = Math.max(
+    MIN_CATALOG_FILE_SIZE_BYTES,
+    options.minFileSizeBytes ?? config.minFileSizeBytes
+  );
   const maxBytes = options.maxFileSizeBytes ?? Infinity;
   const sizeRange = Number.isFinite(maxBytes)
     ? `${Math.round(minBytes / ONE_MB)}–${Math.round(maxBytes / ONE_MB)} MB`
@@ -775,6 +880,25 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
     tier: cloudProvider ? "cloud" : "hot",
   });
   const driveId = driveRes.driveId;
+  const canBootstrapDeltaBaseline = driveRes.hasCatalog === true;
+
+  // The backend just created this drive row, so it holds no catalog for it
+  // (first-ever scan, or the drive was forgotten/removed and re-added). Any
+  // local "already uploaded" stamps under this root are stale — drop them so
+  // this scan re-sends everything instead of skipping into an empty catalog.
+  if (driveRes.isNew) {
+    const rootPrefix = scanDir.endsWith(path.sep) ? scanDir : scanDir + path.sep;
+    let cleared = 0;
+    for (const key of Object.keys(hashCache)) {
+      if (hashCache[key].uploadedFp && key.startsWith(rootPrefix)) {
+        delete hashCache[key].uploadedFp;
+        cleared++;
+      }
+    }
+    if (cleared > 0) {
+      console.log(`[Delta Sync] Backend has no catalog for ${scanDir} — re-uploading all ${cleared} previously synced file(s).`);
+    }
+  }
 
   const scanRes = await syncToConvex("startScan", {
     machineId,
@@ -785,7 +909,20 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
   const sessionId = scanRes.sessionId || `offline-${Date.now()}`;
 
   const fileBatch: FileMetadata[] = [];
-  const result: ScanResult = { fileCount: 0, byteCount: 0, errorsCount: 0, skippedUnstable: 0 };
+  const result: ScanResult = {
+    fileCount: 0,
+    byteCount: 0,
+    errorsCount: 0,
+    skippedUnstable: 0,
+    uploadedCount: 0,
+    skippedUnchanged: 0,
+    baselinedCount: 0,
+  };
+
+  // Set when the backend rejects an upload or becomes unavailable. The rest of
+  // the walk becomes a no-op instead of hammering the same failing endpoint.
+  // Whatever wasn't confirmed stays unstamped and retries on a later cycle.
+  let uploadStopped = false;
 
   // Uploads run as a background chain so hashing never stalls on the network.
   // Each link catches its own error to keep the chain alive; backpressure in
@@ -795,15 +932,23 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
 
   async function flushBatch(final = false) {
     const batch = fileBatch.splice(0, fileBatch.length);
-    if (batch.length > 0) {
+    if (batch.length > 0 && !uploadStopped) {
       pendingUploads++;
       uploadChain = uploadChain
         .then(async () => {
+          if (uploadStopped) return;
           console.log(`[${final ? "Final " : ""}Batch Upload] Syncing ${batch.length} file(s) to Convex`);
           await syncToConvex("uploadBatch", { scanSessionId: sessionId, machineId, driveId, files: batch });
+          stampUploaded(hashCache, batch);
+          result.uploadedCount += batch.length;
           saveHashCacheThrottled(hashCache);
         })
         .catch((err: any) => {
+          uploadStopped = true;
+          if (err instanceof RateLimitedError) {
+            console.warn(`[Upload Budget] Backend rate limit hit — stopping uploads for this scan (retry in ~${err.retryAfterSeconds}s or next cycle): ${err.message}`);
+            return;
+          }
           result.errorsCount++;
           console.warn(`[Upload Error] Batch of ${batch.length} file(s) failed: ${err.message}`);
         })
@@ -822,6 +967,7 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
   const inFlight = new Set<Promise<void>>();
 
   const processFile = async (filePath: string, statObj: fs.Stats) => {
+    if (uploadStopped) return;
     try {
       // Skip files that are still being written so we never index a half-flushed
       // export. Only files modified in the last minute can be mid-write, so the
@@ -833,9 +979,38 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
         console.log(`[Scan Skip] File still changing, deferring to next cycle: ${filePath}`);
         return;
       }
-      fileBatch.push(await buildFileMetadata(filePath, statObj, hashCache, calculateFull));
+      const existingCacheEntry = hashCache[`${filePath}-${statObj.size}`];
+      const meta = await buildFileMetadata(filePath, statObj, hashCache, calculateFull);
       result.fileCount++;
       result.byteCount += statObj.size;
+
+      // Upgrade bridge from agent 1.0: its hash cache predates uploadedFp, but
+      // registerDrive confirmed this drive already has a backend catalog. Trust
+      // only cache entries that still match the current stat/hash. This avoids
+      // a one-time 10M-row replay merely to establish the delta baseline.
+      if (
+        !options.forceFullUpload &&
+        canBootstrapDeltaBaseline &&
+        !existingCacheEntry?.uploadedFp &&
+        existingCacheEntry?.modifiedAt === meta.modifiedAtFile &&
+        existingCacheEntry.quickHash === meta.quickHash &&
+        existingCacheEntry.fullHash === meta.fullHash
+      ) {
+        stampUploaded(hashCache, [meta]);
+        result.skippedUnchanged++;
+        result.baselinedCount++;
+        return;
+      }
+
+      // Delta sync: the backend already has this exact metadata — skip the
+      // upload entirely. This is the change that turns an hourly cycle over an
+      // unchanged catalog into ~zero Convex traffic.
+      if (!options.forceFullUpload && hashCache[cacheKeyFor(meta)]?.uploadedFp === metadataFingerprint(meta)) {
+        result.skippedUnchanged++;
+        return;
+      }
+
+      fileBatch.push(meta);
       if (fileBatch.length >= 100) await flushBatch();
     } catch (err: any) {
       result.errorsCount++;
@@ -867,11 +1042,15 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
   saveHashCache(hashCache);
   await syncToConvex("completeScan", {
     sessionId,
-    status: result.errorsCount > 0 ? "partial" : "completed",
+    status: uploadStopped || result.errorsCount > 0 ? "partial" : "completed",
     errorsCount: result.errorsCount,
+    // True walk totals: with delta sync the per-batch progress counts only
+    // changed files, so the session record gets the real numbers here.
+    filesSeen: result.fileCount,
+    bytesSeen: result.byteCount,
   });
 
-  console.log(`[Scan Complete] ${scanDir} — ${result.fileCount} file(s), ${(result.byteCount / 1024 ** 4).toFixed(2)} TB, errors: ${result.errorsCount}, deferred: ${result.skippedUnstable}`);
+  console.log(`[Scan Complete] ${scanDir} — ${result.fileCount} file(s) seen (${result.uploadedCount} uploaded, ${result.skippedUnchanged} unchanged, ${result.baselinedCount} baselined from agent 1.0 cache), ${(result.byteCount / 1024 ** 4).toFixed(2)} TB, errors: ${result.errorsCount}, deferred: ${result.skippedUnstable}`);
   return result;
 }
 
@@ -890,7 +1069,23 @@ async function runSyncCycle(config: DriveOSConfig, options: ScanOptions = {}): P
   }
 
   saveState({ lastSyncStartedAt: new Date().toISOString() });
-  const totals: ScanResult = { fileCount: 0, byteCount: 0, errorsCount: 0, skippedUnstable: 0 };
+  const totals: ScanResult = {
+    fileCount: 0,
+    byteCount: 0,
+    errorsCount: 0,
+    skippedUnstable: 0,
+    uploadedCount: 0,
+    skippedUnchanged: 0,
+    baselinedCount: 0,
+  };
+
+  // Full-catalog uploads are manual only. Even a no-op server mutation must
+  // read each existing document, so an automatic weekly "self-heal" would
+  // reintroduce a predictable bandwidth spike.
+  const forceFullUpload = Boolean(options.forceFullUpload);
+  if (forceFullUpload) {
+    console.log("[Sync] Manual full upload cycle: re-sending all file metadata (--force-full).");
+  }
 
   // One shared hash cache for the whole cycle: every volume reads and writes the
   // same in-memory object, so a mid-scan save by one volume can't corrupt what
@@ -924,11 +1119,14 @@ async function runSyncCycle(config: DriveOSConfig, options: ScanOptions = {}): P
         continue;
       }
       try {
-        const res = await performScan(resolved, config, { ...options, checkStability: true, sharedHashCache, ...pass });
+        const res = await performScan(resolved, config, { ...options, checkStability: true, sharedHashCache, ...pass, forceFullUpload });
         totals.fileCount += res.fileCount;
         totals.byteCount += res.byteCount;
         totals.errorsCount += res.errorsCount;
         totals.skippedUnstable += res.skippedUnstable;
+        totals.uploadedCount += res.uploadedCount;
+        totals.skippedUnchanged += res.skippedUnchanged;
+        totals.baselinedCount += res.baselinedCount;
       } catch (err: any) {
         console.error(`[Sync] Scan of ${resolved} failed: ${err.message}`);
         totals.errorsCount++;
@@ -941,7 +1139,7 @@ async function runSyncCycle(config: DriveOSConfig, options: ScanOptions = {}): P
     lastSyncFiles: totals.fileCount,
     lastSyncBytes: totals.byteCount,
   });
-  console.log(`[Sync Cycle Complete] ${totals.fileCount} file(s) across ${roots.length} root(s), ${(totals.byteCount / 1024 ** 4).toFixed(2)} TB.`);
+  console.log(`[Sync Cycle Complete] ${totals.fileCount} file(s) across ${roots.length} root(s), ${(totals.byteCount / 1024 ** 4).toFixed(2)} TB — ${totals.uploadedCount} uploaded, ${totals.skippedUnchanged} unchanged (skipped), ${totals.baselinedCount} upgrade-baselined.`);
   return totals;
 }
 
@@ -1143,6 +1341,7 @@ program
   .option("--full-hash", "Calculate streaming SHA-256 full hashes for this scan")
   .option("--allow-cloud-root", "Allow scanning a cloud-synced folder as metadata-only")
   .option("--check-stability", "Skip files that are still being written")
+  .option("--force-full", "Re-upload all metadata even if unchanged since the last sync")
   .action(async (options) => {
     const scanDir = path.resolve(options.path);
     if (!fs.existsSync(scanDir)) {
@@ -1154,6 +1353,7 @@ program
       fullHash: Boolean(options.fullHash),
       allowCloudRoot: Boolean(options.allowCloudRoot),
       checkStability: Boolean(options.checkStability),
+      forceFullUpload: Boolean(options.forceFull),
     });
   });
 
@@ -1164,18 +1364,23 @@ program
   .option("--once", "Run a single sync cycle and exit (no scheduling)")
   .option("--full-hash", "Calculate streaming SHA-256 full hashes during scans")
   .option("--allow-cloud-root", "Allow cloud-synced roots as metadata-only")
+  .option("--force-full", "Re-upload all metadata even if unchanged since the last sync")
   .action(async (options) => {
     const config = loadConfig();
     validateRuntimeConfig(config);
     const scanOpts: ScanOptions = {
       fullHash: Boolean(options.fullHash),
       allowCloudRoot: Boolean(options.allowCloudRoot),
+      forceFullUpload: Boolean(options.forceFull),
     };
     const intervalMs = Math.max(1, Number(options.intervalMinutes) || 60) * 60 * 1000;
 
     // Always run an immediate catch-up cycle on start (unless paused), then pick
     // up any jobs approved in the dashboard.
     await runSyncCycle(config, scanOpts);
+    // --force-full applies to the first cycle only; scheduled cycles fall back
+    // to delta sync.
+    scanOpts.forceFullUpload = false;
     await runPendingJobs(config);
     if (options.once) return;
 
@@ -1203,12 +1408,14 @@ program
   .description("Flush a sync cycle immediately across all configured roots (ignores schedule, respects pause)")
   .option("--full-hash", "Calculate streaming SHA-256 full hashes for this scan")
   .option("--allow-cloud-root", "Allow cloud-synced roots as metadata-only")
+  .option("--force-full", "Re-upload all metadata even if unchanged since the last sync")
   .action(async (options) => {
     const config = loadConfig();
     validateRuntimeConfig(config);
     const res = await runSyncCycle(config, {
       fullHash: Boolean(options.fullHash),
       allowCloudRoot: Boolean(options.allowCloudRoot),
+      forceFullUpload: Boolean(options.forceFull),
     });
     if (!res) process.exitCode = 0;
   });
@@ -1264,12 +1471,12 @@ program
   .option("--interval-minutes <minutes>", "Batch upload interval; defaults to hourly", "60")
   .option("--debounce-seconds <seconds>", "Wait for files to settle before queueing metadata", "8")
   .option("--allow-cloud-root", "Allow watching a cloud-synced folder as metadata-only")
-  .action((options) => {
+  .action(async (options) => {
     const watchDir = path.resolve(options.path);
     const config = loadConfig();
     validateRuntimeConfig(config);
     const hashCache = loadHashCache();
-    let queue: FileMetadata[] = [];
+    let queue = new Map<string, FileMetadata>();
     const pending = new Map<string, NodeJS.Timeout>();
     const intervalMs = Math.max(1, Number(options.intervalMinutes) || 60) * 60 * 1000;
     const debounceMs = Math.max(1, Number(options.debounceSeconds) || 8) * 1000;
@@ -1280,25 +1487,101 @@ program
     }
     enforceTrackableRoot("Watch target", watchDir, Boolean(options.allowCloudRoot));
 
+    // Resolve the same catalog root/drive identity used by scheduled scans.
+    // The old watcher omitted driveId and used a fake scanSessionId, which made
+    // watched files distinct from the same paths uploaded by the scanner.
+    const containingRoots = config.scanRoots
+      .map((root) => path.resolve(root))
+      .filter((root) => {
+        const relative = path.relative(root, watchDir);
+        return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+      })
+      .sort((a, b) => b.length - a.length);
+    const catalogRoot = containingRoots[0] || watchDir;
+    const cloudProvider = cloudSyncProvider(catalogRoot);
+    const machineRes = await syncToConvex("registerMachine", {
+      name: config.machineName,
+      ownerId: config.ownerId,
+      agentVersion: AGENT_VERSION,
+      platform: process.platform,
+      location: config.location,
+    });
+    const machineId = machineRes.machineId;
+    const driveMetrics = getDriveMetrics(catalogRoot);
+    const driveRes = await syncToConvex("registerDrive", {
+      label: path.basename(catalogRoot),
+      volumeId: `${process.platform}:${catalogRoot}`,
+      machineId,
+      ownerId: config.ownerId,
+      ...driveMetrics,
+      filesystem: cloudProvider ? "cloud" : driveMetrics.filesystem,
+      mountPath: catalogRoot,
+      tier: cloudProvider ? "cloud" : "hot",
+    });
+    const driveId = driveRes.driveId;
+
+    if (driveRes.isNew) {
+      const rootPrefix = catalogRoot.endsWith(path.sep) ? catalogRoot : catalogRoot + path.sep;
+      for (const key of Object.keys(hashCache)) {
+        if (key.startsWith(rootPrefix)) delete hashCache[key].uploadedFp;
+      }
+      saveHashCache(hashCache);
+    }
+
     // Flushes the accumulated local change-queue as ONE batched upload cycle.
     // Only ever called on the interval timer or the safety cap — never per FS event.
     async function processQueue() {
-      if (queue.length === 0) return;
+      if (queue.size === 0) return;
       if (loadState().paused) {
-        console.log(`[Watcher Paused] Holding ${queue.length} queued change(s) until resume.`);
+        console.log(`[Watcher Paused] Holding ${queue.size} queued change(s) until resume.`);
         return;
       }
-      const batch = queue;
-      queue = [];
+      const batch = Array.from(queue.values());
+      queue = new Map<string, FileMetadata>();
       console.log(`[Watcher Batch] Flushing ${batch.length} file change(s) to Convex`);
+
+      const scanRes = await syncToConvex("startScan", {
+        machineId,
+        driveId,
+        rootPath: catalogRoot,
+        agentVersion: AGENT_VERSION,
+      });
+      const sessionId = scanRes.sessionId;
+      let partial = false;
+
       for (let i = 0; i < batch.length; i += 100) {
-        await syncToConvex("uploadBatch", {
-          scanSessionId: `watch-${config.machineName}`,
-          machineId: config.machineName,
-          files: batch.slice(i, i + 100),
-        });
+        const slice = batch.slice(i, i + 100);
+        try {
+          await syncToConvex("uploadBatch", {
+            scanSessionId: sessionId,
+            machineId,
+            driveId,
+            files: slice,
+          });
+          stampUploaded(hashCache, slice);
+        } catch (err: any) {
+          partial = true;
+          // Put the unsent remainder back without duplicating repeated events
+          // for the same path.
+          for (const meta of batch.slice(i)) {
+            if (!queue.has(meta.path)) queue.set(meta.path, meta);
+          }
+          if (err instanceof RateLimitedError) {
+            console.warn(`[Watcher Budget] Backend rate limit hit — holding ${batch.length - i} change(s) for the next interval.`);
+          } else {
+            console.warn(`[Watcher Sync] Upload stopped — holding ${batch.length - i} change(s): ${err.message}`);
+          }
+          break;
+        }
       }
       saveHashCache(hashCache);
+      await syncToConvex("completeScan", {
+        sessionId,
+        status: partial ? "partial" : "completed",
+        errorsCount: partial ? 1 : 0,
+        filesSeen: batch.length,
+        bytesSeen: batch.reduce((total, file) => total + file.sizeBytes, 0),
+      });
     }
 
     // Builds metadata into the local queue. Does NOT upload — uploads happen only
@@ -1306,14 +1589,18 @@ program
     async function enqueue(filePath: string) {
       try {
         const statObj = fs.statSync(filePath);
-        if (!statObj.isFile() || statObj.size < config.minFileSizeBytes) return;
+        if (!statObj.isFile() || statObj.size < Math.max(config.minFileSizeBytes, MIN_CATALOG_FILE_SIZE_BYTES)) return;
         if (!(await isFileStable(filePath))) {
           console.log(`[Watcher Stable Check] Skipping actively changing file until next event: ${filePath}`);
           return;
         }
-        queue.push(await buildFileMetadata(filePath, statObj, hashCache, config.fullHash));
+        const meta = await buildFileMetadata(filePath, statObj, hashCache, config.fullHash);
+        // Event fired but nothing the backend stores actually changed (e.g.
+        // atime-only touches) — skip the upload.
+        if (hashCache[cacheKeyFor(meta)]?.uploadedFp === metadataFingerprint(meta)) return;
+        queue.set(meta.path, meta);
         // Safety cap only — bounds memory if a huge burst arrives between intervals.
-        if (queue.length >= 500) {
+        if (queue.size >= 500) {
           console.log("[Watcher Cap] Local queue reached 500 — flushing early to bound memory.");
           await processQueue();
         }
