@@ -1,6 +1,6 @@
 {
   "name": "driveos-desktop",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "DriveOS Agent — desktop tray app for non-technical editors",
   "main": "dist/main.js",
