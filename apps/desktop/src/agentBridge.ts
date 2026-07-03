@@ -81,10 +81,14 @@ export async function connect(opts: {
 }
 
 export async function scanNow(): Promise<{ ok: boolean; message: string }> {
-  const { stdout, stderr } = await runAgent(["scan-now"], 0);
+  // Cap the scan so the "Scanning…" button always clears. Previously this ran
+  // with no timeout (0), so a hung upload left the button spinning forever. Two
+  // hours is well beyond a real large-drive scan; past that it's stuck, not slow.
+  // (The agent's own per-request fetch timeout normally prevents reaching this.)
+  const { stdout, stderr } = await runAgent(["scan-now"], 2 * 60 * 60 * 1000);
   const out = (stdout + stderr).trim();
   const ok = /Sync Cycle Complete|Scan Complete/i.test(out);
-  const summary = out.split("\n").filter((l) => /Cycle Complete|paused|Unauthorized|unavailable/i.test(l)).pop();
+  const summary = out.split("\n").filter((l) => /Cycle Complete|paused|Unauthorized|unavailable|already running/i.test(l)).pop();
   return { ok, message: summary || "Scan finished." };
 }
 

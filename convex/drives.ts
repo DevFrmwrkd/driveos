@@ -1,6 +1,12 @@
 import { v } from "convex/values";
 import { internalMutation, mutation, query } from "./_generated/server";
+import { internal } from "./_generated/api";
 import { requireMember, inTenant } from "./access";
+
+// Max file rows deleted per transaction when removing a drive's catalog. Convex
+// caps reads/writes per mutation (~a few thousand); a drive can hold millions of
+// files, so deletion is paged and self-reschedules until the catalog is empty.
+const DRIVE_FILE_DELETE_BATCH = 500;
 
 export const list = query({
   args: {},
@@ -13,9 +19,11 @@ export const list = query({
   },
 });
 
-// Shared catalog removal: drop the drive and its file records. Used by both the
-// web "Stop tracking" button and the agent's forget-drive command. Only affects
-// DriveOS's catalog — never touches the actual disk.
+// Shared catalog removal: drop the drive row now, then delete its file records
+// in the background in bounded pages. Used by both the web "Stop tracking"
+// button and the agent's forget-drive command. Only affects DriveOS's catalog —
+// never touches the actual disk. Returns immediately; a drive with millions of
+// files would otherwise blow the per-mutation limit in one shot.
 async function deleteDriveCatalog(
   ctx: any,
   driveId: any,
@@ -23,12 +31,7 @@ async function deleteDriveCatalog(
   actorId: string | undefined,
   label: string
 ) {
-  const files = await ctx.db
-    .query("files")
-    .withIndex("by_drive_path", (q: any) => q.eq("driveId", driveId))
-    .collect();
-  for (const f of files) await ctx.db.delete(f._id);
-
+  // Delete the drive row first so it disappears from the dashboard at once.
   await ctx.db.delete(driveId);
 
   await ctx.db.insert("auditLogs", {
@@ -37,12 +40,40 @@ async function deleteDriveCatalog(
     action: "drive_remove",
     entityType: "drive",
     entityId: driveId,
-    message: `Stopped tracking drive "${label}" and removed ${files.length} file record(s).`,
+    message: `Stopped tracking drive "${label}". Removing its file records in the background.`,
     createdAt: Date.now(),
   });
 
-  return files.length;
+  // Kick off paged file deletion (bounded per transaction, self-reschedules).
+  await ctx.scheduler.runAfter(0, internal.drives.purgeDriveFiles, {
+    driveId: String(driveId),
+    deleted: 0,
+  });
 }
+
+// Delete one page of a removed drive's file rows, then reschedule itself until
+// none remain. Each run stays well under the per-mutation write limit.
+export const purgeDriveFiles = internalMutation({
+  args: { driveId: v.string(), deleted: v.number() },
+  handler: async (ctx, args) => {
+    const driveId = ctx.db.normalizeId("drives", args.driveId);
+    if (!driveId) return; // malformed id; nothing to do
+    const page = await ctx.db
+      .query("files")
+      .withIndex("by_drive_path", (q) => q.eq("driveId", driveId))
+      .take(DRIVE_FILE_DELETE_BATCH);
+
+    for (const f of page) await ctx.db.delete(f._id);
+
+    if (page.length === DRIVE_FILE_DELETE_BATCH) {
+      // More rows remain — continue in the next transaction.
+      await ctx.scheduler.runAfter(0, internal.drives.purgeDriveFiles, {
+        driveId: args.driveId,
+        deleted: args.deleted + page.length,
+      });
+    }
+  },
+});
 
 // Stop tracking a drive from the web dashboard. Requires a signed-in team member
 // and the drive must belong to their workspace.
@@ -56,8 +87,8 @@ export const remove = mutation({
     const drive = inTenant(await ctx.db.get(driveId), tenantId);
     if (!drive) return { removed: false };
 
-    const filesRemoved = await deleteDriveCatalog(ctx, driveId, tenantId, email, drive.label);
-    return { removed: true, filesRemoved };
+    await deleteDriveCatalog(ctx, driveId, tenantId, email, drive.label);
+    return { removed: true };
   },
 });
 
@@ -76,8 +107,8 @@ export const removeByVolumeId = internalMutation({
       .first();
     if (!drive) return { removed: false };
 
-    const filesRemoved = await deleteDriveCatalog(ctx, drive._id, tenantId, args.machineId, drive.label);
-    return { removed: true, filesRemoved };
+    await deleteDriveCatalog(ctx, drive._id, tenantId, args.machineId, drive.label);
+    return { removed: true };
   },
 });
 

@@ -96,6 +96,41 @@ const CONFIG_PATH = path.join(AGENT_HOME, "driveos-config.json");
 const HASH_CACHE_PATH = path.join(AGENT_HOME, "driveos-hash-cache.json");
 const OFFLINE_LOG_PATH = path.join(AGENT_HOME, "driveos-agent-offline-log.txt");
 const STATE_PATH = path.join(AGENT_HOME, "driveos-agent-state.json");
+const SCAN_LOCK_PATH = path.join(AGENT_HOME, "driveos-scan.lock");
+// A scan older than this is treated as dead (crashed process) and its lock can
+// be taken over — otherwise a hard crash would block scans until manual cleanup.
+const SCAN_LOCK_STALE_MS = 30 * 60 * 1000;
+
+// Only one scan may run at a time across the whole machine. Before this, the
+// hourly `sync` daemon and a manual `scan-now` could run concurrently, each
+// writing driveos-hash-cache.json and clobbering the other's "already uploaded"
+// stamps — so neither converged and the agent re-scanned/re-uploaded forever
+// (the "stuck in a loop" report). Returns true if the lock was acquired.
+function acquireScanLock(): boolean {
+  ensureAgentHome();
+  try {
+    const raw = fs.existsSync(SCAN_LOCK_PATH) ? fs.readFileSync(SCAN_LOCK_PATH, "utf-8") : "";
+    if (raw) {
+      const lock = JSON.parse(raw);
+      if (Date.now() - (lock.at || 0) < SCAN_LOCK_STALE_MS) return false; // held & fresh
+    }
+  } catch {
+    // Corrupt lock file — treat as stale and overwrite.
+  }
+  fs.writeFileSync(SCAN_LOCK_PATH, JSON.stringify({ pid: process.pid, at: Date.now() }), "utf-8");
+  return true;
+}
+
+function releaseScanLock() {
+  try {
+    // Only remove our own lock, so a taken-over stale lock isn't deleted by the
+    // process that lost the race.
+    const raw = fs.existsSync(SCAN_LOCK_PATH) ? fs.readFileSync(SCAN_LOCK_PATH, "utf-8") : "";
+    if (raw && JSON.parse(raw).pid === process.pid) fs.rmSync(SCAN_LOCK_PATH, { force: true });
+  } catch {
+    /* best effort */
+  }
+}
 
 const DEFAULT_CONFIG: DriveOSConfig = {
   machineName: "CJ-Workstation",
@@ -353,6 +388,11 @@ async function syncToConvex(endpoint: string, payload: any) {
 
   let response: Response;
   let text: string;
+  // Hard network timeout so a hung request can never wedge a scan (which left
+  // the desktop "Scanning…" button spinning forever). 60s is generous for a
+  // 100-file batch upload; anything longer is a stuck socket, not slow progress.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (config.authToken) headers.Authorization = `Bearer ${config.authToken}`;
@@ -361,13 +401,18 @@ async function syncToConvex(endpoint: string, payload: any) {
       method: "POST",
       headers,
       body: JSON.stringify(payload),
+      signal: controller.signal,
     });
     text = await response.text();
   } catch (err: any) {
-    const message = err?.message || "Network request failed";
+    const message = controller.signal.aborted
+      ? `Request timed out after 60s`
+      : err?.message || "Network request failed";
     console.warn(`[Convex Sync Stopped] ${endpoint} failed: ${message}`);
     recordSyncFailure(endpoint, message);
     throw new BackendSyncError(message);
+  } finally {
+    clearTimeout(timeout);
   }
 
   let body: any = {};
@@ -945,6 +990,10 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
         })
         .catch((err: any) => {
           uploadStopped = true;
+          // Force-persist stamps for batches that DID succeed before this failure.
+          // Otherwise the throttled save could drop the last <30s of confirmed
+          // uploads, so the next cycle re-uploads them — feeding the re-scan loop.
+          saveHashCache(hashCache);
           if (err instanceof RateLimitedError) {
             console.warn(`[Upload Budget] Backend rate limit hit — stopping uploads for this scan (retry in ~${err.retryAfterSeconds}s or next cycle): ${err.message}`);
             return;
@@ -1068,6 +1117,21 @@ async function runSyncCycle(config: DriveOSConfig, options: ScanOptions = {}): P
     return null;
   }
 
+  // Refuse to run alongside another scan (daemon vs. manual scan-now). Two
+  // concurrent scans clobber each other's hash-cache stamps and never converge.
+  if (!acquireScanLock()) {
+    console.log("[Sync] Another scan is already running — skipping this cycle to avoid duplicate work.");
+    return null;
+  }
+
+  try {
+    return await runSyncCycleLocked(config, options, roots);
+  } finally {
+    releaseScanLock();
+  }
+}
+
+async function runSyncCycleLocked(config: DriveOSConfig, options: ScanOptions, roots: string[]): Promise<ScanResult> {
   saveState({ lastSyncStartedAt: new Date().toISOString() });
   const totals: ScanResult = {
     fileCount: 0,
@@ -1387,18 +1451,39 @@ program
     console.log(`[Scheduler Started] Next sync in ${Math.round(intervalMs / 60000)} minute(s). Convex receives one batched update per cycle — no constant streaming.`);
     const syncTimer = setInterval(() => { void runSyncCycle(config, scanOpts); }, intervalMs);
 
-    // Poll for approved jobs (quarantine, folder creation) far more often than we
-    // scan, so a Quarantine clicked in the web dashboard runs within a minute
-    // rather than waiting for the next hourly sync. One job at a time; overlapping
-    // ticks are skipped via the busy guard.
-    let jobsBusy = false;
-    const jobsTimer = setInterval(() => {
-      if (jobsBusy) return;
-      jobsBusy = true;
-      void runPendingJobs(config).catch((err) => console.error(`[Agent Queue] Poll failed: ${err.message}`)).finally(() => { jobsBusy = false; });
-    }, 60 * 1000);
+    // Adaptive job poller. A fixed 60s timer against a metered backend was a real
+    // cost leak: an idle agent left running for a week made ~40k pointless calls
+    // (verifyMachineToken + rate-limit + a table read every minute). Now the
+    // interval backs off when nothing is queued (60s → up to 30min) and resets
+    // to fast only when a job actually runs. A 429 pauses polling for its
+    // Retry-After, so we never hammer a backend that already said "stop".
+    const JOB_POLL_MIN_MS = 60 * 1000;
+    const JOB_POLL_MAX_MS = 30 * 60 * 1000;
+    let jobPollDelay = JOB_POLL_MIN_MS;
+    let jobsTimer: NodeJS.Timeout;
 
-    const shutdown = () => { clearInterval(syncTimer); clearInterval(jobsTimer); console.log("\n[Scheduler Stopped]"); process.exit(0); };
+    const scheduleJobPoll = (delay: number) => {
+      jobsTimer = setTimeout(async () => {
+        try {
+          const executed = await runPendingJobs(config);
+          // Work found → poll fast again; idle → back off, capped.
+          jobPollDelay = executed > 0 ? JOB_POLL_MIN_MS : Math.min(jobPollDelay * 2, JOB_POLL_MAX_MS);
+        } catch (err: any) {
+          if (err instanceof RateLimitedError) {
+            jobPollDelay = Math.max(err.retryAfterSeconds * 1000, JOB_POLL_MAX_MS);
+            console.warn(`[Agent Queue] Rate limited — pausing job polling for ${Math.round(jobPollDelay / 60000)} min.`);
+          } else {
+            jobPollDelay = Math.min(jobPollDelay * 2, JOB_POLL_MAX_MS);
+            console.error(`[Agent Queue] Poll failed: ${err.message}`);
+          }
+        } finally {
+          scheduleJobPoll(jobPollDelay);
+        }
+      }, delay);
+    };
+    scheduleJobPoll(jobPollDelay);
+
+    const shutdown = () => { clearInterval(syncTimer); clearTimeout(jobsTimer); console.log("\n[Scheduler Stopped]"); process.exit(0); };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
   });
