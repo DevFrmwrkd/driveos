@@ -3,14 +3,28 @@ import { internalAction, internalMutation, internalQuery, mutation, query } from
 import { internal } from "./_generated/api";
 import { requireMember, inTenant } from "./access";
 
+// Cleanup screen recommendations. Only "open" recommendations belong here — once
+// a recommendation has been acted on (a cleanup job was created/approved/run) it
+// must drop off the list, otherwise a file the user already quarantined keeps
+// reappearing on the Cleanup page. Terminal/in-flight statuses are excluded;
+// anything else (pending/new/undefined) is still actionable and shown.
+const HIDDEN_REC_STATUSES = new Set([
+  "approved",
+  "completed",
+  "dismissed",
+  "ignored",
+  "quarantined",
+]);
+
 export const list = query({
   args: {},
   handler: async (ctx) => {
     const { tenantId } = await requireMember(ctx);
-    return await ctx.db
+    const all = await ctx.db
       .query("recommendations")
       .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
       .collect();
+    return all.filter((r) => !HIDDEN_REC_STATUSES.has(r.status));
   },
 });
 

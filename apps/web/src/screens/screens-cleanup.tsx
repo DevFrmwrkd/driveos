@@ -96,9 +96,11 @@ type QuarantineItem = any;
     };
     if (state === "quarantined")
       return h("div", { className: "card", style: { borderColor: "var(--ok-line)", background: "var(--ok-soft)" } },
-        h("div", { className: "card-pad row", style: { gap: 11 } }, h(Icon, { name: "checkCircle", size: 18, style: { color: "var(--ok)" } }),
-          h("span", { className: "hi", style: { fontWeight: 600, flex: 1 } }, r.title + " — quarantined (" + fmtTB(r.recoverTB) + ")"),
-          h("button", { className: "btn sm ghost", onClick: () => setState(null) }, "Undo")));
+        h("div", { className: "card-pad row", style: { gap: 11 } }, h(Icon, { name: "clock", size: 18, style: { color: "var(--ok)" } }),
+          h("div", { style: { flex: 1 } },
+            h("span", { className: "hi", style: { fontWeight: 600, display: "block" } }, r.title + " — queued for quarantine (" + fmtTB(r.recoverTB) + ")"),
+            h("span", { className: "muted", style: { fontSize: 11.5 } }, "The agent moves these files on its next poll, then this recommendation clears.")),
+          h("button", { className: "btn sm ghost", onClick: () => setState(null) }, "Dismiss")));
     if (state === "ignored")
       return h("div", { className: "card", style: { opacity: 0.55 } }, h("div", { className: "card-pad row", style: { gap: 11 } }, h(Icon, { name: "x", size: 16, style: { color: "var(--tx-dim)" } }),
         h("span", { className: "muted", style: { flex: 1 } }, r.title + " — ignored"), h("button", { className: "btn sm ghost", onClick: () => setState(null) }, "Restore")));
