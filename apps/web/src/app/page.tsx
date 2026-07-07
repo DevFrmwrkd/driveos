@@ -406,7 +406,13 @@ function Workspace() {
     }));
   }
   if (convexRecommendations && convexRecommendations.length > 0) {
-    (DB as any).cleanup = convexRecommendations.map((r: any) => ({
+    // Defensive mirror of the backend filter: never show a recommendation whose
+    // cleanup job has already been created/approved/run, so a quarantined file
+    // doesn't reappear on the Cleanup page before the backend redeploys.
+    const HIDDEN_REC_STATUSES = ["approved", "completed", "dismissed", "ignored", "quarantined"];
+    (DB as any).cleanup = convexRecommendations
+      .filter((r: any) => !HIDDEN_REC_STATUSES.includes(r.status))
+      .map((r: any) => ({
       ...r,
       id: r._id,
       cat: recommendationCategory(r.type),
