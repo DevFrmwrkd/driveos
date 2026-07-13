@@ -322,6 +322,7 @@ type QuarantineItem = any;
     const [purging, setPurging] = React.useState(false);
     const markRestored = useMutation(api.cleanup.markQuarantineRestored);
     const purgeExpired = useMutation(api.cleanup.purgeExpired);
+    const purgeItem = useMutation(api.cleanup.purgeItem);
     // Live count of items past their rollback window, safe to permanently delete.
     const purgeable = useQuery(api.cleanup.purgeableCount) || { count: 0, bytes: 0 };
     // Keep local list in sync when the live Convex query updates DB.quarantine.
@@ -336,6 +337,25 @@ type QuarantineItem = any;
         toast("File restored to original location", "rotate", "accent");
       } catch (err: any) {
         toast(err?.message || "Could not restore file", "alert", "risk");
+      } finally {
+        setBusyId(null);
+      }
+    };
+    // Per-row permanent delete of a single item, regardless of its 14-day
+    // window. Queues a purge job the agent runs on its next poll — the row shows
+    // "Deleting…" until the agent confirms and the live query drops it. If the
+    // agent is offline the row stays; that's honest (nothing deleted yet).
+    const deleteOne = async (q: any) => {
+      if (busyId) return;
+      if (!window.confirm(`Permanently delete "${q.name}"? This cannot be undone.`)) return;
+      setBusyId(q.id);
+      try {
+        if (typeof q.id === "string" && q.id.length > 12) {
+          const r = await purgeItem({ quarantineId: q.id, requestedBy: PURGE_REQUESTER });
+          toast(r.queued ? "Queued for permanent deletion — the agent will remove it shortly" : "Could not queue delete", r.queued ? "trash" : "alert", r.queued ? "risk" : "risk");
+        }
+      } catch (err: any) {
+        toast(err?.message || "Could not delete file", "alert", "risk");
       } finally {
         setBusyId(null);
       }
@@ -361,7 +381,9 @@ type QuarantineItem = any;
       h(PageHead, { eyebrow: "Maintenance", title: "Quarantine", desc: "A safe deletion buffer. Files stay restorable for 14 days, then can be permanently removed to free disk space.",
         actions: [
           h("button", { key: 1, className: "btn", onClick: () => go("cleanup") }, h(Icon, { name: "chevL", size: 15 }), "Back to Cleanup"),
-          h("button", { key: 2, className: "btn danger", disabled: purging || purgeable.count === 0, onClick: onPurgeExpired },
+          h("button", { key: 2, className: "btn danger", disabled: purging || purgeable.count === 0,
+            title: purgeable.count === 0 ? "No files have passed their 14-day window yet. Use the per-row Delete to remove one sooner." : `Permanently delete ${purgeable.count} expired file(s)`,
+            onClick: onPurgeExpired },
             h(Icon, { name: "trash", size: 15 }), purging ? "Queuing…" : purgeable.count > 0 ? `Empty expired (${purgeable.count})` : "Empty expired"),
         ] }),
 
@@ -386,7 +408,8 @@ type QuarantineItem = any;
                 h("td", null, h("span", { className: "mono", style: { fontSize: 11.5, color: "var(--warn)" } }, q.deadline)),
                 h("td", { className: "num mono hi" }, fmtGB(q.sizeGB)),
                 h("td", null, h("div", { className: "row", style: { gap: 6, justifyContent: "flex-end" } },
-                  h("button", { className: "btn sm", disabled: busyId === q.id, onClick: () => restore(q.id) }, h(Icon, { name: "rotate", size: 13 }), busyId === q.id ? "…" : "Restore"))))))) ),
+                  h("button", { className: "btn sm", disabled: busyId === q.id, onClick: () => restore(q.id) }, h(Icon, { name: "rotate", size: 13 }), busyId === q.id ? "…" : "Restore"),
+                  h("button", { className: "btn sm danger", disabled: busyId === q.id, title: "Permanently delete this file now", onClick: () => deleteOne(q) }, h(Icon, { name: "trash", size: 13 }), busyId === q.id ? "…" : "Delete"))))))) ),
 
       // audit log
       cardShell("Audit Log", "list", "var(--tx-mut)", null,

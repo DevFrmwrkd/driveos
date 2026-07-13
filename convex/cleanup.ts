@@ -98,6 +98,48 @@ export const purgeExpired = mutation({
   },
 });
 
+// Permanently delete ONE quarantined item now, regardless of its 14-day window.
+// This is the per-row "Delete" button: an explicit, confirmed choice about a
+// specific file, so it doesn't wait for expiry the way the bulk "Empty expired"
+// does. Tenant-scoped; queues an approved purge job for the agent to execute.
+export const purgeItem = mutation({
+  args: { quarantineId: v.string(), requestedBy: v.string() },
+  handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
+    const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
+    if (!id) return { queued: 0 };
+    const item = await ctx.db.get(id);
+    if (!item || item.tenantId !== tenantId || item.status !== "quarantined") return { queued: 0 };
+
+    const now = Date.now();
+    const jobId = await ctx.db.insert("cleanupJobs", {
+      tenantId,
+      requestedBy: args.requestedBy,
+      action: "purge",
+      status: "approved",
+      approvedBy: args.requestedBy,
+      affectedFileIds: [item.fileId],
+      affectedBytes: item.sizeBytes,
+      result: { purgeItems: [{ quarantineItemId: String(item._id), quarantinePath: item.quarantinePath }] },
+      createdAt: now,
+      updatedAt: now,
+    });
+    await ctx.db.patch(id, { status: "pending_purge" });
+
+    await ctx.db.insert("auditLogs", {
+      tenantId,
+      actorId: args.requestedBy,
+      action: "purge_request",
+      entityType: "quarantineItem",
+      entityId: id,
+      message: `Queued permanent deletion of ${item.originalPath} (${(item.sizeBytes / (1024 ** 3)).toFixed(1)} GB)`,
+      createdAt: now,
+    });
+
+    return { queued: 1, jobId };
+  },
+});
+
 // Agent-only (internal): fetch a job + its files, scoped to the agent's tenant.
 export const getJob = internalQuery({
   args: { jobId: v.string(), tenantId: v.optional(v.string()) },

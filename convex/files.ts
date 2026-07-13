@@ -2,6 +2,9 @@ import { v } from "convex/values";
 import { internalMutation, internalQuery, query } from "./_generated/server";
 import { requireMember, inTenant } from "./access";
 
+const MIN_GENERIC_CATALOG_FILE_SIZE_BYTES = 1024 * 1024;
+const AUTO_ANALYSIS_ENABLED = process.env.DRIVEOS_AUTO_ANALYSIS === "true";
+
 export const list = query({
   args: {
     limit: v.optional(v.number()),
@@ -30,7 +33,7 @@ export const list = query({
       if (!drive) return [];
       return await ctx.db
         .query("files")
-        .withIndex("by_drive", (q) => q.eq("driveId", args.driveId))
+        .withIndex("by_drive_path", (q) => q.eq("driveId", args.driveId))
         .take(limit);
     }
     if (args.classification) {
@@ -57,21 +60,14 @@ export const list = query({
   },
 });
 
-export const getByHash = query({
-  args: { fullHash: v.string() },
-  handler: async (ctx, args) => {
-    const { tenantId } = await requireMember(ctx);
-    return await ctx.db
-      .query("files")
-      .withIndex("by_tenant_fullHash", (q) =>
-        q.eq("tenantId", tenantId).eq("fullHash", args.fullHash)
-      )
-      .collect();
-  },
-});
-
 // Agent-only (internal): bulk-upsert scanned file metadata into the agent's
 // tenant. Reached solely via the token-authenticated HTTP route.
+//
+// Bandwidth contract: this mutation must write NOTHING for a file whose
+// metadata is unchanged. The agent already delta-syncs (only changed files are
+// sent), but older agents re-send the whole catalog every hour — blindly
+// patching every row burned ~70 GB/week of write bandwidth, so the no-op check
+// stays here as the backstop.
 export const uploadBatch = internalMutation({
   args: {
     scanSessionId: v.string(),
@@ -81,8 +77,9 @@ export const uploadBatch = internalMutation({
     files: v.array(
       v.object({
         path: v.string(),
-        normalizedPath: v.string(),
-        parentPath: v.string(),
+        // Legacy fields still sent by pre-1.1 agents; accepted but not stored.
+        normalizedPath: v.optional(v.string()),
+        parentPath: v.optional(v.string()),
         name: v.string(),
         extension: v.string(),
         sizeBytes: v.number(),
@@ -104,25 +101,38 @@ export const uploadBatch = internalMutation({
     const tenantId = args.tenantId || "";
     const timestamp = Date.now();
     const driveIdObj = args.driveId ? ctx.db.normalizeId("drives", args.driveId) : undefined;
-    const scanSessionIdObj = ctx.db.normalizeId("scanSessions", args.scanSessionId);
 
     let newFilesCount = 0;
-    let totalBytesUploaded = 0;
+    let changedFilesCount = 0;
+    let ignoredSmallFilesCount = 0;
 
-    // Only this tenant's projects can match for projectId guessing.
-    const allProjects = await ctx.db
-      .query("projects")
-      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
-      .collect();
+    // Only this tenant's projects can match for projectId guessing. Loaded
+    // lazily: a batch of already-assigned files never touches the table.
+    let allProjects: any[] | null = null;
+    const loadProjects = async () => {
+      if (allProjects === null) {
+        allProjects = await ctx.db
+          .query("projects")
+          .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+          .collect();
+      }
+      return allProjects;
+    };
 
     for (const f of args.files) {
-      totalBytesUploaded += f.sizeBytes;
+      // Backstop for pre-1.1 agents and legacy configs: do not create one
+      // database document per cache crumb/sidecar. Small project files remain
+      // eligible because they are product-critical and relatively rare.
+      if (f.sizeBytes < MIN_GENERIC_CATALOG_FILE_SIZE_BYTES && !f.isProjectFile) {
+        ignoredSmallFilesCount++;
+        continue;
+      }
 
       // Guess projectId from path if not explicitly passed
       let resolvedProjectId: string | undefined = f.projectId;
       if (!resolvedProjectId) {
         const pathLower = f.path.toLowerCase();
-        const matchedProject = allProjects.find((p) => {
+        const matchedProject = (await loadProjects()).find((p) => {
           const namePart = p.name.toLowerCase().replace(/[^a-z0-9]+/g, "");
           const slugPart = p.slug.toLowerCase().replace(/[^a-z0-9]+/g, "");
           const clientPart = p.client.toLowerCase().replace(/[^a-z0-9]+/g, "");
@@ -147,20 +157,52 @@ export const uploadBatch = internalMutation({
       const existing = existingRaw && existingRaw.tenantId === tenantId ? existingRaw : null;
 
       if (existing) {
+        // A missing incoming hash keeps the stored one (quick scans don't
+        // recompute full hashes), and a scan guess never CLEARS a projectId —
+        // it may have been assigned manually in the dashboard.
+        const nextQuickHash = f.quickHash || existing.quickHash;
+        const nextFullHash = f.fullHash || existing.fullHash;
+        const nextProjectId = resolvedProjectId ?? existing.projectId;
+
+        const unchanged =
+          existing.sizeBytes === f.sizeBytes &&
+          existing.modifiedAtFile === f.modifiedAtFile &&
+          existing.quickHash === nextQuickHash &&
+          existing.fullHash === nextFullHash &&
+          existing.projectId === nextProjectId &&
+          existing.classification === f.classification &&
+          existing.riskLevel === f.riskLevel &&
+          existing.isGenerated === f.isGenerated &&
+          existing.isRaw === f.isRaw &&
+          existing.isFinal === f.isFinal &&
+          existing.isProjectFile === f.isProjectFile &&
+          !existing.deletedAt;
+
+        // Nothing material changed → write nothing. lastSeenAt intentionally
+        // goes stale on unchanged rows; nothing queries it.
+        if (unchanged) continue;
+
+        changedFilesCount++;
         await ctx.db.patch(existing._id, {
-          projectId: resolvedProjectId,
+          projectId: nextProjectId,
           sizeBytes: f.sizeBytes,
           modifiedAtFile: f.modifiedAtFile,
           lastSeenAt: timestamp,
-          quickHash: f.quickHash || existing.quickHash,
-          fullHash: f.fullHash || existing.fullHash,
+          quickHash: nextQuickHash,
+          fullHash: nextFullHash,
           classification: f.classification,
           riskLevel: f.riskLevel,
           isGenerated: f.isGenerated,
           isRaw: f.isRaw,
           isFinal: f.isFinal,
           isProjectFile: f.isProjectFile,
-          scanSessionId: args.scanSessionId,
+          // Opportunistically compact legacy rows whenever they genuinely
+          // change; setting optional fields to undefined removes them.
+          normalizedPath: undefined,
+          parentPath: undefined,
+          scanSessionId: undefined,
+          // A re-appearing file that was quarantined/soft-deleted is back on disk.
+          deletedAt: undefined,
         });
       } else {
         newFilesCount++;
@@ -171,8 +213,6 @@ export const uploadBatch = internalMutation({
           machineId: args.machineId,
           source: "local",
           path: f.path,
-          normalizedPath: f.normalizedPath,
-          parentPath: f.parentPath,
           name: f.name,
           extension: f.extension,
           sizeBytes: f.sizeBytes,
@@ -188,34 +228,46 @@ export const uploadBatch = internalMutation({
           isRaw: f.isRaw,
           isFinal: f.isFinal,
           isProjectFile: f.isProjectFile,
-          scanSessionId: args.scanSessionId,
         });
       }
     }
 
-    // Update scanSession progress (only if it belongs to this tenant — the id
-    // arrives in the request body and must never let one tenant touch another's).
-    if (scanSessionIdObj) {
-      const session = await ctx.db.get(scanSessionIdObj);
-      if (session && session.tenantId === tenantId) {
-        await ctx.db.patch(scanSessionIdObj, {
-          filesScanned: session.filesScanned + args.files.length,
-          bytesScanned: session.bytesScanned + totalBytesUploaded,
+    // Per-batch scanSession progress writes are deliberately gone. They changed
+    // the same session document after every 100 files, invalidating scans.list
+    // subscriptions hundreds of thousands of times. Agent 1.1 reports the true
+    // totals once in completeScan; older agents show zero progress until update.
+
+    // NOTE: the per-batch drive lastSeenAt patch is gone — scans.complete
+    // already stamps the drive once per scan, and the per-batch version
+    // invalidated the dashboard's reactive drives.list on every single batch.
+
+    // Real changes make the tenant's catalog dirty, which is what arms the
+    // (debounced) post-scan analysis. Unchanged re-uploads never arm it.
+    const dirtyDelta = newFilesCount + changedFilesCount;
+    if (AUTO_ANALYSIS_ENABLED && dirtyDelta > 0) {
+      const state = await ctx.db
+        .query("analysisState")
+        .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
+        .first();
+      if (state) {
+        await ctx.db.patch(state._id, { dirtyCount: state.dirtyCount + dirtyDelta });
+      } else {
+        await ctx.db.insert("analysisState", {
+          tenantId,
+          dirtyCount: dirtyDelta,
+          scheduled: false,
+          lastRunAt: 0,
         });
       }
     }
 
-    // Run simple post-upload hook to update drive metrics (same tenant guard).
-    if (driveIdObj) {
-      const drive = await ctx.db.get(driveIdObj);
-      if (drive && drive.tenantId === tenantId) {
-        await ctx.db.patch(driveIdObj, {
-          lastSeenAt: timestamp,
-        });
-      }
-    }
-
-    return { success: true, uploaded: args.files.length, newFiles: newFilesCount };
+    return {
+      success: true,
+      uploaded: args.files.length,
+      newFiles: newFilesCount,
+      changedFiles: changedFilesCount,
+      ignoredSmallFiles: ignoredSmallFilesCount,
+    };
   },
 });
 

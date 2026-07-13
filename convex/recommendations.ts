@@ -261,11 +261,15 @@ export const listProjectsForAnalysis = internalQuery({
 export const listOpenExactClusters = internalQuery({
   args: { tenantId: v.string() },
   handler: async (ctx, args) => {
+    // Bounded: pull the top open clusters by wasted bytes via the indexed range
+    // (never the whole table), then keep the exact ones. The recommendation only
+    // needs the biggest wasters; a cap keeps this safe no matter the cluster count.
     const clusters = await ctx.db
       .query("duplicateClusters")
-      .withIndex("by_tenant", (q) => q.eq("tenantId", args.tenantId))
-      .collect();
-    return clusters.filter((c) => c.status === "open" && c.type === "exact");
+      .withIndex("by_tenant_status_wasted", (q) => q.eq("tenantId", args.tenantId).eq("status", "open"))
+      .order("desc")
+      .take(1000);
+    return clusters.filter((c) => c.type === "exact");
   },
 });
 
