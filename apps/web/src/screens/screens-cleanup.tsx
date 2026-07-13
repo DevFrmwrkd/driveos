@@ -40,7 +40,7 @@ const h: any = React.createElement;
 
 type ScreenProps = Record<string, any>;
 type CleanupPreviewState = any | null;
-type RecState = "quarantined" | "ignored" | null;
+type RecState = "quarantined" | "ignored" | "deleted" | null;
 type QuarantineItem = any;
 
 
@@ -62,16 +62,21 @@ type QuarantineItem = any;
 
   // Create + approve a quarantine job from a recommendation. The local agent's
   // `run-jobs` command picks up the approved job and performs the actual move.
+  // When `purgeAfter` is true ("Delete permanently"), the file still moves to
+  // quarantine first — so the agent's protected-file guard still applies — and
+  // the backend then auto-queues a purge that erases it from disk. Same net
+  // effect the user wants (file gone from the device) without a new delete path.
   function useQuarantineRecommendation() {
     const createJob = useMutation(api.cleanup.createJob);
     const approveJob = useMutation(api.cleanup.approveJob);
-    return React.useCallback(async (r: any) => {
+    return React.useCallback(async (r: any, opts?: { purgeAfter?: boolean }) => {
       const jobId = await createJob({
         recommendationId: typeof r.id === "string" ? r.id : undefined,
         requestedBy: CLEANUP_REQUESTER,
         action: "quarantine",
         affectedFileIds: r.affectedFileIds || [],
         affectedBytes: r.affectedBytes || 0,
+        purgeAfter: opts?.purgeAfter || undefined,
       });
       if (jobId) await approveJob({ jobId, approvedBy: CLEANUP_REQUESTER });
       return jobId;
@@ -81,6 +86,7 @@ type QuarantineItem = any;
   function RecCard({ r, go, toast, onPreview }: ScreenProps) {
     const [state, setState] = React.useState<RecState>(null);
     const [busy, setBusy] = React.useState(false);
+    const [confirmDelete, setConfirmDelete] = React.useState(false);
     const quarantine = useQuarantineRecommendation();
     const onQuarantine = async () => {
       if (busy) return;
@@ -94,12 +100,34 @@ type QuarantineItem = any;
         setBusy(false);
       }
     };
+    // Permanent delete: quarantine-then-auto-purge. Confirmed via type-to-confirm
+    // modal because it's irreversible — no 14-day rollback.
+    const onDelete = async () => {
+      if (busy) return;
+      setBusy(true);
+      try {
+        await quarantine(r, { purgeAfter: true });
+        setConfirmDelete(false);
+        setState("deleted");
+      } catch (err: any) {
+        toast(err?.message || "Could not queue permanent delete", "alert", "risk");
+      } finally {
+        setBusy(false);
+      }
+    };
     if (state === "quarantined")
       return h("div", { className: "card", style: { borderColor: "var(--ok-line)", background: "var(--ok-soft)" } },
         h("div", { className: "card-pad row", style: { gap: 11 } }, h(Icon, { name: "clock", size: 18, style: { color: "var(--ok)" } }),
           h("div", { style: { flex: 1 } },
             h("span", { className: "hi", style: { fontWeight: 600, display: "block" } }, r.title + " — queued for quarantine (" + fmtTB(r.recoverTB) + ")"),
             h("span", { className: "muted", style: { fontSize: 11.5 } }, "The agent moves these files on its next poll, then this recommendation clears.")),
+          h("button", { className: "btn sm ghost", onClick: () => setState(null) }, "Dismiss")));
+    if (state === "deleted")
+      return h("div", { className: "card", style: { borderColor: "var(--risk-line)", background: "var(--risk-soft)" } },
+        h("div", { className: "card-pad row", style: { gap: 11 } }, h(Icon, { name: "trash", size: 18, style: { color: "var(--risk)" } }),
+          h("div", { style: { flex: 1 } },
+            h("span", { className: "hi", style: { fontWeight: 600, display: "block" } }, r.title + " — queued for permanent deletion (" + fmtTB(r.recoverTB) + ")"),
+            h("span", { className: "muted", style: { fontSize: 11.5 } }, "The agent removes these files from the drive on its next poll. This cannot be undone.")),
           h("button", { className: "btn sm ghost", onClick: () => setState(null) }, "Dismiss")));
     if (state === "ignored")
       return h("div", { className: "card", style: { opacity: 0.55 } }, h("div", { className: "card-pad row", style: { gap: 11 } }, h(Icon, { name: "x", size: 16, style: { color: "var(--tx-dim)" } }),
@@ -122,7 +150,32 @@ type QuarantineItem = any;
           h("div", { className: "row", style: { gap: 8, marginTop: 14 } },
             h("button", { className: "btn sm", onClick: () => onPreview(r) }, h(Icon, { name: "eye", size: 13 }), "Preview"),
             r.risk !== "danger" && h("button", { className: "btn sm primary", disabled: busy, onClick: onQuarantine }, h(Icon, { name: "shield", size: 13 }), busy ? "Queuing…" : "Quarantine"),
-            h("button", { className: "btn sm ghost", onClick: () => setState("ignored") }, "Ignore")))));
+            r.risk !== "danger" && h("button", { className: "btn sm danger", disabled: busy, title: "Permanently delete these files from the drive (no 14-day rollback)", onClick: () => setConfirmDelete(true) }, h(Icon, { name: "trash", size: 13 }), "Delete permanently"),
+            h("button", { className: "btn sm ghost", onClick: () => setState("ignored") }, "Ignore"))),
+        confirmDelete && h(DeleteConfirmModal, { r, busy, onConfirm: onDelete, onClose: () => setConfirmDelete(false) })));
+  }
+
+  // Type-to-confirm modal for permanent deletion. The button only enables once
+  // the user types DELETE, so an irreversible purge can't fire on a stray click.
+  function DeleteConfirmModal({ r, busy, onConfirm, onClose }: ScreenProps) {
+    const [typed, setTyped] = React.useState("");
+    const armed = typed.trim().toUpperCase() === "DELETE";
+    const footer = [
+      h("button", { key: "c", className: "btn", onClick: onClose }, "Cancel"),
+      h("button", { key: "d", className: "btn danger", disabled: !armed || busy, onClick: onConfirm },
+        h(Icon, { name: "trash", size: 14 }), busy ? "Queuing…" : "Permanently delete"),
+    ];
+    return h(Modal, { title: "Permanently delete files", subtitle: r.title, icon: "trash", iconKind: "risk", onClose, footer, width: 560 },
+      h("div", { style: { padding: "13px 15px", borderRadius: "var(--r)", background: "var(--risk-soft)", border: "1px solid var(--risk-line)", marginBottom: 16, display: "flex", gap: 10 } },
+        h(Icon, { name: "alert", size: 18, style: { color: "var(--risk)", flexShrink: 0 } }),
+        h("div", { style: { fontSize: 12.5, color: "var(--tx)", lineHeight: 1.5 } },
+          h("b", { className: "hi" }, "This cannot be undone. "),
+          "These " + fmtNum(r.files) + " file(s) (" + fmtTB(r.recoverTB) + ") will be removed from the drive with no 14-day rollback. Protected RAW, final exports, and project files are automatically skipped.")),
+      h("div", { className: "eyebrow", style: { marginBottom: 6 } }, "Type DELETE to confirm"),
+      h("input", { className: "input mono", value: typed, autoFocus: true, placeholder: "DELETE",
+        onChange: (e: React.ChangeEvent<HTMLInputElement>) => setTyped(e.target.value),
+        onKeyDown: (e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === "Enter" && armed && !busy) onConfirm(); },
+        style: { width: "100%", letterSpacing: "0.1em" } }));
   }
   function catIcon(cat: string) {
     const icons: Record<string, string> = { "Cache": "cpu", "Proxies": "layers", "Duplicate stock": "globe", "Review exports": "download", "Abandoned copies": "box", "Duplicate downloads": "copy", "Unknown": "alert" };
