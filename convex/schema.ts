@@ -244,6 +244,11 @@ export default defineSchema({
     affectedFileIds: v.array(v.string()),
     affectedBytes: v.number(),
     rollbackUntil: v.optional(v.number()),
+    // When true, a "quarantine" job auto-chains an approved "purge" job the
+    // moment the agent confirms the move — the "Delete permanently" flow. The
+    // file still moves to quarantine first (so protected files are blocked by
+    // the same guard), then is erased from disk on the agent's next poll.
+    purgeAfter: v.optional(v.boolean()),
     result: v.optional(v.any()),
     createdAt: v.number(),
     updatedAt: v.number(),

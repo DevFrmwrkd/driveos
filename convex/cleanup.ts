@@ -185,6 +185,9 @@ export const createJob = mutation({
     action: v.string(), // "quarantine" | "restore" | "generate_manifest" | "create_folder_structure"
     affectedFileIds: v.array(v.string()),
     affectedBytes: v.number(),
+    // "Delete permanently" from the Cleanup page: still a quarantine job (so the
+    // protected-file guard applies), but flagged to auto-purge once moved.
+    purgeAfter: v.optional(v.boolean()),
     result: v.optional(v.any()),
   },
   handler: async (ctx, args) => {
@@ -201,7 +204,10 @@ export const createJob = mutation({
       status: "pending_approval",
       affectedFileIds: args.affectedFileIds,
       affectedBytes: args.affectedBytes,
-      rollbackUntil: args.action === "quarantine" ? timestamp + rollbackPeriod : undefined,
+      // A purge-after job keeps a zero rollback window: the file is meant to be
+      // deleted, not held for 14 days.
+      rollbackUntil: args.action === "quarantine" && !args.purgeAfter ? timestamp + rollbackPeriod : undefined,
+      purgeAfter: args.purgeAfter || undefined,
       result: args.result,
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -214,7 +220,7 @@ export const createJob = mutation({
       action: "job_create",
       entityType: "cleanupJob",
       entityId: jobId,
-      message: `Created cleanup job for action "${args.action}" affecting ${(args.affectedBytes / (1024 ** 3)).toFixed(1)} GB`,
+      message: `Created cleanup job for action "${args.action}"${args.purgeAfter ? " (permanent delete)" : ""} affecting ${(args.affectedBytes / (1024 ** 3)).toFixed(1)} GB`,
       createdAt: timestamp,
     });
 
@@ -273,8 +279,9 @@ export const pollPendingJobs = internalQuery({
     const tenantId = args.tenantId || "";
     // Only the two actionable statuses, via the (tenant,status) index — never
     // the whole job history. This query runs on every agent poll, so reading the
-    // full cleanupJobs table (which accumulates completed/failed rows forever)
-    // would grow more expensive every day the workspace is used.
+    // full cleanupJobs table (which accumulates completed/failed rows forever,
+    // and now also the auto-purge jobs from "Delete permanently") would grow
+    // more expensive every day the workspace is used. Bounded read = stable cost.
     const approved = await ctx.db
       .query("cleanupJobs")
       .withIndex("by_tenant_status", (q) => q.eq("tenantId", tenantId).eq("status", "approved"))
@@ -339,10 +346,13 @@ export const updateJobStatus = internalMutation({
 
     if (args.status === "completed") {
       if (job.action === "quarantine" && args.quarantineFiles) {
+        // Collect the freshly-created quarantine items so a purge-after job can
+        // reference them by id + on-disk path.
+        const createdItems: { quarantineItemId: string; quarantinePath: string }[] = [];
         for (const qf of args.quarantineFiles) {
           const fileIdObj = ctx.db.normalizeId("files", qf.fileId);
 
-          await ctx.db.insert("quarantineItems", {
+          const qItemId = await ctx.db.insert("quarantineItems", {
             tenantId,
             cleanupJobId: args.jobId,
             originalPath: qf.originalPath,
@@ -350,9 +360,11 @@ export const updateJobStatus = internalMutation({
             fileId: qf.fileId,
             sizeBytes: qf.sizeBytes,
             movedAt: timestamp,
-            rollbackUntil: job.rollbackUntil || (timestamp + 14 * 24 * 60 * 60 * 1000),
+            // purge-after items get no rollback window (immediate delete intent).
+            rollbackUntil: job.purgeAfter ? timestamp : (job.rollbackUntil || (timestamp + 14 * 24 * 60 * 60 * 1000)),
             status: "quarantined",
           });
+          createdItems.push({ quarantineItemId: String(qItemId), quarantinePath: qf.quarantinePath });
 
           if (fileIdObj) {
             const file = await ctx.db.get(fileIdObj);
@@ -360,6 +372,35 @@ export const updateJobStatus = internalMutation({
               await ctx.db.patch(fileIdObj, { deletedAt: timestamp });
             }
           }
+        }
+
+        // "Delete permanently" flow: the file has moved to quarantine and is
+        // blocked-or-not by the same protected-file guard as any quarantine.
+        // Now auto-queue an approved purge job so the agent erases exactly those
+        // items from disk on its next poll. Only queues if something moved.
+        if (job.purgeAfter && createdItems.length > 0) {
+          const purgeJobId = await ctx.db.insert("cleanupJobs", {
+            tenantId,
+            machineId: job.machineId,
+            requestedBy: job.requestedBy,
+            action: "purge",
+            status: "approved", // auto-approved: the type-to-confirm delete WAS the approval
+            approvedBy: job.approvedBy || job.requestedBy,
+            affectedFileIds: job.affectedFileIds,
+            affectedBytes: job.affectedBytes,
+            result: { purgeItems: createdItems },
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          });
+          await ctx.db.insert("auditLogs", {
+            tenantId,
+            machineId: job.machineId,
+            action: "purge_request",
+            entityType: "cleanupJob",
+            entityId: purgeJobId,
+            message: `Auto-queued permanent deletion of ${createdItems.length} quarantined item(s) (Delete permanently)`,
+            createdAt: timestamp,
+          });
         }
       }
 
