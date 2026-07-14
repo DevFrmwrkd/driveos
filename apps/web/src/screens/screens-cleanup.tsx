@@ -1,4 +1,5 @@
 import React from "react";
+import { createPortal } from "react-dom";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convexApi";
 import { DB } from "@/data";
@@ -157,6 +158,10 @@ type QuarantineItem = any;
 
   // Type-to-confirm modal for permanent deletion. The button only enables once
   // the user types DELETE, so an irreversible purge can't fire on a stray click.
+  // Rendered through a portal to document.body: the card wrapping this modal has
+  // a transform-based .fade-up animation, which creates a stacking context that
+  // would otherwise trap the position:fixed scrim *behind* sibling cards. The
+  // portal lifts it out so the modal overlays the whole screen like every other.
   function DeleteConfirmModal({ r, busy, onConfirm, onClose }: ScreenProps) {
     const [typed, setTyped] = React.useState("");
     const armed = typed.trim().toUpperCase() === "DELETE";
@@ -165,7 +170,7 @@ type QuarantineItem = any;
       h("button", { key: "d", className: "btn danger", disabled: !armed || busy, onClick: onConfirm },
         h(Icon, { name: "trash", size: 14 }), busy ? "Queuing…" : "Permanently delete"),
     ];
-    return h(Modal, { title: "Permanently delete files", subtitle: r.title, icon: "trash", iconKind: "risk", onClose, footer, width: 560 },
+    const modal = h(Modal, { title: "Permanently delete files", subtitle: r.title, icon: "trash", iconKind: "risk", onClose, footer, width: 560 },
       h("div", { style: { padding: "13px 15px", borderRadius: "var(--r)", background: "var(--risk-soft)", border: "1px solid var(--risk-line)", marginBottom: 16, display: "flex", gap: 10 } },
         h(Icon, { name: "alert", size: 18, style: { color: "var(--risk)", flexShrink: 0 } }),
         h("div", { style: { fontSize: 12.5, color: "var(--tx)", lineHeight: 1.5 } },
@@ -176,6 +181,8 @@ type QuarantineItem = any;
         onChange: (e: React.ChangeEvent<HTMLInputElement>) => setTyped(e.target.value),
         onKeyDown: (e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === "Enter" && armed && !busy) onConfirm(); },
         style: { width: "100%", letterSpacing: "0.1em" } }));
+    // Guard against SSR (no document during server render).
+    return typeof document !== "undefined" ? createPortal(modal, document.body) : modal;
   }
   function catIcon(cat: string) {
     const icons: Record<string, string> = { "Cache": "cpu", "Proxies": "layers", "Duplicate stock": "globe", "Review exports": "download", "Abandoned copies": "box", "Duplicate downloads": "copy", "Unknown": "alert" };
