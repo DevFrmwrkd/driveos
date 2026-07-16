@@ -17,6 +17,7 @@ import type * as audit from "../audit.js";
 import type * as auth from "../auth.js";
 import type * as cleanup from "../cleanup.js";
 import type * as cloud from "../cloud.js";
+import type * as compaction from "../compaction.js";
 import type * as crons from "../crons.js";
 import type * as drives from "../drives.js";
 import type * as duplicates from "../duplicates.js";
@@ -47,6 +48,7 @@ declare const fullApi: ApiFromModules<{
   auth: typeof auth;
   cleanup: typeof cleanup;
   cloud: typeof cloud;
+  compaction: typeof compaction;
   crons: typeof crons;
   drives: typeof drives;
   duplicates: typeof duplicates;
