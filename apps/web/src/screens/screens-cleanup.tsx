@@ -200,13 +200,22 @@ type QuarantineItem = any;
     const protT = DB.cleanup.filter((c) => c.risk === "danger").reduce((s, c) => s + c.recoverTB, 0);
     const totalT = DB.cleanup.reduce((s, c) => s + c.recoverTB, 0);
     const heroMax = totalT > 0 ? totalT : 1;
+    const isEmpty = DB.cleanup.length === 0;
 
     return h("div", { className: "page-inner" },
       h(PageHead, { eyebrow: "Maintenance", title: "Cleanup Recommendations", desc: "Every recommendation explains what was found, why it's safe, and exactly what happens next. Nothing is deleted — files move to quarantine first.",
         actions: [h("button", { key: 1, className: "btn", onClick: () => go("quarantine") }, h(Icon, { name: "shield", size: 15 }), "View Quarantine")] }),
 
+      // No real recommendations yet — never fabricate demo cards. Analysis
+      // generates these after a scan; until then, say so plainly.
+      isEmpty && h("div", { className: "card" },
+        h("div", { className: "empty" },
+          h("div", { className: "empty-ico" }, h(Icon, { name: "shieldCheck", size: 24 })),
+          h("h3", null, "No cleanup recommendations yet"),
+          h("div", { className: "muted", style: { maxWidth: "48ch" } }, "Once an agent scans your drives and analysis runs, safe-to-reclaim cache, proxies, and duplicates show up here with a preview before anything moves."))),
+
       // hero
-      h("div", { className: "card fade-up", style: { marginBottom: "var(--gap)", overflow: "hidden", background: "linear-gradient(135deg, var(--bg-panel), var(--bg-panel-2))" } },
+      !isEmpty && h("div", { className: "card fade-up", style: { marginBottom: "var(--gap)", overflow: "hidden", background: "linear-gradient(135deg, var(--bg-panel), var(--bg-panel-2))" } },
         h("div", { style: { display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 0 } },
           h("div", { className: "card-pad", style: { padding: 28 } },
             h("div", { className: "eyebrow", style: { marginBottom: 8 } }, "Potential recovery"),
@@ -224,7 +233,7 @@ type QuarantineItem = any;
             h("div", { className: "mono dim", style: { fontSize: 11, marginTop: 2 } }, "Quarantine retention: 30 days · full rollback")))),
 
       // category chips
-      h("div", { className: "chip-row", style: { marginBottom: "var(--gap)" } },
+      !isEmpty && h("div", { className: "chip-row", style: { marginBottom: "var(--gap)" } },
         h("button", { className: "badge " + (cat === "all" ? "accent" : ""), style: { cursor: "pointer", height: 28, padding: "0 12px" }, onClick: () => setCat("all") }, "All categories"),
         cats.map((c) => h("button", { key: c, className: "badge " + (cat === c ? "accent" : ""), style: { cursor: "pointer", height: 28, padding: "0 12px" }, onClick: () => setCat(c) },
           h(Icon, { name: catIcon(c), size: 12 }), c))),
