@@ -405,7 +405,14 @@ function Workspace() {
       rec: d.explanation,
     }));
   }
-  if (convexRecommendations && convexRecommendations.length > 0) {
+  // Once Convex has answered, its recommendations are authoritative — even when
+  // the answer is an empty list. Gating on length>0 (the old bug) let the mock
+  // demo cards (c1–c8 in data.ts, with NO real affectedFileIds) survive whenever
+  // there were no open recommendations, so a user would "delete" a demo card,
+  // the job would carry zero files, nothing happened on disk, and it reappeared.
+  // Mirror the duplicates block above: real data replaces mock the moment the
+  // query resolves, so the Cleanup page can never show undeletable demo cards.
+  if (convexRecommendations) {
     // Defensive mirror of the backend filter: never show a recommendation whose
     // cleanup job has already been created/approved/run, so a quarantined file
     // doesn't reappear on the Cleanup page before the backend redeploys.
