@@ -1449,7 +1449,58 @@ program
     if (options.once) return;
 
     console.log(`[Scheduler Started] Next sync in ${Math.round(intervalMs / 60000)} minute(s). Convex receives one batched update per cycle — no constant streaming.`);
-    const syncTimer = setInterval(() => { void runSyncCycle(config, scanOpts); }, intervalMs);
+
+    // Adaptive scan scheduler. A fixed hourly setInterval kept re-scanning a
+    // quiet drive 24 rounds/day on a PC left on — each round re-reads the
+    // catalog to compute the delta, and a lost hash cache turns that into a
+    // full re-upload. Mirroring the job poller below: when a cycle uploads
+    // nothing, back the interval off (base → up to SCAN_MAX_MS); a cycle that
+    // actually changed something resets to base. A hard daily ceiling caps the
+    // number of cycles so even a broken delta cache can't loop unbounded — the
+    // backend's per-tenant daily upload budget is the final backstop, but this
+    // stops us from wastefully hammering it up to that limit.
+    const SCAN_BASE_MS = intervalMs;
+    const SCAN_MAX_MS = Math.max(intervalMs, 6 * 60 * 60 * 1000); // cap idle backoff at 6h
+    const SCAN_MAX_CYCLES_PER_DAY = Math.max(24, Math.ceil((24 * 60 * 60 * 1000) / intervalMs));
+    let scanDelay = SCAN_BASE_MS;
+    let cyclesToday = 0;
+    let dayWindowStart = 0; // ms epoch of the current 24h counting window; set on first tick
+    let syncTimer: NodeJS.Timeout;
+
+    const scheduleScan = (delay: number) => {
+      syncTimer = setTimeout(async () => {
+        // Roll the 24h counting window and enforce the ceiling BEFORE running a
+        // cycle. If capped, reschedule for the remainder of the window and skip
+        // the cycle entirely (single reschedule — no try/finally double-arm).
+        const now = Date.now();
+        if (dayWindowStart === 0 || now - dayWindowStart >= 24 * 60 * 60 * 1000) {
+          dayWindowStart = now;
+          cyclesToday = 0;
+        }
+        if (cyclesToday >= SCAN_MAX_CYCLES_PER_DAY) {
+          const waitMs = Math.max(60_000, 24 * 60 * 60 * 1000 - (now - dayWindowStart));
+          console.warn(`[Scan Ceiling] Hit ${SCAN_MAX_CYCLES_PER_DAY} sync cycles in 24h — pausing scans for ${Math.round(waitMs / 60000)} min to protect the daily budget.`);
+          scheduleScan(waitMs);
+          return;
+        }
+        cyclesToday++;
+
+        try {
+          const res = await runSyncCycle(config, scanOpts);
+          // uploadedCount === 0 → nothing changed on disk; back off. Any upload
+          // (or an errored/null cycle we want to retry sooner) resets to base.
+          const quiet = res != null && res.uploadedCount === 0;
+          scanDelay = quiet ? Math.min(scanDelay * 2, SCAN_MAX_MS) : SCAN_BASE_MS;
+          if (quiet) console.log(`[Scan Idle] No changes this cycle — next scan in ${Math.round(scanDelay / 60000)} min.`);
+        } catch (err: any) {
+          console.error(`[Scan Cycle Error] ${err.message}`);
+          scanDelay = Math.min(scanDelay * 2, SCAN_MAX_MS);
+        } finally {
+          scheduleScan(scanDelay);
+        }
+      }, delay);
+    };
+    scheduleScan(scanDelay);
 
     // Adaptive job poller. A fixed 60s timer against a metered backend was a real
     // cost leak: an idle agent left running for a week made ~40k pointless calls
@@ -1483,7 +1534,7 @@ program
     };
     scheduleJobPoll(jobPollDelay);
 
-    const shutdown = () => { clearInterval(syncTimer); clearTimeout(jobsTimer); console.log("\n[Scheduler Stopped]"); process.exit(0); };
+    const shutdown = () => { clearTimeout(syncTimer); clearTimeout(jobsTimer); console.log("\n[Scheduler Stopped]"); process.exit(0); };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
   });
