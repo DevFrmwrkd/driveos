@@ -16,6 +16,7 @@ import { OperationJournal } from "./operationJournal.js";
 import { JobLeaseClient, JobLeaseLostError, RateLimitedError, withRateLimitBackoff } from "./jobLeaseClient.js";
 import { isRegenerablePath, verifyKeepCopy, type KeepCopyProof } from "./keepCopy.js";
 import { WatchQueue, WatchRootGuard, UnresolvedRemovals, catalogReceipts, catalogSnapshotFromCache, cachedParentIdentities, directoryIdentity, receiptMatchesScope, selectCatalogSnapshot, type CatalogReceipt, type CatalogSnapshot, type DirectoryIdentity } from "./watchQueue.js";
+import { requireCatalogReplay } from "./catalogReplay.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), "apps/web/.env.local") });
 dotenv.config({ path: path.resolve(process.cwd(), ".env.local") });
@@ -1052,12 +1053,11 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
     const rootPrefix = scanDir.endsWith(path.sep) ? scanDir : scanDir + path.sep;
     let cleared = 0;
     for (const key of Object.keys(hashCache)) {
-      if (hashCache[key].uploadedFp && key.startsWith(rootPrefix)) {
-        delete hashCache[key].uploadedFp;
-        cleared++;
-      }
+      if (key.startsWith(rootPrefix) && requireCatalogReplay(hashCache[key], { driveId, machineId }, true)) cleared++;
     }
     if (cleared > 0) {
+      // Persist the replay fence before any ACK; its cache save may be throttled.
+      saveHashCache(hashCache);
       console.log(`[Delta Sync] Backend has no catalog for ${scanDir} — re-uploading all ${cleared} previously synced file(s).`);
     }
   }
@@ -1146,6 +1146,7 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
         return;
       }
       const existingCacheEntry = hashCache[`${filePath}-${statObj.size}`];
+      if (existingCacheEntry) requireCatalogReplay(existingCacheEntry, { driveId, machineId });
       const meta = await buildFileMetadata(filePath, statObj, hashCache, calculateFull);
       result.fileCount++;
       result.byteCount += statObj.size;
