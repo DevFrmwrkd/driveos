@@ -13,6 +13,21 @@ describe("DriveOS shared library classification rules", () => {
     expect(classifyFile("/Volumes/Drive/ShowX/clip_lowres.mp4", "clip_lowres.mp4")).toBe("PROXY");
   });
 
+  test.each([
+    [String.raw`E:\Show\02_RAW\A_CAM\take001.mov`, "take001.mov", "RAW", "red"],
+    [String.raw`\\studio\media\Show\02_RAW\take001.mp4`, "take001.mp4", "RAW", "red"],
+    [String.raw`E:\Show\08_DELIVERY\master.mov`, "master.mov", "EXPORT_FINAL", "red"],
+    [String.raw`E:\Show\07_EXPORTS\FINAL\master.mp4`, "master.mp4", "EXPORT_FINAL", "red"],
+    ["/Show/07_EXPORTS/FINAL/master.mp4", "master.mp4", "EXPORT_FINAL", "red"],
+    [String.raw`E:\Show\05_PROXIES\take001.mov`, "take001.mov", "PROXY", "green"],
+    [String.raw`E:\Show\06_RENDERS_CACHE\render.dat`, "render.dat", "CACHE", "green"],
+    ["E:/Show\\02_RAW/A_CAM\\take001.mov", "take001.mov", "RAW", "red"],
+  ])("Protect and classify native paths: %s", (filePath, name, classification, risk) => {
+    const actual = classifyFile(filePath, name);
+    expect(actual).toBe(classification);
+    expect(calculateFileRisk(actual, 10 * 1024 * 1024)).toBe(risk);
+  });
+
   test("Classify project files", () => {
     expect(classifyFile("/Volumes/Drive/ShowX/03_PROJECT_FILES/PREMIERE/edit.prproj", "edit.prproj")).toBe("PROJECT_FILE");
     expect(classifyFile("/Volumes/Drive/ShowX/illustrations/graphics.psd", "graphics.psd")).toBe("GRAPHICS"); // psd outside project files is graphics

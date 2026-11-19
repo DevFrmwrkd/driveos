@@ -1,171 +1,99 @@
 import React from "react";
+import { useMutation, useQuery } from "convex/react";
+import { api } from "@/convexApi";
 import { DB } from "@/data";
-import {
-  Icon,
-  fmtTB,
-  fmtGB,
-  pct,
-  fmtNum,
-  STATUS_META,
-  RISK_META,
-  PROJ_STATUS,
-  TIER_META,
-  tierKind,
-  Avatar,
-  Badge,
-  StatusBadge,
-  RiskBadge,
-  Bar,
-  MultiBar,
-  Donut,
-  HealthRing,
-  Sparkline,
-  MiniBars,
-  Treemap,
-  StatCard,
-  Check,
-  Seg,
-  FileTypePill,
-  FT_ICON,
-  Modal,
-  SectionTitle,
-  Legend,
-  PageHead,
-  cardShell,
-  getVar
-} from "@/components";
-const h: any = React.createElement;
+import { Icon } from "@/components/icons";
+import { Badge, Modal, PageHead, StatusBadge } from "@/components/components";
+import { formatBytes } from "@/lib/download";
+
 type ScreenProps = Record<string, any>;
-type ArchiveModalState = { p: any } | null;
+const CHECKLIST = [
+  "Final exports and delivery masters are present",
+  "Original footage and project files are present",
+  "Licenses, fonts, and graphics are included",
+  "An independent archive or backup copy has been checked",
+  "Required cloud delivery has been checked outside DriveOS",
+  "Generated files to keep or clean have been reviewed",
+];
+const message = (error: unknown) => error instanceof Error ? error.message : "The archive request could not be completed.";
 
+export function ArchiveChecklistModal({ p, onClose, toast, go }: ScreenProps) {
+  const manifests = useQuery(api.archive.listManifests);
+  const jobs = useQuery(api.cleanup.listJobs);
+  const requestManifest = useMutation(api.archive.requestManifest);
+  const updateStatus = useMutation(api.projects.updateStatus);
+  const [done, setDone] = React.useState<boolean[]>(() => CHECKLIST.map(() => false));
+  const [busy, setBusy] = React.useState(false);
+  const projectId = p?.id || p?._id;
+  const latest = (manifests || []).filter((m: any) => m.projectId === projectId && /archive_manifest\.json$/i.test(m.manifestPath)).sort((a: any, b: any) => b.createdAt - a.createdAt)[0];
+  const latestJob = (jobs || []).find((j: any) => j.action === "generate_manifest" && j.result?.projectId === projectId);
+  const running = latestJob && ["approved", "queued", "running"].includes(latestJob.status);
+  const verified = latest?.status === "verified";
 
-
-/* ============================================================
-   DriveOS — Archive + Archive Checklist Modal
-   ============================================================ */
-
-
-  
-
-  const CHECKLIST = [
-    "Final exports exist", "Raw footage exists", "Project files exist",
-    "Music / SFX / license docs exist", "Fonts & graphics exist", "Archive copy verified",
-    "Cloud copy verified (if required)", "Checksums generated", "Proxies marked safe to remove",
-    "Cache marked safe to remove", "Review exports selected for quarantine", "Status changed to Archived",
-  ];
-
-  // ---- Archive Checklist Modal ----
-  function ArchiveChecklistModal({ p, onClose, toast, go }: ScreenProps) {
-    const initial = CHECKLIST.map((_, i: number) => i < 5 || (p && p.archiveReady > 80 && i < 9));
-    const [done, setDone] = React.useState(initial);
-    const complete = done.filter(Boolean).length;
-    const allDone = complete === CHECKLIST.length;
-    const toggle = (i: number) => setDone((d: boolean[]) => d.map((x: boolean, j: number) => j === i ? !x : x));
-
-    const footer = [
-      h("div", { key: "p", className: "row", style: { gap: 10, marginRight: "auto" } },
-        h("div", { style: { width: 120 } }, h(Bar, { value: complete, max: CHECKLIST.length, kind: allDone ? "ok" : "warn", height: 6 })),
-        h("span", { className: "mono", style: { fontSize: 12, color: "var(--tx-mut)" } }, complete + " / " + CHECKLIST.length)),
-      h("button", { key: "c", className: "btn", onClick: onClose }, "Cancel"),
-      h("button", { key: "m", className: "btn", onClick: () => toast("Checksum manifest generated", "fingerprint", "accent") }, h(Icon, { name: "fingerprint", size: 14 }), "Generate Manifest"),
-      h("button", { key: "a", className: "btn primary", disabled: !allDone, onClick: () => { toast((p ? p.name : "Project") + " archived", "archive", "ok"); onClose(); if (go) go("archive"); } },
-        h(Icon, { name: "archive", size: 14 }), allDone ? "Mark Archived" : "Complete all items"),
-    ];
-
-    return h(Modal, { title: "Archive Checklist" + (p ? " — " + p.name : ""), subtitle: "Step-by-step closeout. Nothing archives until every item is verified.", icon: "archive", iconKind: "auto", onClose, footer, width: 620 },
-      h("div", { style: { display: "flex", flexDirection: "column", gap: 7 } }, CHECKLIST.map((c, i) =>
-        h("div", { key: i, className: "spread", onClick: () => toggle(i), style: { padding: "11px 13px", borderRadius: "var(--r)", cursor: "pointer", background: done[i] ? "var(--ok-soft)" : "var(--bg-surface)", border: "1px solid " + (done[i] ? "var(--ok-line)" : "var(--line)"), transition: "all .12s" } },
-          h("div", { className: "row", style: { gap: 11 } },
-            h("span", { className: "chk " + (done[i] ? "on" : ""), style: { background: done[i] ? "var(--ok)" : "var(--bg-input)", borderColor: done[i] ? "var(--ok)" : "var(--line-strong)" } }, h(Icon, { name: "check", size: 12, stroke: 3, style: { color: "#fff", opacity: done[i] ? 1 : 0 } })),
-            h("span", { style: { fontSize: 13, fontWeight: 500, color: done[i] ? "var(--tx-hi)" : "var(--tx)" } }, c)),
-          h("span", { className: "mono dim", style: { fontSize: 10.5 } }, String(i + 1).padStart(2, "0")))))) ;
+  async function request(verify = false) {
+    if (!projectId || busy) return;
+    setBusy(true);
+    try { await requestManifest({ projectId, verify }); toast(verify ? "Archive verification queued for the agent" : "Archive manifest queued for the agent", "clock", "accent"); }
+    catch (error) { toast(message(error), "alert", "risk"); }
+    finally { setBusy(false); }
   }
-
-  // ---- Archive drive card ----
-  function ArchiveDriveCard({ d, go }: ScreenProps) {
-    const verified = d.id === "vault-a" ? "47 days ago" : d.id === "brandon-arc" ? "6 days ago" : "21 days ago";
-    return h("div", { className: "card fade-up", onClick: () => go("drive", { id: d.id }), style: { cursor: "pointer" } },
-      h("div", { className: "card-pad" },
-        h("div", { className: "spread", style: { marginBottom: 13 } },
-          h("div", { className: "row", style: { gap: 11, minWidth: 0 } },
-            h("div", { style: { width: 38, height: 38, borderRadius: 10, flexShrink: 0, display: "grid", placeItems: "center", background: "var(--auto-soft)", color: "var(--auto)", border: "1px solid var(--auto-line)" } }, h(Icon, { name: "archive", size: 18 })),
-            h("div", { style: { minWidth: 0 } }, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 13.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, d.name),
-              h("div", { className: "muted", style: { fontSize: 11 } }, d.location))),
-          h(StatusBadge, { status: d.status })),
-        h(Bar, { value: d.usedTB, max: d.capTB, kind: "", height: 7 }),
-        h("div", { className: "spread", style: { fontSize: 11, marginTop: 6 } }, h("span", { className: "mono dim" }, fmtTB(d.usedTB) + " / " + d.capTB + " TB"), h("span", { className: "muted" }, d.projects.length + " projects")),
-        h("div", { className: "divider", style: { margin: "13px 0" } }),
-        h("div", { className: "spread", style: { fontSize: 11.5 } },
-          h("span", { className: "row", style: { gap: 6 } }, h(Icon, { name: "fingerprint", size: 13, style: { color: "var(--ok)" } }), h("span", { className: "muted" }, "Checksum verified")),
-          h("span", { className: "mono dim" }, verified))));
+  async function archive() {
+    if (!projectId || !verified || !done.every(Boolean) || busy) return;
+    setBusy(true);
+    try { await updateStatus({ projectId, status: "archived" }); toast(`${p.name} marked archived`, "archive", "ok"); onClose(); go?.("archive"); }
+    catch (error) { toast(message(error), "alert", "risk"); }
+    finally { setBusy(false); }
   }
+  return <Modal title={`Archive Checklist${p ? ` — ${p.name}` : ""}`} subtitle="Review these conditions yourself. Checkmarks are your confirmation, not an automatic backup verification." icon="archive" iconKind="auto" onClose={onClose} width={760} footer={[
+    <button key="close" className="btn" onClick={onClose}>Cancel</button>,
+    <button key="generate" className="btn" disabled={!projectId || busy || Boolean(running)} onClick={() => void request(false)}>Generate Manifest</button>,
+    <button key="verify" className="btn" disabled={!latest || busy || Boolean(running)} onClick={() => void request(true)}>Verify Manifest</button>,
+    <button key="archive" className="btn primary" disabled={!projectId || !verified || !done.every(Boolean) || busy} onClick={() => void archive()}>Mark Archived</button>,
+  ]}>
+    {!projectId ? <p className="muted">Select a project before starting an archive.</p> : <>
+      <div className="card card-pad" style={{ marginBottom: 16 }}>
+        <div className="spread"><b>Archive manifest</b><Badge kind={verified ? "ok" : latest?.status === "failed" ? "risk" : "warn"}>{running ? `Agent job ${latestJob.status}` : latest?.status || "Not generated"}</Badge></div>
+        <p className="muted" style={{ fontSize: 12, lineHeight: 1.6, marginBottom: 0 }}>{latest ? `${latest.fileCount} files · ${formatBytes(latest.totalBytes)} · ${latest.manifestPath}` : "The agent creates a file inventory and checksums from the actual project folder. Its verification must finish before the project can be marked archived."}</p>
+        {latestJob?.status === "failed" && <p style={{ color: "var(--risk)", fontSize: 12 }}>{latestJob.result?.error || "The agent could not complete this archive request. Check its log."}</p>}
+      </div>
+      <div style={{ display: "grid", gap: 9 }}>{CHECKLIST.map((text, i) => <label key={text} className="row" style={{ gap: 11, padding: 13, border: "1px solid var(--line)", borderRadius: "var(--r)", background: done[i] ? "var(--ok-soft)" : "var(--bg-surface)", cursor: "pointer" }}><input type="checkbox" checked={done[i]} onChange={e => setDone(previous => previous.map((value, index) => index === i ? e.target.checked : value))} /><span style={{ fontSize: 13 }}>{text}</span></label>)}</div>
+      <p className="dim" style={{ fontSize: 12 }}>Manifest verification checks the current project inventory. It does not prove that a separate drive or cloud backup exists.</p>
+    </>}
+  </Modal>;
+}
 
-  function ArchiveScreen({ go, toast }: ScreenProps) {
-    const [modal, setModal] = React.useState<ArchiveModalState>(null);
-    const ready = DB.projects.filter((p) => p.status === "ready" || (p.status === "delivered" && p.archiveReady >= 80));
-    const archiveDrives = DB.drives.filter((d) => d.tier === "cold");
-
-    return h("div", { className: "page-inner" },
-      h(PageHead, { eyebrow: "Storage", title: "Archive", desc: "Cold storage and finished projects. Verify redundancy and checksums before a project goes offline for good.",
-        actions: [
-          h("button", { key: 1, className: "btn", onClick: () => toast("Verifying archive integrity…", "fingerprint", "accent") }, h(Icon, { name: "shieldCheck", size: 15 }), "Verify Archive"),
-          h("button", { key: 2, className: "btn primary", onClick: () => setModal({ p: ready[0] }) }, h(Icon, { name: "archive", size: 15 }), "Start Archive Checklist")] }),
-
-      // KPIs
-      h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "var(--gap)", marginBottom: "var(--gap)" } },
-        akpi("Ready to Archive", ready.length, "archive", "var(--auto)"),
-        akpi("Archive Drives", archiveDrives.length, "server", "var(--tx-hi)"),
-        akpi("Cold Storage", fmtTB((DB.tiers.find((t) => t.key === "cold") || { usedTB: 0 }).usedTB), "database", "var(--tx-hi)"),
-        akpi("At-risk Projects", 2, "alert", "var(--risk)")),
-
-      // ready to archive
-      h("h3", { style: { fontSize: 15, marginBottom: 13 } }, "Projects Ready to Archive"),
-      h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--gap)", marginBottom: 26 } },
-        ready.map((p) => h(ReadyCard, { key: p.id, p, go, onStart: () => setModal({ p }) }))),
-
-      // archive drives
-      h("h3", { style: { fontSize: 15, marginBottom: 13 } }, "Offline Drive Catalog"),
-      h("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px,1fr))", gap: "var(--gap)", marginBottom: 26 } },
-        archiveDrives.map((d) => h(ArchiveDriveCard, { key: d.id, d, go }))),
-
-      modal && h(ArchiveChecklistModal, { p: modal.p, onClose: () => setModal(null), toast, go }));
+export function ArchiveScreen({ go, toast }: ScreenProps) {
+  const manifests = useQuery(api.archive.listManifests);
+  const requestManifest = useMutation(api.archive.requestManifest);
+  const [selected, setSelected] = React.useState("");
+  const [modal, setModal] = React.useState<any | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const projects = DB.projects;
+  const selectedProject = projects.find(p => p.id === selected) || projects[0];
+  const ready = projects.filter(p => ["ready", "ready_to_archive", "delivered"].includes(p.status));
+  const archiveDrives = DB.drives.filter(d => d.tier === "cold");
+  const fullManifests = (manifests || []).filter((m: any) => /archive_manifest\.json$/i.test(m.manifestPath));
+  const latestSelected = fullManifests.filter((m: any) => m.projectId === selectedProject?.id).sort((a: any, b: any) => b.createdAt - a.createdAt)[0];
+  async function verify() {
+    if (!selectedProject || busy) return;
+    setBusy(true);
+    try { await requestManifest({ projectId: selectedProject.id, verify: true }); toast("Archive verification queued for the agent", "clock", "accent"); }
+    catch (error) { toast(message(error), "alert", "risk"); }
+    finally { setBusy(false); }
   }
-
-  function ReadyCard({ p, go, onStart }: ScreenProps) {
-    const risks: string[] = [];
-    if (p.id === "show-x-old") risks.push("Only one copy exists");
-    if (p.archiveReady < 90) risks.push("Cloud copy not verified");
-    if (p.structure < 60) risks.push("Project files incomplete");
-    const checks = [
-      { label: "Final exports", ok: p.archiveReady > 50 },
-      { label: "Raw footage verified", ok: p.id !== "show-x-old" },
-      { label: "Project files", ok: p.structure > 60 },
-      { label: "Checksums generated", ok: p.archiveReady >= 90 },
-    ];
-    return h("div", { className: "card fade-up" },
-      h("div", { className: "card-pad" },
-        h("div", { className: "spread", style: { marginBottom: 12 } },
-          h("div", { style: { minWidth: 0 } }, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 14.5, cursor: "pointer" }, onClick: () => go("project", { id: p.id }) }, p.name),
-            h("div", { className: "muted", style: { fontSize: 11.5, marginTop: 2 } }, p.client + " · " + fmtTB(p.sizeTB) + " · " + p.modified)),
-          h("div", { style: { textAlign: "right" } }, h("div", { className: "stat-num", style: { fontSize: 22, color: p.archiveReady >= 90 ? "var(--ok)" : "var(--warn)" } }, p.archiveReady + "%"), h("div", { className: "eyebrow", style: { fontSize: 9 } }, "Ready"))),
-        h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 13 } }, checks.map((c, i) =>
-          h("div", { key: i, className: "row", style: { gap: 8 } }, h("span", { style: { width: 18, height: 18, borderRadius: 5, display: "grid", placeItems: "center", flexShrink: 0, background: c.ok ? "var(--ok-soft)" : "var(--risk-soft)", color: c.ok ? "var(--ok)" : "var(--risk)" } }, h(Icon, { name: c.ok ? "check" : "x", size: 12, stroke: 3 })),
-            h("span", { style: { fontSize: 12, color: c.ok ? "var(--tx)" : "var(--tx-mut)" } }, c.label)))),
-        risks.length > 0 && h("div", { style: { padding: "9px 12px", borderRadius: "var(--r)", background: "var(--risk-soft)", border: "1px solid var(--risk-line)", marginBottom: 13 } },
-          risks.map((rk, i) => h("div", { key: i, className: "row", style: { gap: 7, fontSize: 11.5, color: "var(--tx)", padding: "1px 0" } }, h(Icon, { name: "alert", size: 12, style: { color: "var(--risk)", flexShrink: 0 } }), rk))),
-        h("div", { className: "row", style: { gap: 8 } },
-          h("button", { className: "btn primary sm", style: { flex: 1 }, onClick: onStart }, h(Icon, { name: "archive", size: 14 }), "Archive Checklist"),
-          h("button", { className: "btn sm", onClick: () => go("project", { id: p.id }) }, "Open"))));
-  }
-
-  function akpi(label: React.ReactNode, value: React.ReactNode, icon: string, color: string) {
-    return h("div", { className: "card card-pad fade-up", style: { display: "flex", alignItems: "center", gap: 13 } },
-      h("div", { style: { width: 38, height: 38, borderRadius: 10, display: "grid", placeItems: "center", flexShrink: 0, background: "var(--bg-surface)", color, border: "1px solid var(--line)" } }, h(Icon, { name: icon, size: 18 })),
-      h("div", null, h("div", { className: "stat-num", style: { fontSize: 21, color } }, value), h("div", { className: "eyebrow", style: { fontSize: 9.5, marginTop: 1 } }, label)));
-  }
-
-  
-  
-
-
-export { ArchiveScreen, ArchiveChecklistModal };
+  return <div className="page-inner">
+    <PageHead eyebrow="Storage" title="Archive" desc="Generate and verify actual project inventories. Backup-copy confirmation remains a separate review." actions={[
+      <button key="verify" className="btn" disabled={!latestSelected || busy} title={!latestSelected ? "Generate a full archive manifest first" : "Verify the selected project's actual inventory"} onClick={() => void verify()}><Icon name="shieldCheck" size={15} />Verify Archive</button>,
+      <button key="checklist" className="btn primary" disabled={!selectedProject} onClick={() => setModal(selectedProject)}><Icon name="archive" size={15} />Start Archive Checklist</button>,
+    ]} />
+    <div className="card card-pad" style={{ marginBottom: "var(--gap)" }}><label className="field-label" htmlFor="archive-project">Project</label><select id="archive-project" className="select" value={selectedProject?.id || ""} onChange={e => setSelected(e.target.value)} style={{ minWidth: 280 }}>{projects.length === 0 ? <option value="">No projects available</option> : projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></div>
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "var(--gap)", marginBottom: "var(--gap)" }}>{[
+      ["Ready for review", ready.length], ["Archive drives", archiveDrives.length], ["Cold storage used", formatBytes(archiveDrives.reduce((sum, d) => sum + d.usedTB * 1024 ** 4, 0))], ["Verified manifests", fullManifests.filter((m: any) => m.status === "verified").length],
+    ].map(([label, value]) => <div className="card card-pad" key={label}><div className="eyebrow">{label}</div><div className="stat-num" style={{ fontSize: 23, marginTop: 8 }}>{value}</div></div>)}</div>
+    <h3 style={{ fontSize: 15 }}>Projects Ready for Archive Review</h3>
+    {ready.length === 0 ? <div className="card card-pad muted" style={{ marginBottom: "var(--gap)" }}>No delivered or ready-to-archive projects yet. Any tracked project can generate a manifest from the selector above.</div> : <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: "var(--gap)", marginBottom: "var(--gap)" }}>{ready.map(p => <div className="card card-pad" key={p.id}><h3 style={{ marginTop: 0, fontSize: 15 }}>{p.name}</h3><p className="muted">{p.client} · {formatBytes(p.sizeTB * 1024 ** 4)}</p><div className="row" style={{ gap: 8 }}><button className="btn primary sm" onClick={() => setModal(p)}>Archive Checklist</button><button className="btn sm" onClick={() => go("project", { id: p.id })}>Open</button></div></div>)}</div>}
+    <h3 style={{ fontSize: 15 }}>Archive Drive Catalog</h3>
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: "var(--gap)", marginBottom: "var(--gap)" }}>{archiveDrives.length === 0 ? <div className="card card-pad muted">No drives are assigned to cold storage.</div> : archiveDrives.map(d => <button className="card card-pad" key={d.id} style={{ textAlign: "left", cursor: "pointer" }} onClick={() => go("drive", { id: d.id })}><div className="spread"><b>{d.name}</b><StatusBadge status={d.status} /></div><p className="muted">{d.location} · {formatBytes(d.usedTB * 1024 ** 4)} used</p><div className="dim" style={{ fontSize: 12 }}>Backup checksums have not been verified for this drive.</div></button>)}</div>
+    {modal && <ArchiveChecklistModal p={modal} onClose={() => setModal(null)} toast={toast} go={go} />}
+  </div>;
+}

@@ -8,6 +8,8 @@ import { Command } from "commander";
 import chokidar from "chokidar";
 import dotenv from "dotenv";
 import { classifyFile, calculateFileRisk } from "@driveos/shared";
+import { isProtectedSourceFile, moveFileSafely, quarantineDestination, QUARANTINE_FOLDER_NAME } from "./fileOperations.js";
+import { walkManifestFiles } from "./manifestFiles.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), "apps/web/.env.local") });
 dotenv.config({ path: path.resolve(process.cwd(), ".env.local") });
@@ -146,7 +148,6 @@ const DEFAULT_CONFIG: DriveOSConfig = {
 // Per-volume quarantine folder name. Lives at the root of each scanned volume
 // when quarantineOnSourceVolume is on, and is in IGNORED_FOLDERS so scans never
 // re-catalog files that were just quarantined.
-const QUARANTINE_FOLDER_NAME = ".driveos-quarantine";
 
 const IGNORED_FOLDERS = new Set([
   ".TRASH",
@@ -683,70 +684,22 @@ function writeProjectStructure(root: string, project: any, projectId: string, al
   return { manifest, manifestPath };
 }
 
-function preserveOriginalPath(originalPath: string) {
-  const parsed = path.parse(path.resolve(originalPath));
-  return path.join(parsed.root.replace(/[:/\\]+/g, "_"), path.relative(parsed.root, path.resolve(originalPath)));
-}
-
-// Resolve the volume mount root a path lives on, so quarantine can stay on the
-// same disk (a fast rename, no cross-volume copy). macOS external drives mount
-// at /Volumes/<Name>; Windows volumes are a drive-letter root like E:\. Falls
-// back to the filesystem root when nothing more specific matches.
-function volumeRootForPath(targetPath: string): string {
-  const resolved = path.resolve(targetPath);
-  if (process.platform === "darwin") {
-    const m = resolved.match(/^(\/Volumes\/[^/]+)/);
-    if (m) return m[1];
-  }
-  return path.parse(resolved).root;
-}
-
-// Where a quarantined file should land. Per-volume by default (same-disk move,
-// works on external drives); otherwise the single configured quarantineRoot.
-function quarantineDestination(filePath: string, config: DriveOSConfig, jobId: string, timestamp: string): string {
-  if (config.quarantineOnSourceVolume !== false) {
-    const volRoot = volumeRootForPath(filePath);
-    return path.join(volRoot, QUARANTINE_FOLDER_NAME, timestamp, jobId, path.basename(filePath));
-  }
-  return path.join(config.quarantineRoot, timestamp, jobId, preserveOriginalPath(filePath));
-}
-
-// Move a file to quarantine, surviving cross-volume moves. A plain rename fails
-// with EXDEV when source and destination are on different volumes (the reason
-// quarantine never worked on external drives), so fall back to copy → verify
-// size → delete original. The original is only removed after the copy is
-// confirmed byte-for-byte the same size, so an interrupted move never loses data.
-function moveFileSafely(src: string, dest: string) {
-  fs.mkdirSync(path.dirname(dest), { recursive: true });
-  try {
-    fs.renameSync(src, dest);
-    return;
-  } catch (err: any) {
-    if (err.code !== "EXDEV") throw err;
-  }
-  const srcSize = fs.statSync(src).size;
-  fs.copyFileSync(src, dest);
-  const destSize = fs.statSync(dest).size;
-  if (destSize !== srcSize) {
-    try { fs.unlinkSync(dest); } catch {}
-    throw new Error(`Cross-volume copy size mismatch for ${src} (${srcSize} vs ${destSize}); original left in place`);
-  }
-  fs.unlinkSync(src);
-}
-
 async function executeQuarantineJob(job: any, config: DriveOSConfig) {
   validateRuntimeConfig(config);
   const quarantineFiles = [];
+  const failures: { fileId: string; error: string }[] = [];
   const timestamp = new Date().toISOString().split("T")[0];
 
   for (const file of job.files || []) {
-    if (["RAW", "EXPORT_FINAL", "PROJECT_FILE", "ADMIN", "ARCHIVE_MANIFEST"].includes(file.classification)) {
+    if (isProtectedSourceFile(file)) {
       console.warn(`[Quarantine Blocked] Protected ${file.classification} file skipped: ${file.path}`);
+      failures.push({ fileId: file._id, error: "Protected source file" });
       continue;
     }
 
     if (!fs.existsSync(file.path)) {
       console.warn(`[Quarantine Warning] File was missing: ${file.path}`);
+      failures.push({ fileId: file._id, error: "Source file is missing" });
       continue;
     }
 
@@ -754,9 +707,20 @@ async function executeQuarantineJob(job: any, config: DriveOSConfig) {
 
     console.log(`[Quarantine Execute] ${file.path} -> ${destination}`);
     try {
+      const current = fs.statSync(file.path);
+      if (current.size !== file.sizeBytes || (typeof file.modifiedAtFile === "number" && Math.abs(current.mtimeMs - file.modifiedAtFile) > 1)) {
+        throw new Error("File changed since its last scan. Scan it again before cleanup.");
+      }
+      const classification = classifyFile(file.path, path.basename(file.path));
+      if (!["CACHE", "RENDER_PREVIEW", "PROXY"].includes(classification)) {
+        if (!file.fullHash || await calculateFullHash(file.path) !== file.fullHash) {
+          throw new Error("The duplicate content hash is missing or changed. Run a full-hash scan before cleanup.");
+        }
+      }
       moveFileSafely(file.path, destination);
     } catch (err: any) {
       console.error(`[Quarantine Error] Could not move ${file.path}: ${err.message}`);
+      failures.push({ fileId: file._id, error: err.message });
       continue;
     }
     quarantineFiles.push({
@@ -769,11 +733,12 @@ async function executeQuarantineJob(job: any, config: DriveOSConfig) {
 
   await syncToConvex("updateJobStatus", {
     jobId: job._id,
-    status: "completed",
+    status: failures.length > 0 ? "failed" : "completed",
     quarantineFiles,
+    result: { moved: quarantineFiles.length, failures },
   });
 
-  console.log(`[Success] Relocated ${quarantineFiles.length} file(s) to quarantine.`);
+  console.log(`[Quarantine Result] Relocated ${quarantineFiles.length} file(s); ${failures.length} skipped or failed.`);
 }
 
 // Permanently delete quarantined files whose rollback window expired. The backend
@@ -783,6 +748,7 @@ async function executeQuarantineJob(job: any, config: DriveOSConfig) {
 async function executePurgeJob(job: any) {
   const purgeItems: { quarantineItemId: string; quarantinePath: string }[] = job.result?.purgeItems || [];
   const purgedItemIds: string[] = [];
+  const failures: { quarantineItemId: string; error: string }[] = [];
   let freedBytes = 0;
 
   for (const item of purgeItems) {
@@ -793,35 +759,132 @@ async function executePurgeJob(job: any) {
         freedBytes += size;
         console.log(`[Purge] Permanently deleted ${item.quarantinePath}`);
       } else {
-        console.warn(`[Purge] Already gone, marking deleted: ${item.quarantinePath}`);
+        throw new Error(`Quarantined file is unavailable on this machine: ${item.quarantinePath}`);
       }
       // Either way the file is no longer on disk, so the item is settled.
       purgedItemIds.push(item.quarantineItemId);
     } catch (err: any) {
       console.error(`[Purge Error] Could not delete ${item.quarantinePath}: ${err.message}`);
+      failures.push({ quarantineItemId: item.quarantineItemId, error: err.message });
     }
   }
 
   await syncToConvex("updateJobStatus", {
     jobId: job._id,
-    status: "completed",
-    result: { purgedItemIds },
+    status: failures.length > 0 ? "failed" : "completed",
+    result: { purgedItemIds, failures },
   });
   console.log(`[Success] Purged ${purgedItemIds.length} item(s), freed ${(freedBytes / (1024 ** 3)).toFixed(2)} GB.`);
 }
 
-async function executeJob(job: any, config: DriveOSConfig) {
+async function restoreQuarantineItem(quarantineId: string, finalize = true) {
+  const response = await syncToConvex("getQuarantineItem", { quarantineId });
+  const item = response.item;
+  if (!item || !fs.existsSync(item.quarantinePath)) throw new Error("Quarantined file is unavailable on this machine.");
+  moveFileSafely(item.quarantinePath, item.originalPath);
+  if (finalize) await syncToConvex("markQuarantineRestored", { quarantineId });
+  console.log(`[Restore Success] ${item.quarantinePath} -> ${item.originalPath}`);
+}
+
+async function generateArchiveManifest(projectId: string, rootOverride?: string, verify = false, expectedManifestChecksum?: string) {
+  const projectRes = await syncToConvex("getProject", { projectId });
+  const project = projectRes.project;
+  const configuredRoot = rootOverride || project?.rootPath;
+  if (!project || !configuredRoot || !path.isAbsolute(configuredRoot) || !fs.existsSync(configuredRoot)) {
+    throw new Error("The project must have an existing absolute local root before a manifest can be generated.");
+  }
+  const root = path.resolve(configuredRoot);
+  if (cloudSyncProvider(root)) throw new Error("Archive manifests must be generated on a local project drive.");
+  const manifestPath = path.join(root, "09_ARCHIVE_MANIFEST", "archive_manifest.json");
+  let baseline: any = null;
+  if (verify) {
+    if (!expectedManifestChecksum || !fs.existsSync(manifestPath)) throw new Error("Generate a checksummed archive manifest before verifying this project.");
+    const saved = fs.readFileSync(manifestPath, "utf8");
+    if (crypto.createHash("sha256").update(saved).digest("hex") !== expectedManifestChecksum) throw new Error("The saved manifest changed since it was registered.");
+    baseline = JSON.parse(saved);
+    if (!Array.isArray(baseline.files) || baseline.files.some((file: any) => !file.fullHash)) throw new Error("The manifest has no complete SHA-256 inventory. Generate it again.");
+  }
+  const hashCache = loadHashCache();
+  const files: any[] = [];
+  let totalBytes = 0;
+  await walkManifestFiles(root, async (filePath, stats) => {
+    const metadata = await buildFileMetadata(filePath, stats, hashCache, false);
+    // Verification must re-read content, even when a cached size/mtime matches.
+    const fullHash = await calculateFullHash(filePath);
+    const after = fs.statSync(filePath);
+    if (stats.size !== after.size || stats.mtimeMs !== after.mtimeMs) throw new Error(`File changed while generating manifest: ${filePath}`);
+    totalBytes += stats.size;
+    files.push({ path: metadata.path, sizeBytes: metadata.sizeBytes, modifiedAtFile: metadata.modifiedAtFile,
+      quickHash: metadata.quickHash, fullHash, classification: metadata.classification });
+  });
+  if (baseline) {
+    const current = new Map(files.map(file => [path.resolve(file.path), file]));
+    if (current.size !== baseline.files.length) throw new Error("Project inventory changed since the manifest was generated.");
+    for (const entry of baseline.files) {
+      const file = current.get(path.resolve(entry.path));
+      if (!file || file.sizeBytes !== entry.sizeBytes || file.fullHash !== entry.fullHash) throw new Error(`Archive verification failed for ${entry.path}`);
+    }
+    const verificationResult = { verified: true, checkedFiles: files.length, checkedAt: Date.now() };
+    await syncToConvex("createManifest", { projectId, createdBy: project.ownerId || loadConfig().ownerId,
+      fileCount: files.length, totalBytes, manifestPath, checksum: expectedManifestChecksum, verificationResult });
+    return { manifestPath, checksum: expectedManifestChecksum, fileCount: files.length, totalBytes, verificationResult };
+  }
+  const manifest = { ...buildProjectManifest(project, projectId, root), generatedAt: new Date().toISOString(),
+    rootPath: root, fileCount: files.length, totalBytes, files };
+  const serialized = JSON.stringify(manifest, null, 2);
+  const checksum = crypto.createHash("sha256").update(serialized).digest("hex");
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(manifestPath, serialized, "utf8");
+  saveHashCache(hashCache);
+  await syncToConvex("createManifest", { projectId, createdBy: project.ownerId || loadConfig().ownerId,
+    fileCount: files.length, totalBytes, manifestPath, checksum });
+  return { manifestPath, checksum, fileCount: files.length, totalBytes };
+}
+
+async function executeJob(job: any, config: DriveOSConfig): Promise<boolean> {
+  if (!["approved", "queued"].includes(job.status)) throw new Error("Only approved or queued jobs can run.");
   console.log(`[Agent Queue] Executing job ${job._id}: ${job.action}`);
-  await syncToConvex("updateJobStatus", { jobId: job._id, status: "running" });
+  const claim = await syncToConvex("updateJobStatus", { jobId: job._id, status: "running" });
+  if (claim.claimed === false) {
+    console.log(`[Agent Queue] Job ${job._id} was already claimed or completed — skipped.`);
+    return false;
+  }
 
   if (job.action === "quarantine") {
     await executeQuarantineJob(job, config);
-    return;
+    return true;
   }
 
   if (job.action === "purge") {
     await executePurgeJob(job);
-    return;
+    return true;
+  }
+
+  if (job.action === "restore") {
+    const quarantineId = job.result?.quarantineId;
+    if (!quarantineId) throw new Error("Restore job is missing its quarantine item.");
+    await restoreQuarantineItem(quarantineId, false);
+    await syncToConvex("updateJobStatus", { jobId: job._id, status: "completed", result: { restoredQuarantineIds: [quarantineId] } });
+    return true;
+  }
+
+  if (job.action === "scan") {
+    const root = job.result?.rootPath;
+    if (!root || !path.isAbsolute(root) || !fs.existsSync(root)) throw new Error("The requested drive is unavailable on this machine.");
+    if (!acquireScanLock()) throw new Error("Another scan is running. Retry when it finishes.");
+    try {
+      const scan = await performScan(root, loadConfig(), { checkStability: true });
+      await syncToConvex("updateJobStatus", { jobId: job._id, status: scan.errorsCount > 0 ? "failed" : "completed", result: { ...job.result, ...scan } });
+    } finally {
+      releaseScanLock();
+    }
+    return true;
+  }
+
+  if (job.action === "generate_manifest") {
+    const result = await generateArchiveManifest(job.result?.projectId, job.result?.rootPath, Boolean(job.result?.verify), job.result?.expectedManifestChecksum);
+    await syncToConvex("updateJobStatus", { jobId: job._id, status: "completed", result });
+    return true;
   }
 
   if (job.action === "create_folder_structure") {
@@ -830,20 +893,21 @@ async function executeJob(job: any, config: DriveOSConfig) {
     if (!rootPath) throw new Error("create_folder_structure job missing result.rootPath");
 
     const { manifest, manifestPath } = writeProjectStructure(rootPath, result, result.projectId || job._id);
+    const manifestJson = fs.readFileSync(manifestPath, "utf8");
     await syncToConvex("createManifest", {
       projectId: result.projectId || job._id,
       createdBy: result.owner || config.ownerId,
-      fileCount: PROJECT_FOLDER_TREE.length + 1,
-      totalBytes: Buffer.byteLength(JSON.stringify(manifest)),
+      fileCount: 1,
+      totalBytes: Buffer.byteLength(manifestJson),
       manifestPath,
-      checksum: crypto.createHash("sha256").update(JSON.stringify(manifest)).digest("hex"),
+      checksum: crypto.createHash("sha256").update(manifestJson).digest("hex"),
     });
-    await syncToConvex("updateJobStatus", { jobId: job._id, status: "completed" });
+    await syncToConvex("updateJobStatus", { jobId: job._id, status: "completed", result: { ...result, manifestPath, folderCount: PROJECT_FOLDER_TREE.length, completedAt: Date.now() } });
     console.log(`[Success] Created project folder structure at ${rootPath}.`);
-    return;
+    return true;
   }
 
-  await syncToConvex("updateJobStatus", { jobId: job._id, status: "completed" });
+  throw new Error(`Unsupported agent action: ${job.action}`);
 }
 
 interface ScanOptions {
@@ -1486,7 +1550,9 @@ program
         cyclesToday++;
 
         try {
-          const res = await runSyncCycle(config, scanOpts);
+          // Add/remove drive actions run in separate CLI processes. Reload roots
+          // each cycle so the resident scheduler immediately honors that config.
+          const res = await runSyncCycle(loadConfig(), scanOpts);
           // uploadedCount === 0 → nothing changed on disk; back off. Any upload
           // (or an errored/null cycle we want to retry sooner) resets to base.
           const quiet = res != null && res.uploadedCount === 0;
@@ -1516,7 +1582,7 @@ program
     const scheduleJobPoll = (delay: number) => {
       jobsTimer = setTimeout(async () => {
         try {
-          const executed = await runPendingJobs(config);
+          const executed = await runPendingJobs(loadConfig());
           // Work found → poll fast again; idle → back off, capped.
           jobPollDelay = executed > 0 ? JOB_POLL_MIN_MS : Math.min(jobPollDelay * 2, JOB_POLL_MAX_MS);
         } catch (err: any) {
@@ -1793,14 +1859,15 @@ program
     const projectRes = await syncToConvex("getProject", { projectId: options.projectId });
     const project = projectRes.project || {};
     const { manifest, manifestPath } = writeProjectStructure(root, project, options.projectId);
+    const manifestJson = fs.readFileSync(manifestPath, "utf8");
 
     await syncToConvex("createManifest", {
       projectId: options.projectId,
       createdBy: project.ownerId || config.ownerId,
-      fileCount: PROJECT_FOLDER_TREE.length + 1,
-      totalBytes: Buffer.byteLength(JSON.stringify(manifest)),
+      fileCount: 1,
+      totalBytes: Buffer.byteLength(manifestJson),
       manifestPath,
-      checksum: crypto.createHash("sha256").update(JSON.stringify(manifest)).digest("hex"),
+      checksum: crypto.createHash("sha256").update(manifestJson).digest("hex"),
     });
 
     console.log(`[Wizard Success] Created project folder structure at ${root}`);
@@ -1819,8 +1886,7 @@ async function runPendingJobs(config: DriveOSConfig): Promise<number> {
   let executed = 0;
   for (const job of jobs) {
     try {
-      await executeJob(job, config);
-      executed++;
+      if (await executeJob(job, config)) executed++;
     } catch (err: any) {
       console.error(`[Agent Execution Error] Job ${job._id} failed: ${err.message}`);
       await syncToConvex("updateJobStatus", { jobId: job._id, status: "failed", result: { error: err.message } });
@@ -1861,23 +1927,7 @@ program
   .description("Restore a quarantined file to its original path")
   .requiredOption("-q, --quarantineId <id>", "Quarantine item ID")
   .action(async (options) => {
-    const res = await syncToConvex("getQuarantineItem", { quarantineId: options.quarantineId });
-    const item = res.item;
-    if (!item || res.offline) {
-      console.error(`[Error] Quarantine item not found or Convex is offline: ${options.quarantineId}`);
-      process.exit(1);
-    }
-
-    if (!fs.existsSync(item.quarantinePath)) {
-      console.error(`[Error] Quarantined file missing: ${item.quarantinePath}`);
-      process.exit(1);
-    }
-
-    // Cross-volume safe, so a file quarantined under the legacy single-folder
-    // mode still restores onto its source drive.
-    moveFileSafely(item.quarantinePath, item.originalPath);
-    await syncToConvex("markQuarantineRestored", { quarantineId: options.quarantineId });
-    console.log(`[Restore Success] ${item.quarantinePath} -> ${item.originalPath}`);
+    await restoreQuarantineItem(options.quarantineId);
   });
 
 program

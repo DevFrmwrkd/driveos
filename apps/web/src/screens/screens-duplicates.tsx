@@ -2,262 +2,80 @@ import React from "react";
 import { useMutation } from "convex/react";
 import { api } from "@/convexApi";
 import { DB } from "@/data";
-import {
-  Icon,
-  fmtTB,
-  fmtGB,
-  pct,
-  fmtNum,
-  STATUS_META,
-  RISK_META,
-  PROJ_STATUS,
-  TIER_META,
-  tierKind,
-  Avatar,
-  Badge,
-  StatusBadge,
-  RiskBadge,
-  Bar,
-  MultiBar,
-  Donut,
-  HealthRing,
-  Sparkline,
-  MiniBars,
-  Treemap,
-  StatCard,
-  Check,
-  Seg,
-  FileTypePill,
-  FT_ICON,
-  Modal,
-  SectionTitle,
-  Legend,
-  PageHead,
-  cardShell,
-  getVar
-} from "@/components";
-const h: any = React.createElement;
+import { Icon, Badge, PageHead, Seg } from "@/components";
+import { formatBytes } from "@/lib/download";
 
 type ScreenProps = Record<string, any>;
-type AnyRecord = Record<string, any>;
+const KIND_LABEL: Record<string, string> = { exact: "Exact match", likely: "Likely duplicate", same_name: "Same name", stock_reuse: "Stock reuse" };
 
+function ClusterCard({ cluster, go, toast }: ScreenProps) {
+  const queueQuarantine = useMutation(api.cleanup.queueQuarantine);
+  const updateStatus = useMutation(api.duplicates.updateStatus);
+  const [selection, setSelection] = React.useState<Record<string, boolean>>({});
+  const [busy, setBusy] = React.useState(false);
+  const [queued, setQueued] = React.useState<{ ids: string[]; count: number } | null>(null);
+  const locations: any[] = cluster.locations || [];
+  const canSelect = (location: any) => cluster.kind === "exact" && !!location.fileId && location.fileId !== cluster.recommendedKeepFileId && !String(location.tag || "").startsWith("Protected ");
+  const selected = locations.filter(location => canSelect(location) && (selection[location.fileId] ?? location.role === "quarantine"));
+  const jobs = queued ? DB.jobs.filter(job => queued.ids.includes(job._id)) : [];
+  const completed = !!queued && jobs.length === queued.ids.length && jobs.every(job => job.status === "completed");
+  const failed = jobs.some(job => job.status === "failed");
 
-
-/* ============================================================
-   DriveOS — Duplicate Center
-   ============================================================ */
-
-
-  
-
-  const KIND_LABEL: Record<string, string> = { exact: "Exact match", likely: "Likely duplicate", samename: "Same name, diff. content", stock: "Stock duplicated across projects" };
-
-  function fmtDuplicateSize(gb: number) {
-    if (gb >= 1000) return fmtGB(gb);
-    if (gb >= 10) return Math.round(gb) + " GB";
-    if (gb >= 1) return gb.toFixed(1) + " GB";
-    const mb = gb * 1024;
-    if (mb >= 1) return Math.round(mb) + " MB";
-    return Math.max(1, Math.round(mb * 1024)) + " KB";
+  async function queue() {
+    if (busy || selected.length === 0) return;
+    setBusy(true);
+    try {
+      const result = await queueQuarantine({ fileIds: selected.map(location => location.fileId), clusterId: cluster.id });
+      setQueued({ ids: result.jobIds, count: result.queued });
+      toast(`Queued ${result.queued} duplicate copy/copies for quarantine`, "shield", "ok");
+    } catch (error) { toast(error instanceof Error ? error.message : "Could not queue duplicate cleanup", "alert", "risk"); }
+    finally { setBusy(false); }
+  }
+  async function mark(status: "ignored" | "resolved") {
+    if (busy) return; setBusy(true);
+    try { await updateStatus({ clusterId: cluster.id, status }); toast(status === "ignored" ? "Cluster ignored" : "Marked as intentional redundancy", "check", "ok"); }
+    catch (error) { toast(error instanceof Error ? error.message : "Could not update cluster", "alert", "risk"); }
+    finally { setBusy(false); }
   }
 
-  const DUP_REQUESTER = "founder";
+  if (queued) return <div className="card card-pad" style={{ borderColor: failed ? "var(--risk-line)" : "var(--ok-line)" }}>
+    <div className="spread"><b>{cluster.name}</b><Badge kind={failed ? "risk" : completed ? "ok" : "warn"}>{failed ? "Action failed" : completed ? "Quarantine completed" : "Quarantine queued"}</Badge></div>
+    <p className="muted" style={{ fontSize: 13 }}>{failed ? "The agent could not move every selected file. Review its logs before retrying." : completed ? `The agent confirmed ${queued.count} file move(s). Refresh analysis to update duplicate totals.` : `Waiting for the local agent to move ${queued.count} selected copy/copies. The recommended keep copy remains selected for retention.`}</p>
+    <button className="btn sm" onClick={() => go("quarantine")}>View Quarantine</button>
+  </div>;
 
-  function ClusterCard({ c, go, toast }: ScreenProps) {
-    const [roles, setRoles] = React.useState<string[]>(() => c.locations.map((l: any) => l.role));
-    const [resolved, setResolved] = React.useState<string | null>(null);
-    const [busy, setBusy] = React.useState(false);
-    const createJob = useMutation(api.cleanup.createJob);
-    const approveJob = useMutation(api.cleanup.approveJob);
-    const updateClusterStatus = useMutation(api.duplicates.updateStatus);
+  return <div className="card">
+    <div className="card-pad"><div className="spread"><div><b className="mono">{cluster.name}</b><div className="muted" style={{ fontSize: 12, marginTop: 6 }}>{KIND_LABEL[cluster.kind] || "Duplicate cluster"} · {cluster.copies} cataloged copies · {formatBytes(cluster.sizeGB * 1024 ** 3)} each</div></div><Badge kind={cluster.risk === "danger" ? "risk" : cluster.risk === "safe" ? "ok" : "warn"}>{cluster.risk === "danger" ? "Protected" : cluster.risk === "safe" ? "Safe to review" : "Needs review"}</Badge></div><div className="mono dim" style={{ marginTop: 10, fontSize: 11, overflowWrap: "anywhere" }}>{cluster.fingerprint}</div></div>
+    <div className="muted" style={{ padding: "0 18px 10px", fontSize: 11 }}>Showing up to 20 active catalog locations. Only the selected visible copies are queued.</div>
+    {locations.length ? locations.map(location => {
+      const keep = location.fileId === cluster.recommendedKeepFileId;
+      const eligible = canSelect(location);
+      const checked = eligible && (selection[location.fileId] ?? location.role === "quarantine");
+      return <div className="spread" key={location.fileId || location.path} style={{ padding: "12px 18px", gap: 15, borderTop: "1px solid var(--line)", background: checked ? "var(--warn-soft)" : undefined }}>
+        <div style={{ minWidth: 0 }}><div className="mono" style={{ overflowWrap: "anywhere", fontSize: 12 }}>{location.path}</div><div className="muted" style={{ fontSize: 11, marginTop: 4 }}>{DB.driveById[location.drive]?.name || location.drive} · {location.tag}</div></div>
+        {eligible ? <label className="row" style={{ gap: 7, whiteSpace: "nowrap", fontSize: 12 }}><input type="checkbox" checked={checked} onChange={event => setSelection(current => ({ ...current, [location.fileId]: event.target.checked }))} />Quarantine</label> : <Badge kind={keep ? "ok" : "warn"}>{keep ? "Recommended keep" : "Review only"}</Badge>}
+      </div>;
+    }) : <div className="card-pad muted">No active file locations remain in this analysis result. Run analysis again.</div>}
+    <div style={{ padding: "13px 18px", background: "var(--accent-soft)", borderTop: "1px solid var(--line)" }}><div style={{ fontSize: 12, lineHeight: 1.6 }}>{cluster.rec}</div><div className="dim" style={{ fontSize: 11, marginTop: 6 }}>The agent rechecks file protection and content before moving selected copies.</div></div>
+    <div className="spread" style={{ padding: "13px 18px", borderTop: "1px solid var(--line)", gap: 12 }}><div className="mono muted" style={{ fontSize: 12 }}>{selected.length} selected · {formatBytes(selected.reduce((sum, location) => sum + (location.sizeBytes || 0), 0))}</div><div className="row" style={{ gap: 8 }}><button className="btn sm ghost" disabled={busy} onClick={() => void mark("ignored")}>Ignore</button><button className="btn sm" disabled={busy} onClick={() => void mark("resolved")}>Intentional</button><button className="btn sm primary" disabled={busy || selected.length === 0 || cluster.risk === "danger"} onClick={() => void queue()}><Icon name="shield" size={13} />{busy ? "Queuing…" : `Quarantine ${selected.length}`}</button></div></div>
+  </div>;
+}
 
-    // Quarantine the copies the user marked, or every copy except the
-    // recommended keep file when the cluster has no resolved locations.
-    const onQuarantine = async (label: string) => {
-      if (busy) return;
-      setBusy(true);
-      try {
-        const isConvexCluster = typeof c.id === "string" && c.id.length > 12;
-        const locs: any[] = Array.isArray(c.locations) ? c.locations : [];
-        let quarantineIds: string[];
-        let affectedBytes: number;
-        if (locs.some((l) => l.fileId)) {
-          const picked = locs.filter((_, i) => roles[i] === "quarantine");
-          quarantineIds = picked.map((l) => l.fileId).filter(Boolean);
-          affectedBytes = Math.round(picked.reduce((s, l) => s + (l.sizeBytes || c.sizeGB * (1024 ** 3)), 0));
-        } else {
-          const allIds: string[] = Array.isArray(c.fileIds) ? c.fileIds : [];
-          quarantineIds = allIds.filter((id) => id !== c.recommendedKeepFileId);
-          affectedBytes = Math.round(c.sizeGB * (1024 ** 3) * quarantineIds.length);
-        }
-        if (isConvexCluster && quarantineIds.length > 0) {
-          const jobId = await createJob({
-            requestedBy: DUP_REQUESTER,
-            action: "quarantine",
-            affectedFileIds: quarantineIds,
-            affectedBytes,
-          });
-          if (jobId) await approveJob({ jobId, approvedBy: DUP_REQUESTER });
-        }
-        if (isConvexCluster) await updateClusterStatus({ clusterId: c.id, status: "quarantined" });
-        setResolved(label);
-      } catch (err: any) {
-        toast(err?.message || "Could not queue quarantine", "alert", "risk");
-      } finally {
-        setBusy(false);
-      }
-    };
-
-    const onIntentional = async () => {
-      if (busy) return;
-      setBusy(true);
-      try {
-        if (typeof c.id === "string" && c.id.length > 12) await updateClusterStatus({ clusterId: c.id, status: "resolved" });
-        setResolved("Marked intentional");
-      } catch (err: any) {
-        toast(err?.message || "Could not update cluster", "alert", "risk");
-      } finally {
-        setBusy(false);
-      }
-    };
-
-    const onIgnore = async () => {
-      try {
-        if (typeof c.id === "string" && c.id.length > 12) await updateClusterStatus({ clusterId: c.id, status: "ignored" });
-        toast("Cluster ignored", "x", "accent");
-      } catch (err: any) {
-        toast(err?.message || "Could not ignore cluster", "alert", "risk");
-      }
-    };
-    const keepCount = roles.filter((r: string) => r === "keep").length;
-    const quarCount = roles.filter((r: string) => r === "quarantine").length;
-    const recover = c.locations.reduce((s: number, l: any, i: number) => s + (roles[i] === "quarantine" ? c.sizeGB : 0), 0);
-    const riskMeta = (RISK_META as AnyRecord)[c.risk] || RISK_META.review;
-
-    const cycle = (i: number) => {
-      const order = ["keep", "quarantine", "review"];
-      setRoles((r) => r.map((x: string, j: number) => j === i ? order[(order.indexOf(x) + 1) % order.length] : x));
-    };
-
-    if (resolved) {
-      return h("div", { className: "card fade-up", style: { borderColor: "var(--ok-line)", background: "var(--ok-soft)" } },
-        h("div", { className: "card-pad row", style: { gap: 12 } },
-          h(Icon, { name: "checkCircle", size: 20, style: { color: "var(--ok)" } }),
-          h("div", { style: { flex: 1 } }, h("div", { className: "hi", style: { fontWeight: 600 } }, c.name + " · " + resolved),
-            h("div", { className: "muted", style: { fontSize: 12 } }, resolved === "Quarantined" ? "Moved " + quarCount + " copies to quarantine · recovered " + fmtDuplicateSize(recover) : "Marked as intentional redundancy")),
-          h("button", { className: "btn sm ghost", onClick: () => setResolved(null) }, "Undo")));
-    }
-
-    return h("div", { className: "card fade-up" },
-      // header
-      h("div", { className: "card-pad", style: { paddingBottom: 14, display: "flex", gap: 14, alignItems: "flex-start" } },
-        h("div", { style: { width: 46, height: 46, borderRadius: 11, flexShrink: 0, display: "grid", placeItems: "center", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
-          h(Icon, { name: FT_ICON[c.type] || "box", size: 20, style: { color: "var(--ft-" + c.type + ")" } })),
-        h("div", { style: { flex: 1, minWidth: 0 } },
-          h("div", { className: "spread" },
-            h("div", { className: "row", style: { gap: 9, minWidth: 0 } },
-              h("span", { className: "mono hi", style: { fontSize: 14, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, c.name),
-              h(Badge, { kind: riskMeta.cls, icon: c.risk === "danger" ? "lock" : c.risk === "safe" ? "shieldCheck" : "info" }, riskMeta.label)),
-            h("div", { className: "row", style: { gap: 8, flexShrink: 0 } },
-              h("span", { className: "stat-num", style: { fontSize: 18 } }, fmtDuplicateSize(c.sizeGB)),
-              h("span", { className: "muted", style: { fontSize: 12 } }, "× " + c.copies))),
-          h("div", { className: "row", style: { gap: 14, marginTop: 6, fontSize: 11.5, flexWrap: "wrap" } },
-            h("span", { className: "tag" }, KIND_LABEL[c.kind] || "Duplicate cluster"),
-            h("span", { className: "muted" }, h(Icon, { name: "fingerprint", size: 12, style: { verticalAlign: "-2px", marginRight: 4 } }), c.fingerprint),
-            c.project !== "—" && h("span", { className: "muted" }, "Project: ", h("b", { className: "hi" }, (DB.projectById[c.project] || {}).name || c.project)),
-            h("span", { className: "muted" }, "Modified ", c.modified)))),
-      // locations
-      h("div", { style: { borderTop: "1px solid var(--line)" } },
-        c.locations.map((l: any, i: number) => {
-          const role = roles[i];
-          const drive = (DB.driveById as AnyRecord)[l.drive] || { name: l.drive, status: "offline" };
-          const rc = role === "keep" ? "ok" : role === "quarantine" ? "warn" : "cloud";
-          return h("div", { key: i, className: "spread", style: { padding: "11px 18px", borderBottom: i < c.locations.length - 1 ? "1px solid var(--line-faint)" : "none", background: role === "quarantine" ? "var(--warn-soft)" : "transparent" } },
-            h("div", { className: "row", style: { gap: 11, minWidth: 0, flex: 1 } },
-              h(Icon, { name: drive.status === "cloud" ? "cloud" : "hdd", size: 15, style: { color: "var(--tx-dim)", flexShrink: 0 } }),
-              h("div", { style: { minWidth: 0 } },
-                h("div", { className: "mono", style: { fontSize: 11.5, color: "var(--tx)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, l.path),
-                h("div", { className: "row", style: { gap: 7, marginTop: 2 } }, h("span", { className: "muted", style: { fontSize: 11 } }, drive.name), h("span", { className: "dim", style: { fontSize: 11 } }, "· " + l.tag)))),
-            h("button", { className: "badge " + rc, style: { cursor: "pointer", height: 24 }, onClick: () => cycle(i) },
-              h(Icon, { name: role === "keep" ? "shieldCheck" : role === "quarantine" ? "shield" : "eye", size: 12 }),
-              role === "keep" ? "Keep" : role === "quarantine" ? "Quarantine" : "Review"));
-        })),
-      // recommendation
-      h("div", { style: { padding: "13px 18px", background: "var(--accent-soft)", borderTop: "1px solid var(--accent-line)", display: "flex", gap: 10, alignItems: "flex-start" } },
-        h(Icon, { name: "sparkle", size: 15, style: { color: "var(--accent-hi)", marginTop: 1, flexShrink: 0 } }),
-        h("div", { style: { fontSize: 12.5, color: "var(--tx)", lineHeight: 1.5 } }, h("b", { className: "hi" }, "Recommendation · "), c.rec)),
-      // actions
-      h("div", { className: "spread", style: { padding: "13px 18px", borderTop: "1px solid var(--line)" } },
-        h("div", { className: "row", style: { gap: 8 } },
-          h("span", { className: "mono", style: { fontSize: 12, color: "var(--tx-mut)" } }, "Keep ", h("b", { style: { color: "var(--ok)" } }, keepCount), " · Quarantine ", h("b", { style: { color: "var(--warn)" } }, quarCount)),
-          recover > 0 && h(Badge, { kind: "ok" }, "Recover " + fmtDuplicateSize(recover))),
-        h("div", { className: "row", style: { gap: 8 } },
-          h("button", { className: "btn sm ghost", disabled: busy, onClick: onIgnore }, "Ignore"),
-          h("button", { className: "btn sm", disabled: busy, onClick: onIntentional }, h(Icon, { name: "flag", size: 13 }), "Intentional"),
-          h("button", { className: "btn sm primary", disabled: quarCount === 0 || c.risk === "danger" || busy, onClick: () => onQuarantine("Quarantined") },
-            h(Icon, { name: "shield", size: 13 }), busy ? "Queuing…" : "Quarantine " + quarCount))));
-  }
-
-  function DuplicateCenter({ go, toast }: ScreenProps) {
-    const [kind, setKind] = React.useState("all");
-    const [risk, setRisk] = React.useState("all");
-    const [scope, setScope] = React.useState("all");
-
-    let list = DB.duplicates.filter((c) =>
-      (kind === "all" || c.kind === kind) &&
-      (risk === "all" || c.risk === risk) &&
-      (scope === "all" ||
-        (scope === "drives" && new Set(c.locations.map((l: any) => l.drive)).size > 1) ||
-        (scope === "cloud" && c.locations.some((l: any) => ((DB.driveById as AnyRecord)[l.drive] || {}).status === "cloud")) ||
-        (scope === "project" && c.project !== "—")));
-
-    const totalRecover = DB.duplicates.reduce((s, c) => s + c.recoverGB, 0);
-    // Derived from live duplicate clusters rather than hardcoded figures.
-    const totalDupTB = DB.duplicates.reduce((s, c) => s + (c.sizeGB * c.copies) / 1024, 0);
-    const clusterCount = DB.duplicates.length;
-    const recoverByRisk = (rk: string) => DB.duplicates.filter((c) => c.risk === rk).reduce((s, c) => s + c.recoverGB, 0);
-    const reviewTB = recoverByRisk("review") / 1024;
-    const protectedTB = recoverByRisk("danger") / 1024;
-
-    return h("div", { className: "page-inner" },
-      h(PageHead, { eyebrow: "Maintenance", title: "Duplicate Center", desc: "Review duplicate clusters across every drive and the cloud. Nothing is deleted — confirmed copies move to a recoverable quarantine.",
-        actions: [h("button", { key: 1, className: "btn", onClick: () => toast("Re-running fingerprint match…", "fingerprint", "accent") }, h(Icon, { name: "refresh", size: 15 }), "Re-scan")] }),
-
-      // summary
-      h("div", { className: "card fade-up", style: { marginBottom: "var(--gap)", display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 1fr", gap: 0 } },
-        h("div", { className: "card-pad", style: { display: "flex", flexDirection: "column", justifyContent: "center", gap: 4 } },
-          h("div", { className: "eyebrow" }, "Total Duplicate Storage"),
-          h("div", { className: "row", style: { alignItems: "baseline", gap: 8 } }, h("span", { className: "stat-num", style: { fontSize: 34 } }, totalDupTB.toFixed(1)), h("span", { style: { fontSize: 16, color: "var(--tx-mut)", fontWeight: 600 } }, "TB")),
-          h("div", { className: "muted", style: { fontSize: 12 } }, "across ", h("b", { className: "hi" }, fmtNum(clusterCount) + " cluster" + (clusterCount === 1 ? "" : "s")))),
-        sumBox("Safe to recover", fmtDuplicateSize(totalRecover), "var(--ok)", "shieldCheck"),
-        sumBox("Needs review", fmtTB(reviewTB), "var(--warn)", "info"),
-        sumBox("Protected", fmtTB(protectedTB), "var(--risk)", "lock")),
-
-      // filters
-      h("div", { className: "filter-bar" },
-        h(Icon, { name: "filter", size: 15, style: { color: "var(--tx-dim)" } }),
-        h(Seg, { value: kind, onChange: setKind, options: [
-          { value: "all", label: "All" }, { value: "exact", label: "Exact" }, { value: "likely", label: "Likely" }, { value: "samename", label: "Same name" }, { value: "stock", label: "Stock" }] }),
-        h(Seg, { value: risk, onChange: setRisk, options: [
-          { value: "all", label: "Any risk" }, { value: "safe", label: "Safe" }, { value: "review", label: "Review" }, { value: "danger", label: "Protected" }] }),
-        h("select", { className: "select", value: scope, onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setScope(e.target.value) },
-          h("option", { value: "all" }, "All locations"),
-          h("option", { value: "drives" }, "Across drives"),
-          h("option", { value: "project" }, "Inside a project"),
-          h("option", { value: "cloud" }, "Cloud duplicates"))),
-
-      list.length === 0
-        ? h("div", { className: "card" }, h("div", { className: "empty" }, h("div", { className: "empty-ico" }, h(Icon, { name: "checkCircle", size: 24 })), h("h3", null, "No duplicates match"), h("div", { className: "muted" }, "Either everything's clean here, or the filters are too tight.")))
-        : h("div", { style: { display: "flex", flexDirection: "column", gap: "var(--gap)" } }, list.map((c) => h(ClusterCard, { key: c.id, c, go, toast }))));
-  }
-
-  function sumBox(label: React.ReactNode, value: React.ReactNode, color: string, icon: string) {
-    return h("div", { className: "card-pad", style: { borderLeft: "1px solid var(--line)", display: "flex", flexDirection: "column", justifyContent: "center", gap: 5 } },
-      h("div", { className: "row", style: { gap: 7 } }, h(Icon, { name: icon, size: 14, style: { color } }), h("span", { className: "eyebrow", style: { fontSize: 9.5 } }, label)),
-      h("div", { className: "stat-num", style: { fontSize: 22, color } }, value));
-  }
-
-  
-
-
-export { DuplicateCenter };
+export function DuplicateCenter({ go, toast, requestAnalysis, actionBusy }: ScreenProps) {
+  const [kind, setKind] = React.useState("all");
+  const [risk, setRisk] = React.useState("all");
+  const [scope, setScope] = React.useState("all");
+  const list = DB.duplicates.filter(cluster => (kind === "all" || cluster.kind === kind) && (risk === "all" || cluster.risk === risk) &&
+    (scope === "all" || (scope === "drives" && new Set((cluster.locations || []).map((location: any) => location.drive)).size > 1) ||
+      (scope === "cloud" && (cluster.locations || []).some((location: any) => DB.driveById[location.drive]?.status === "cloud")) ||
+      (scope === "project" && cluster.project !== "—")));
+  const recoverBytes = (level: string) => DB.duplicates.filter(cluster => cluster.risk === level).reduce((sum, cluster) => sum + (cluster.wastedBytes || 0), 0);
+  return <div className="page-inner">
+    <PageHead eyebrow="Maintenance" title="Duplicate Center" desc="Review the latest duplicate analysis and select redundant copies. Files move only after the agent confirms the approved job." actions={[<button key="refresh" className="btn" disabled={actionBusy} onClick={() => void requestAnalysis()}><Icon name="refresh" size={15} />Re-scan</button>]} />
+    <div className="card card-pad" style={{ marginBottom: "var(--gap)", display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 18 }}>
+      {[["Last analysis total", formatBytes(DB.duplicates.reduce((sum, cluster) => sum + (cluster.totalBytes || 0), 0))], ["Safe candidates", formatBytes(recoverBytes("safe"))], ["Needs review", formatBytes(recoverBytes("review"))], ["Protected", formatBytes(recoverBytes("danger"))]].map(([label, value]) => <div key={label}><div className="eyebrow">{label}</div><div className="stat-num" style={{ fontSize: 24, marginTop: 8 }}>{value}</div></div>)}
+    </div>
+    <div className="filter-bar"><Icon name="filter" size={15} /><Seg value={kind} onChange={setKind} options={[{ value: "all", label: "All" }, { value: "exact", label: "Exact" }, { value: "likely", label: "Likely" }, { value: "same_name", label: "Same name" }, { value: "stock_reuse", label: "Stock" }]} /><Seg value={risk} onChange={setRisk} options={[{ value: "all", label: "Any risk" }, { value: "safe", label: "Safe" }, { value: "review", label: "Review" }, { value: "danger", label: "Protected" }]} /><select aria-label="Duplicate locations" className="select" value={scope} onChange={event => setScope(event.target.value)}><option value="all">All locations</option><option value="drives">Across drives</option><option value="project">Inside a project</option><option value="cloud">Cloud duplicates</option></select></div>
+    {list.length ? <div style={{ display: "grid", gap: "var(--gap)" }}>{list.map(cluster => <ClusterCard key={cluster.id} cluster={cluster} go={go} toast={toast} />)}</div> : <div className="card"><div className="empty"><Icon name="checkCircle" size={24} /><h3>No duplicates match</h3><div className="muted">Run analysis after scanning, or adjust the filters.</div></div></div>}
+  </div>;
+}

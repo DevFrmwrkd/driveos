@@ -298,7 +298,9 @@ export interface AuditLog {
 // ============================================================
 
 export function classifyFile(filePath: string, fileName: string): FileClassification {
-  const pathUpper = filePath.toUpperCase();
+  // Paths arrive from macOS, Windows drive letters, and UNC shares. Apply the
+  // same folder rules regardless of the workstation's native separator.
+  const pathUpper = filePath.replace(/\\/g, "/").toUpperCase();
   const nameUpper = fileName.toUpperCase();
   const ext = nameUpper.split(".").pop() || "";
 
@@ -329,6 +331,7 @@ export function classifyFile(filePath: string, fileName: string): FileClassifica
   if (
     pathUpper.includes("/CACHE/") ||
     pathUpper.includes("/RENDERS_CACHE/") ||
+    pathUpper.includes("/06_RENDERS_CACHE/") ||
     pathUpper.includes("/ADOBE/COMMON/MEDIA CACHE/") ||
     pathUpper.includes("/RENDER FILES/") ||
     pathUpper.includes("/DAVINCI_CACHE/") ||
@@ -381,6 +384,7 @@ export function classifyFile(filePath: string, fileName: string): FileClassifica
   // 7) EXPORT FINAL / DELIVERIES
   if (
     pathUpper.includes("/EXPORTS/FINAL/") ||
+    pathUpper.includes("/07_EXPORTS/FINAL/") ||
     pathUpper.includes("/DELIVERY/") ||
     pathUpper.includes("/08_DELIVERY/") ||
     nameUpper.includes("_FINAL") ||

@@ -144,26 +144,26 @@ post("createManifest", async (ctx, body, machine) => {
 });
 
 post("pollPendingJobs", async (ctx, body, machine) => {
-  return await ctx.runQuery(internal.cleanup.pollPendingJobs, scoped(body, machine));
+  return await ctx.runQuery(internal.cleanup.pollPendingJobs, { ...scoped(body, machine), machineId: machine.machineId });
 });
 
 post("getJob", async (ctx, body, machine) => {
-  const job = await ctx.runQuery(internal.cleanup.getJob, scoped(body, machine));
+  const job = await ctx.runQuery(internal.cleanup.getJob, { ...scoped(body, machine), machineId: machine.machineId });
   return { success: true, job };
 });
 
 post("updateJobStatus", async (ctx, body, machine) => {
-  await ctx.runMutation(internal.cleanup.updateJobStatus, scoped(body, machine));
-  return { success: true };
+  const result = await ctx.runMutation(internal.cleanup.updateJobStatus, { ...scoped(body, machine), machineId: machine.machineId });
+  return { success: true, ...result };
 });
 
 post("getQuarantineItem", async (ctx, body, machine) => {
-  const item = await ctx.runQuery(internal.cleanup.getQuarantineItem, scoped(body, machine));
+  const item = await ctx.runQuery(internal.cleanup.getQuarantineItem, { ...scoped(body, machine), machineId: machine.machineId });
   return { success: true, item };
 });
 
 post("markQuarantineRestored", async (ctx, body, machine) => {
-  await ctx.runMutation(internal.cleanup.markQuarantineRestoredAgent, scoped(body, machine));
+  await ctx.runMutation(internal.cleanup.markQuarantineRestoredAgent, { ...scoped(body, machine), machineId: machine.machineId });
   return { success: true };
 });
 

@@ -30,6 +30,7 @@ import type * as recommendations from "../recommendations.js";
 import type * as retention from "../retention.js";
 import type * as scans from "../scans.js";
 import type * as seed from "../seed.js";
+import type * as settings from "../settings.js";
 import type * as tenants from "../tenants.js";
 
 import type {
@@ -61,6 +62,7 @@ declare const fullApi: ApiFromModules<{
   retention: typeof retention;
   scans: typeof scans;
   seed: typeof seed;
+  settings: typeof settings;
   tenants: typeof tenants;
 }>;
 

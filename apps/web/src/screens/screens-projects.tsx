@@ -1,5 +1,9 @@
 import React from "react";
 import { DB } from "@/data";
+import { useQuery } from "convex/react";
+import { api } from "@/convexApi";
+import { groupCatalogFiles } from "@/catalog";
+import { formatBytes } from "@/lib/download";
 import { ArchiveChecklistModal } from "./screens-archive";
 import {
   Icon,
@@ -80,12 +84,12 @@ type AnyRecord = Record<string, any>;
         healthCell("Structure", p.structure, structKind(p.structure)),
         healthCell("Archive Ready", p.archiveReady, p.archiveReady >= 80 ? "ok" : p.archiveReady >= 40 ? "warn" : "risk", true)));
   }
-  function healthCell(label: React.ReactNode, val: number, kind: string, right = false) {
+  function healthCell(label: React.ReactNode, val: number | null, kind: string, right = false) {
     return h("div", { style: { padding: "12px 16px", borderRight: right ? "none" : "1px solid var(--line)" } },
       h("div", { className: "spread", style: { marginBottom: 6 } },
         h("span", { className: "eyebrow", style: { fontSize: 9 } }, label),
-        h("span", { className: "mono", style: { fontSize: 11, color: "var(--" + kind + ")" } }, val + "%")),
-      h(Bar, { value: val, max: 100, kind, height: 5 }));
+        h("span", { className: "mono", style: { fontSize: 11, color: val == null ? "var(--tx-dim)" : "var(--" + kind + ")" } }, val == null ? "Not assessed" : val + "%")),
+      val != null && h(Bar, { value: val, max: 100, kind, height: 5 }));
   }
 
   // ---- Overview ----
@@ -138,125 +142,61 @@ type AnyRecord = Record<string, any>;
   // ============================================================
   //  PROJECT DETAIL
   // ============================================================
-  function projectTree(p: any) {
-    const base = (DB.projectFolders as AnyRecord)[p.id];
-    if (base) return base;
-    // synthesize: mark some missing based on structure score
-    return DB.folderTemplate.filter((f) => f.lvl === 0).map((f, i) => ({
-      name: f.name, status: (p.structure < 70 && (i === 0 || i === 9)) ? "missing" : (f.name.includes("PROX") || f.name.includes("CACHE")) ? "warn" : "ok",
-      sizeGB: Math.round(p.sizeTB * 1000 * [0.002,0.001,0.55,0.03,0.06,0.12,0.09,0.05,0.02,0][i] || 1),
-    }));
-  }
-
-  function ProjectDetail({ params, go, toast }: ScreenProps) {
-    const p = (DB.projectById as AnyRecord)[params.id];
-    const [modal, setModal] = React.useState<"archive" | null>(null);
-    if (!p) return h("div", { className: "page-inner" }, h("div", { className: "muted" }, "Project not found."));
-    const st = (PROJ_STATUS as AnyRecord)[p.status] || { cls: "", label: p.status || "Unknown" };
-    const tier = (TIER_META as AnyRecord)[p.tier] || { color: "--tx-dim", label: p.tier || "Unknown" };
-    const owner = (DB.teamById as AnyRecord)[p.owner] || { name: p.owner || "Unknown" };
-    const tree = projectTree(p);
-    const missing = tree.filter((f: any) => f.status === "missing");
-
-    const head = h(PageHead, {
-      eyebrow: p.client + " · " + p.show,
-      title: p.name,
-      desc: null,
-      actions: [
-        h("button", { key: 1, className: "btn", onClick: () => toast("Opening file location…", "external", "accent") }, h(Icon, { name: "external", size: 15 }), "Open Location"),
-        h("button", { key: 2, className: "btn", onClick: () => go("cleanup") }, h(Icon, { name: "broom", size: 15 }), "Clean Project"),
-        h("button", { key: 3, className: "btn primary", onClick: () => setModal("archive") }, h(Icon, { name: "archive", size: 15 }), "Archive Project"),
-      ],
-    });
-
-    const metaRow = h("div", { className: "row", style: { gap: 9, marginBottom: 18, marginTop: -10, flexWrap: "wrap" } },
-      h("span", { className: "badge " + st.cls }, st.label),
-      h("span", { className: "tag" }, h("span", { style: { width: 7, height: 7, borderRadius: 2, background: getVar(tier.color) } }), tier.label, " storage"),
-      h("span", { className: "row", style: { gap: 6 } }, h(Avatar, { id: p.owner, size: 22 }), h("span", { className: "muted", style: { fontSize: 12.5 } }, owner.name)),
-      h("span", { className: "tag" }, h(Icon, { name: "clock", size: 12 }), "Modified " + p.modified),
-      h("span", { className: "tag" }, h(Icon, { name: "layers", size: 12 }), p.template + " template"));
-
-    // summary strip
-    const summary = h("div", { className: "card card-pad fade-up", style: { display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 20, marginBottom: "var(--gap)" } },
-      sumCell("Total Size", fmtTB(p.sizeTB), "database", ""),
-      sumCell("Duplicates", fmtTB(p.dupTB), "copy", "var(--warn)"),
-      sumCell("Cache / Proxy Waste", fmtTB(p.cleanTB), "cpu", "var(--ft-cache)"),
-      sumCell("Structure Health", p.structure + "%", "target", "var(--" + structKind(p.structure) + ")"),
-      sumCell("Archive Ready", p.archiveReady + "%", "archive", p.archiveReady >= 80 ? "var(--ok)" : "var(--warn)"));
-
-    // copies
-    const copies = cardShell("Copies & Redundancy", "layers", "var(--tx-mut)", null,
-      h("div", { className: "card-pad", style: { display: "flex", flexDirection: "column", gap: 11 } },
-        copyRow("Local working copy", p.locations.some((l: string) => ["hot", "warm"].includes(((DB.driveById as AnyRecord)[l] || {}).tier)), "hdd"),
-        copyRow("Cloud copy", p.locations.includes("gdrive"), "cloud"),
-        copyRow("Archive copy", p.locations.some((l: string) => ((DB.driveById as AnyRecord)[l] || {}).tier === "cold"), "archive"),
-        h("div", { className: "divider", style: { margin: "4px 0" } }),
-        h("div", { style: { fontSize: 11.5, color: "var(--tx-mut)" } }, "Stored on ", h("b", { className: "hi" }, p.locations.length + " volumes"), ": ",
-          p.locations.map((l: string, i: number) => h("span", { key: l, className: "mono", style: { color: "var(--tx)" } }, ((DB.driveById as AnyRecord)[l] || { name: l }).name, i < p.locations.length - 1 ? " · " : "")))));
-
-    // folder tree
-    const treeCard = cardShell("Folder Structure", "folder", "var(--tx-mut)",
-      h("span", { className: "badge " + structKind(p.structure) }, p.structure + "% healthy"),
-      h("div", { className: "card-pad" },
-        h("div", { className: "tree" }, h("div", { className: "tree-row" }, h(Icon, { name: "folder", size: 13, style: { color: "var(--accent-hi)" } }),
-          h("span", { className: "hi" }, "/" + p.client.replace(/\s+/g, "_") + "_" + p.name.split(" ")[0] + "/")),
-          h("div", { className: "tree-indent" }, tree.map((f: any, i: number) => h("div", { key: i, className: "tree-row" },
-            h(Icon, { name: f.status === "missing" ? "x" : "folder", size: 13, style: { color: f.status === "missing" ? "var(--risk)" : f.status === "warn" ? "var(--warn)" : "var(--tx-mut)" } }),
-            h("span", { className: f.status === "missing" ? "tree-missing" : "" }, f.name),
-            f.status !== "missing" && h("span", { className: "mono dim", style: { marginLeft: "auto", fontSize: 11 } }, f.sizeGB >= 1000 ? (f.sizeGB / 1000).toFixed(1) + " TB" : f.sizeGB + " GB"),
-            f.status === "missing" && h("span", { className: "badge risk", style: { marginLeft: "auto", height: 18 } }, "missing"),
-            f.status === "warn" && h("span", { className: "badge warn", style: { marginLeft: "auto", height: 18 } }, "cleanable")))))));
-
-    // asset checklist
-    const assets = [
-      { label: "Raw footage", ok: true, note: fmtTB(p.sizeTB * 0.55) + " · verified" },
-      { label: "Project files (Premiere/AE)", ok: p.structure > 60, note: p.structure > 60 ? "Present" : "03_PROJECT_FILES missing" },
-      { label: "Final export", ok: p.archiveReady > 50, note: p.archiveReady > 50 ? "EP_FINAL_v7.mov" : "No final export yet" },
-      { label: "Music / SFX licenses", ok: true, note: "4 license docs in 00_ADMIN" },
-      { label: "Fonts & graphics", ok: true, note: "Bundled in 04_ASSETS" },
-      { label: "Archive manifest", ok: missing.length === 0, note: missing.length ? "09_ARCHIVE_MANIFEST missing" : "Generated" },
-    ];
-    const assetCard = cardShell("Deliverable Status", "checkCircle", "var(--ok)", null,
-      h("div", { style: { padding: "6px 0" } }, assets.map((a, i) => h("div", { key: i, className: "spread", style: { padding: "10px 18px", borderBottom: i < assets.length - 1 ? "1px solid var(--line-faint)" : "none" } },
-        h("div", { className: "row", style: { gap: 10 } },
-          h("span", { style: { width: 20, height: 20, borderRadius: 6, display: "grid", placeItems: "center", flexShrink: 0, background: a.ok ? "var(--ok-soft)" : "var(--risk-soft)", color: a.ok ? "var(--ok)" : "var(--risk)" } }, h(Icon, { name: a.ok ? "check" : "x", size: 13, stroke: 3 })),
-          h("span", { className: "hi", style: { fontWeight: 600, fontSize: 13 } }, a.label)),
-        h("span", { className: "muted", style: { fontSize: 11.5 } }, a.note)))));
-
-    // duplicates
-    const inProj = DB.duplicates.filter((d) => d.project === p.id);
-    const dupCard = cardShell("Duplicates", "copy", "var(--warn)", h("button", { className: "btn sm ghost", onClick: () => go("duplicates") }, "Review"),
-      h("div", { className: "card-pad", style: { display: "flex", flexDirection: "column", gap: 12 } },
-        h("div", { className: "row", style: { gap: 12 } },
-          dupStat("Inside project", fmtTB(p.dupTB), "var(--warn)"),
-          dupStat("Shared w/ others", fmtTB(p.dupTB * 0.6), "var(--auto)")),
-        inProj.length ? inProj.map((d) => h("div", { key: d.id, className: "spread", style: { padding: "10px 12px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
-          h("div", { className: "row", style: { gap: 9, minWidth: 0 } }, h(FileTypePill, { type: d.type }), h("span", { className: "mono hi", style: { fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, d.name)),
-          h("div", { className: "row", style: { gap: 8, flexShrink: 0 } }, h(Badge, { kind: ((RISK_META as AnyRecord)[d.risk] || { cls: "" }).cls }, d.copies + "×"), h("span", { className: "mono", style: { fontSize: 12, color: "var(--tx-hi)" } }, d.sizeGB + " GB"))))
-          : h("div", { className: "muted", style: { fontSize: 12.5, padding: "4px 2px" } }, "No internal duplicates detected.")));
-
-    // recommended actions
-    const recs = [
-      { t: "Create missing folders", d: missing.length ? missing.map((m: any) => m.name).join(", ") : "Structure complete", risk: "safe", icon: "plus", disabled: !missing.length },
-      { t: "Delete generated proxies", d: "After delivery approval · " + fmtTB(p.cleanTB * 0.5), risk: "review", icon: "trash" },
-      { t: "Quarantine old review exports", d: "v1–v6 superseded · 1.5 TB studio-wide", risk: "review", icon: "shield" },
-      { t: "Copy final exports to cloud", d: "Ensure off-site delivery copy", risk: "safe", icon: "cloud" },
-      { t: "Generate archive manifest", d: "Checksums + file inventory", risk: "safe", icon: "fingerprint" },
-    ];
-    const recCard = cardShell("Recommended Actions", "sparkle", "var(--accent-hi)", null,
-      h("div", { style: { padding: 14, display: "flex", flexDirection: "column", gap: 9 } }, recs.map((r, i) =>
-        h("div", { key: i, className: "spread", style: { padding: "11px 13px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)", opacity: r.disabled ? 0.5 : 1 } },
-          h("div", { className: "row", style: { gap: 11, minWidth: 0 } },
-            h("span", { style: { width: 30, height: 30, borderRadius: 8, display: "grid", placeItems: "center", flexShrink: 0, background: "var(--" + r.risk + "-soft)", color: "var(--" + r.risk + ")", border: "1px solid var(--" + r.risk + "-line)" } }, h(Icon, { name: r.icon, size: 15 })),
-            h("div", { style: { minWidth: 0 } }, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 12.5 } }, r.t), h("div", { className: "muted", style: { fontSize: 11.5 } }, r.d))),
-          h("button", { className: "btn sm", disabled: r.disabled, onClick: () => toast(r.t + " queued", r.icon, r.risk === "safe" ? "ok" : "accent") }, r.disabled ? "Done" : "Run")))));
-
-    return h("div", { className: "page-inner" },
-      h("button", { className: "btn ghost sm", style: { marginBottom: 12 }, onClick: () => go("projects") }, h(Icon, { name: "chevL", size: 15 }), "All projects"),
-      head, metaRow, summary,
-      h("div", { style: { display: "grid", gridTemplateColumns: "1.1fr 1fr", gap: "var(--gap)", marginBottom: "var(--gap)" } }, treeCard, h("div", { style: { display: "flex", flexDirection: "column", gap: "var(--gap)" } }, copies, dupCard)),
-      h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--gap)", marginBottom: "var(--gap)" } }, assetCard, recCard),
-      modal === "archive" && h(ArchiveChecklistModal, { p, onClose: () => setModal(null), toast, go }));
+  function ProjectDetail({ params, go, toast, requestAnalysis, actionBusy }: ScreenProps) {
+    const catalog = useQuery(api.files.list, { projectId: params.id, limit: 200 });
+    const [modal, setModal] = React.useState<"archive" | "location" | null>(null);
+    const p = DB.projectById[params.id];
+    if (!p) return <div className="page-inner"><div className="card card-pad muted">Project not found.</div></div>;
+    const owner = DB.teamById[p.owner] || { name: p.owner || "Unassigned" };
+    const status = PROJ_STATUS[p.status] || { label: p.status, cls: "" };
+    const files = (catalog || []).filter((f: any) => !f.deletedAt);
+    const bytes = files.reduce((sum: number, file: any) => sum + file.sizeBytes, 0);
+    const groups = groupCatalogFiles(files, (file) => file.classification || "UNKNOWN");
+    const setupJob = DB.jobs.find((job) => job.action === "create_folder_structure" && job.result?.projectId === p.id);
+    const manifestJob = DB.jobs.find((job) => job.action === "generate_manifest" && job.result?.projectId === p.id);
+    const locations = [...new Set(files.map((file: any) => file.driveId).filter(Boolean))] as string[];
+    if (p.driveId && !locations.includes(p.driveId)) locations.push(p.driveId);
+    const duplicates = DB.duplicates.filter((cluster) => (cluster.projectIds || []).includes(p.id));
+    const setupLabel = setupJob ? setupJob.status === "completed" ? "Folder setup completed by agent" : "Folder setup: " + setupJob.status.replace(/_/g, " ") : "Folder setup has not been confirmed";
+    return <div className="page-inner">
+      <button className="btn ghost sm" style={{ marginBottom: 12 }} onClick={() => go("projects")}><Icon name="chevL" size={15} />All projects</button>
+      <PageHead eyebrow={p.client + (p.show ? " · " + p.show : "")} title={p.name} desc={owner.name + " · " + (p.template || "Standard studio")}
+        actions={[
+          <button key="location" className="btn" disabled={!p.rootPath} onClick={() => setModal("location")}><Icon name="folder" size={15} />Project location</button>,
+          <button key="cleanup" className="btn" onClick={() => go("cleanup")}><Icon name="broom" size={15} />Review Cleanup</button>,
+          <button key="archive" className="btn primary" onClick={() => setModal("archive")}><Icon name="archive" size={15} />Archive Checklist</button>,
+        ]} />
+      <div className="row" style={{ gap: 9, marginBottom: 18 }}><Badge kind={status.cls}>{status.label}</Badge><span className="tag">{p.tier} storage</span><span className="muted" style={{ fontSize: 12 }}>{setupLabel}</span></div>
+      <div className="card card-pad" style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 20, marginBottom: "var(--gap)" }}>
+        {sumCell("Indexed sample", formatBytes(bytes), "database")}
+        {sumCell("Sample files", files.length, "folder")}
+        {sumCell("Duplicate clusters", duplicates.length, "copy", "var(--warn)")}
+        {sumCell("Backup verification", "Not verified", "shield", "var(--warn)")}
+      </div>
+      <p className="muted" style={{ fontSize: 12 }}>{catalog === undefined ? "Loading project catalog…" : "Up to 200 indexed project files are shown. Folder setup status does not verify current contents or backup copies."}</p>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--gap)", marginBottom: "var(--gap)" }}>
+        <div className="card"><div className="card-head"><div className="card-title">Project Folder Setup</div></div><div className="card-pad">
+          <div className="mono" style={{ overflowWrap: "anywhere", fontSize: 12, marginBottom: 12 }}>{p.rootPath || "No local root configured"}</div>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 12 }}>{setupLabel}{setupJob?.status === "failed" ? ": " + (setupJob.result?.error || "See agent logs") : ""}</div>
+          <div className="tree">{DB.folderTemplate.filter((folder) => folder.lvl === 0).map((folder) => <div className="tree-row" key={folder.name}><Icon name="folder" size={13} /><span>{folder.name}</span><span className="dim" style={{ marginLeft: "auto", fontSize: 10 }}>standard template</span></div>)}</div>
+        </div></div>
+        <div className="card"><div className="card-head"><div className="card-title">Indexed File Types</div></div><div className="card-pad">
+          {groups.length ? groups.map((group) => <div className="spread" style={{ padding: "9px 0" }} key={group.name}><span>{group.name} · {group.count} files</span><span className="mono">{formatBytes(group.bytes)}</span></div>) : <div className="muted">No files indexed for this project yet. Scan its drive after folder setup completes.</div>}
+        </div></div>
+        <div className="card"><div className="card-head"><div className="card-title">Locations & Redundancy</div><Badge kind="warn">Not verified</Badge></div><div className="card-pad">
+          {locations.length ? locations.map((id) => <div key={id} className="row" style={{ gap: 9, padding: "8px 0" }}><Icon name="hdd" size={15} /><span>{DB.driveById[id]?.name || "Tracked drive"}</span><span className="muted" style={{ marginLeft: "auto", fontSize: 12 }}>Catalog location</span></div>) : <div className="muted">No catalog locations have been confirmed.</div>}
+          <p className="muted" style={{ fontSize: 12 }}>A catalog location is not proof of a complete or checksum-verified backup. Cloud and archive copies remain unverified.</p>
+        </div></div>
+        <div className="card"><div className="card-head"><div className="card-title">Project Actions</div></div><div className="card-pad" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <button className="btn" disabled={actionBusy} onClick={() => void requestAnalysis()}><Icon name="cpu" size={15} />Refresh Duplicate & Cleanup Analysis</button>
+          <button className="btn" onClick={() => go("duplicates")}><Icon name="copy" size={15} />Review Duplicate Clusters</button>
+          <button className="btn" onClick={() => setModal("archive")}><Icon name="fingerprint" size={15} />Generate Archive Manifest</button>
+          <div className="muted" style={{ fontSize: 12 }}>{manifestJob ? "Latest manifest request: " + manifestJob.status.replace(/_/g, " ") : "No manifest request has been recorded."}</div>
+        </div></div>
+      </div>
+      {modal === "location" ? <Modal title="Project location" icon="folder" onClose={() => setModal(null)} footer={<button className="btn" onClick={() => setModal(null)}>Close</button>}><div className="mono" style={{ overflowWrap: "anywhere" }}>{p.rootPath}</div><p className="muted" style={{ fontSize: 12 }}>Open this path on the computer that owns the selected drive. A browser cannot open a remote computer's folder.</p></Modal> : null}
+      {modal === "archive" ? <ArchiveChecklistModal p={p} onClose={() => setModal(null)} toast={toast} go={go} /> : null}
+    </div>;
   }
 
   function sumCell(label: React.ReactNode, value: React.ReactNode, icon: string, color = "") {

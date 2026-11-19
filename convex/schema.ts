@@ -32,6 +32,16 @@ export default defineSchema({
     createdAt: v.number(),
   }).index("by_slug", ["slug"]),
 
+  workspaceSettings: defineTable({
+    tenantId: v.string(),
+    retentionDays: v.number(),
+    cleanupRules: v.object({
+      rawKeep: v.boolean(), proxyDelete: v.boolean(), cacheDelete: v.boolean(),
+      finalKeep: v.boolean(), licenseKeep: v.boolean(),
+    }),
+    updatedAt: v.number(),
+  }).index("by_tenant", ["tenantId"]),
+
   teamMembers: defineTable({
     tenantId: v.optional(v.string()),
     name: v.string(),
@@ -132,6 +142,9 @@ export default defineSchema({
     modifiedAtFile: v.number(),
     lastSeenAt: v.number(),
     deletedAt: v.optional(v.number()),
+    // Atomically reserves a file for one approved cleanup. A pending copy must
+    // never be counted as the surviving keep copy for another cleanup job.
+    pendingCleanupJobId: v.optional(v.string()),
     quickHash: v.optional(v.string()),
     fullHash: v.optional(v.string()),
     mediaFingerprint: v.optional(v.string()),
@@ -164,6 +177,13 @@ export default defineSchema({
     tier: v.string(), // "hot" | "warm" | "cloud" | "cold"
     rootPath: v.optional(v.string()),
     cloudFolderId: v.optional(v.string()),
+    driveId: v.optional(v.string()),
+    machineId: v.optional(v.string()),
+    setupJobId: v.optional(v.string()),
+    cleanupRules: v.optional(v.object({
+      rawKeep: v.boolean(), proxyDelete: v.boolean(), cacheDelete: v.boolean(),
+      finalKeep: v.boolean(), licenseKeep: v.boolean(),
+    })),
     folderTemplateId: v.optional(v.string()),
     createdAt: v.number(),
     dueDate: v.optional(v.number()),
@@ -259,6 +279,7 @@ export default defineSchema({
 
   quarantineItems: defineTable({
     tenantId: v.optional(v.string()),
+    machineId: v.optional(v.string()),
     cleanupJobId: v.string(),
     originalPath: v.string(),
     quarantinePath: v.string(),

@@ -2,6 +2,7 @@ import { v } from "convex/values";
 import { internalAction, internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { requireMember, inTenant } from "./access";
+import { protectedFile } from "./jobUtils";
 
 // Mirrors the agent-side protection list: these classifications are never auto-quarantined.
 const PROTECTED_CLASSIFICATIONS = new Set(["RAW", "EXPORT_FINAL", "PROJECT_FILE", "ADMIN", "ARCHIVE_MANIFEST"]);
@@ -41,7 +42,7 @@ export const list = query({
         if (!drive) drive = file.source === "cloud" ? "Cloud" : "Local";
 
         const isKeep = file._id === cluster.recommendedKeepFileId;
-        const isProtected = PROTECTED_CLASSIFICATIONS.has(file.classification);
+        const isProtected = protectedFile(file);
         const role = isKeep ? "keep" : isProtected || cluster.type !== "exact" ? "review" : "quarantine";
 
         locations.push({
@@ -136,18 +137,21 @@ function buildCluster(type: "exact" | "likely", hash: string, files: AnalysisFil
 // Detection runs per tenant (internal): page that tenant's catalog, accumulate
 // hash groups in memory, then upsert clusters through small batched mutations.
 export const runDuplicateDetection = internalAction({
-  args: { tenantId: v.string() },
+  args: { tenantId: v.string(), maxFiles: v.optional(v.number()) },
   handler: async (ctx, args): Promise<{ success: boolean; clusterCount: number }> => {
     const exactGroups = new Map<string, AnalysisFile[]>();
     const likelyGroups = new Map<string, AnalysisFile[]>();
 
     let cursor: string | null = null;
+    let filesRead = 0;
     while (true) {
       const page: any = await ctx.runQuery(internal.files.pageForAnalysis, {
         tenantId: args.tenantId,
         cursor,
         numItems: 1000,
       });
+      filesRead += page.files.length;
+      if (args.maxFiles !== undefined && filesRead > args.maxFiles) throw new Error(`Catalog exceeds the explicit analysis limit of ${args.maxFiles} files. No partial duplicate results were published.`);
       for (const f of page.files as AnalysisFile[]) {
         if (f.deletedAt) continue; // quarantined/soft-deleted files never re-cluster
         if (f.fullHash) {

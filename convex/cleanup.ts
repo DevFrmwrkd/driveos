@@ -1,520 +1,490 @@
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { internalMutation, internalQuery, mutation, query } from "./_generated/server";
-import { requireMember, inTenant } from "./access";
+import { requireMember, requireRole, inTenant } from "./access";
+import { CLEANUP_RECOMMENDATION_TYPES, fileMachine, insertApprovedJob, protectedFile, quarantineMachine } from "./jobUtils";
+import { workspaceSettings } from "./settings";
+import { classifyFile } from "../packages/shared/src/index";
 
-export const listJobs = query({
-  args: {},
-  handler: async (ctx) => {
-    const { tenantId } = await requireMember(ctx);
-    return await ctx.db
-      .query("cleanupJobs")
-      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
-      .order("desc")
-      .collect();
-  },
-});
+const EDITORS = ["admin", "producer", "editor", "assistant_editor"];
+const ACTIVE_QUARANTINE = new Set(["quarantined", "pending_restore", "pending_purge"]);
 
-export const listQuarantine = query({
-  args: {},
-  handler: async (ctx) => {
-    const { tenantId } = await requireMember(ctx);
-    return await ctx.db
-      .query("quarantineItems")
-      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
-      .collect();
-  },
-});
+export const listJobs = query({ args: {}, handler: async ctx => {
+  const { tenantId } = await requireMember(ctx);
+  return ctx.db.query("cleanupJobs").withIndex("by_tenant", q => q.eq("tenantId", tenantId)).order("desc").take(200);
+}});
 
-// How many quarantined items in the caller's tenant are past their rollback
-// window and safe to purge. Drives the "Empty expired" button count/disabled.
-export const purgeableCount = query({
-  args: {},
-  handler: async (ctx) => {
-    const { tenantId } = await requireMember(ctx);
-    const now = Date.now();
-    const items = await ctx.db
-      .query("quarantineItems")
-      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
-      .collect();
-    const expired = items.filter((i) => i.status === "quarantined" && i.rollbackUntil <= now);
-    return {
-      count: expired.length,
-      bytes: expired.reduce((s, i) => s + i.sizeBytes, 0),
-    };
-  },
-});
+export const listQuarantine = query({ args: {}, handler: async ctx => {
+  const { tenantId } = await requireMember(ctx);
+  const items = await ctx.db.query("quarantineItems").withIndex("by_tenant", q => q.eq("tenantId", tenantId)).collect();
+  return items.filter(item => ACTIVE_QUARANTINE.has(item.status));
+}});
 
-// Permanently delete quarantined files past their 14-day window, scoped to the
-// caller's tenant. Manual only (a human clicks the button) — never auto-runs.
-// Creates an approved purge job carrying the file paths so the per-machine agent
-// can delete them off disk; items flip to "pending_purge" so they can't double-queue.
-export const purgeExpired = mutation({
-  args: { requestedBy: v.string() },
-  handler: async (ctx, args) => {
-    const { tenantId } = await requireMember(ctx);
-    const now = Date.now();
+export const previewFiles = query({ args: { fileIds: v.array(v.string()) }, handler: async (ctx, args) => {
+  const { tenantId } = await requireMember(ctx);
+  if (args.fileIds.length > 4000) throw new ConvexError("Preview supports up to 4,000 files.");
+  const files = [];
+  for (const fileId of new Set(args.fileIds)) {
+    const id = ctx.db.normalizeId("files", fileId);
+    const file = id ? inTenant(await ctx.db.get(id), tenantId) : null;
+    if (file && !file.deletedAt) files.push({ ...file, protected: Boolean(protectedFile(file)) });
+  }
+  return files;
+}});
 
-    const items = await ctx.db
-      .query("quarantineItems")
-      .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
-      .collect();
-    const expired = items.filter((i) => i.status === "quarantined" && i.rollbackUntil <= now);
-    if (expired.length === 0) return { queued: 0 };
+// refreshAt only invalidates the subscription as wall time passes; the server
+// clock remains authoritative for whether a rollback deadline has expired.
+export const purgeableCount = query({ args: { refreshAt: v.optional(v.number()) }, handler: async ctx => {
+  const { tenantId } = await requireMember(ctx);
+  const items = await ctx.db.query("quarantineItems").withIndex("by_tenant", q => q.eq("tenantId", tenantId)).collect();
+  const expired = items.filter(i => i.status === "quarantined" && i.rollbackUntil <= Date.now());
+  return { count: expired.length, bytes: expired.reduce((s, i) => s + i.sizeBytes, 0) };
+}});
 
-    const purgeItems = expired.map((i) => ({
-      quarantineItemId: String(i._id),
-      quarantinePath: i.quarantinePath,
-    }));
-    const totalBytes = expired.reduce((s, i) => s + i.sizeBytes, 0);
-
-    const jobId = await ctx.db.insert("cleanupJobs", {
-      tenantId,
-      requestedBy: args.requestedBy,
-      action: "purge",
-      status: "approved", // skips pending_approval: the button click IS the approval
-      approvedBy: args.requestedBy,
-      affectedFileIds: expired.map((i) => i.fileId),
-      affectedBytes: totalBytes,
-      result: { purgeItems },
-      createdAt: now,
-      updatedAt: now,
-    });
-
-    for (const item of expired) {
-      await ctx.db.patch(item._id, { status: "pending_purge" });
+// Validate current catalog records, not caller-supplied byte counts or risk labels.
+// A non-regenerable file is eligible only when an exact full-hash duplicate has
+// a distinct, live keep copy. RAW/final/project/admin files remain protected.
+async function validatedFiles(ctx: any, tenantId: string, ids: string[]) {
+  if (!ids.length) throw new ConvexError("No files were selected for quarantine.");
+  if (ids.length > 4000) throw new ConvexError("Select at most 4,000 files per cleanup request.");
+  const settings = await workspaceSettings(ctx, tenantId);
+  const projects = new Map<string, any>();
+  const clusters = new Map<string, any>();
+  const files = [];
+  const selected = new Set(ids);
+  const legacyReservedIds = new Set<string>();
+  const reservationJobs = new Map<string, any>();
+  for (const status of ["approved", "queued", "running"]) {
+    const active = await ctx.db.query("cleanupJobs").withIndex("by_tenant_status", (q: any) => q.eq("tenantId", tenantId).eq("status", status)).take(201);
+    if (active.length > 200) throw new ConvexError("Wait for pending file operations to finish before starting another cleanup.");
+    for (const job of active) {
+      reservationJobs.set(String(job._id), job);
+      if (job.action === "quarantine") for (const id of job.affectedFileIds) legacyReservedIds.add(id);
     }
-
-    await ctx.db.insert("auditLogs", {
-      tenantId,
-      actorId: args.requestedBy,
-      action: "purge_request",
-      entityType: "cleanupJob",
-      entityId: jobId,
-      message: `Queued permanent deletion of ${expired.length} expired quarantine item(s), freeing ${(totalBytes / (1024 ** 3)).toFixed(1)} GB`,
-      createdAt: now,
-    });
-
-    return { queued: expired.length, jobId };
-  },
-});
-
-// Permanently delete ONE quarantined item now, regardless of its 14-day window.
-// This is the per-row "Delete" button: an explicit, confirmed choice about a
-// specific file, so it doesn't wait for expiry the way the bulk "Empty expired"
-// does. Tenant-scoped; queues an approved purge job for the agent to execute.
-export const purgeItem = mutation({
-  args: { quarantineId: v.string(), requestedBy: v.string() },
-  handler: async (ctx, args) => {
-    const { tenantId } = await requireMember(ctx);
-    const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
-    if (!id) return { queued: 0 };
-    const item = await ctx.db.get(id);
-    if (!item || item.tenantId !== tenantId || item.status !== "quarantined") return { queued: 0 };
-
-    const now = Date.now();
-    const jobId = await ctx.db.insert("cleanupJobs", {
-      tenantId,
-      requestedBy: args.requestedBy,
-      action: "purge",
-      status: "approved",
-      approvedBy: args.requestedBy,
-      affectedFileIds: [item.fileId],
-      affectedBytes: item.sizeBytes,
-      result: { purgeItems: [{ quarantineItemId: String(item._id), quarantinePath: item.quarantinePath }] },
-      createdAt: now,
-      updatedAt: now,
-    });
-    await ctx.db.patch(id, { status: "pending_purge" });
-
-    await ctx.db.insert("auditLogs", {
-      tenantId,
-      actorId: args.requestedBy,
-      action: "purge_request",
-      entityType: "quarantineItem",
-      entityId: id,
-      message: `Queued permanent deletion of ${item.originalPath} (${(item.sizeBytes / (1024 ** 3)).toFixed(1)} GB)`,
-      createdAt: now,
-    });
-
-    return { queued: 1, jobId };
-  },
-});
-
-// Agent-only (internal): fetch a job + its files, scoped to the agent's tenant.
-export const getJob = internalQuery({
-  args: { jobId: v.string(), tenantId: v.optional(v.string()) },
-  handler: async (ctx, args) => {
-    const tenantId = args.tenantId || "";
-    const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
-    if (!id) return null;
-
-    const job = await ctx.db.get(id);
-    if (!job || job.tenantId !== tenantId) return null;
-
-    const files = [];
-    for (const fId of job.affectedFileIds) {
-      const fileId = ctx.db.normalizeId("files", fId);
-      if (fileId) {
-        const file = await ctx.db.get(fileId);
-        if (file && file.tenantId === tenantId) files.push(file);
+    if (active.some((job: any) => job.action === "quarantine" && job.affectedFileIds.some((id: string) => selected.has(id))))
+      throw new ConvexError("Some selected files are already queued for quarantine.");
+  }
+  const reserved = async (file: any) => {
+    if (legacyReservedIds.has(String(file._id))) return true;
+    if (!file.pendingCleanupJobId) return false;
+    if (!reservationJobs.has(file.pendingCleanupJobId)) {
+      const id = ctx.db.normalizeId("cleanupJobs", file.pendingCleanupJobId);
+      reservationJobs.set(file.pendingCleanupJobId, id ? await ctx.db.get(id) : null);
+    }
+    const job = reservationJobs.get(file.pendingCleanupJobId);
+    return Boolean(job?.tenantId === tenantId && job.action === "quarantine" &&
+      ["approved", "queued", "running"].includes(job.status) && job.affectedFileIds.includes(String(file._id)));
+  };
+  for (const fileId of selected) {
+    const id = ctx.db.normalizeId("files", fileId);
+    const file = id ? await ctx.db.get(id) : null;
+    if (!file || file.tenantId !== tenantId || file.deletedAt || file.source !== "local") {
+      throw new ConvexError("A selected file is no longer available. Refresh the cleanup list.");
+    }
+    if (protectedFile(file)) throw new ConvexError(`Protected file cannot be quarantined: ${file.name}`);
+    if (await reserved(file)) throw new ConvexError(`File is already reserved for cleanup: ${file.name}`);
+    let rules = settings.cleanupRules;
+    if (file.projectId) {
+      if (!projects.has(file.projectId)) {
+        const pid = ctx.db.normalizeId("projects", file.projectId);
+        projects.set(file.projectId, pid ? await ctx.db.get(pid) : null);
+      }
+      const project = projects.get(file.projectId);
+      if (project?.tenantId === tenantId && project.cleanupRules) {
+        rules = { ...rules, proxyDelete: rules.proxyDelete && project.cleanupRules.proxyDelete,
+          cacheDelete: rules.cacheDelete && project.cleanupRules.cacheDelete };
       }
     }
-
-    return { ...job, files };
-  },
-});
-
-// Agent-only (internal).
-export const getQuarantineItem = internalQuery({
-  args: { quarantineId: v.string(), tenantId: v.optional(v.string()) },
-  handler: async (ctx, args) => {
-    const tenantId = args.tenantId || "";
-    const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
-    if (!id) return null;
-    const item = await ctx.db.get(id);
-    if (!item || item.tenantId !== tenantId) return null;
-    return item;
-  },
-});
-
-export const createJob = mutation({
-  args: {
-    recommendationId: v.optional(v.string()),
-    machineId: v.optional(v.string()),
-    requestedBy: v.string(),
-    action: v.string(), // "quarantine" | "restore" | "generate_manifest" | "create_folder_structure"
-    affectedFileIds: v.array(v.string()),
-    affectedBytes: v.number(),
-    // "Delete permanently" from the Cleanup page: still a quarantine job (so the
-    // protected-file guard applies), but flagged to auto-purge once moved.
-    purgeAfter: v.optional(v.boolean()),
-    result: v.optional(v.any()),
-  },
-  handler: async (ctx, args) => {
-    const { tenantId } = await requireMember(ctx);
-    const timestamp = Date.now();
-    const rollbackPeriod = 14 * 24 * 60 * 60 * 1000;
-
-    const jobId = await ctx.db.insert("cleanupJobs", {
-      tenantId,
-      recommendationId: args.recommendationId,
-      machineId: args.machineId,
-      requestedBy: args.requestedBy,
-      action: args.action,
-      status: "pending_approval",
-      affectedFileIds: args.affectedFileIds,
-      affectedBytes: args.affectedBytes,
-      // A purge-after job keeps a zero rollback window: the file is meant to be
-      // deleted, not held for 14 days.
-      rollbackUntil: args.action === "quarantine" && !args.purgeAfter ? timestamp + rollbackPeriod : undefined,
-      purgeAfter: args.purgeAfter || undefined,
-      result: args.result,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    });
-
-    await ctx.db.insert("auditLogs", {
-      tenantId,
-      actorId: args.requestedBy,
-      machineId: args.machineId,
-      action: "job_create",
-      entityType: "cleanupJob",
-      entityId: jobId,
-      message: `Created cleanup job for action "${args.action}"${args.purgeAfter ? " (permanent delete)" : ""} affecting ${(args.affectedBytes / (1024 ** 3)).toFixed(1)} GB`,
-      createdAt: timestamp,
-    });
-
-    return jobId;
-  },
-});
-
-export const approveJob = mutation({
-  args: {
-    jobId: v.string(),
-    approvedBy: v.string(),
-  },
-  handler: async (ctx, args) => {
-    const { tenantId } = await requireMember(ctx);
-    const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
-    if (!id) return;
-
-    const job = inTenant(await ctx.db.get(id), tenantId);
-    if (!job) return;
-
-    const timestamp = Date.now();
-    await ctx.db.patch(id, {
-      status: "approved",
-      approvedBy: args.approvedBy,
-      updatedAt: timestamp,
-    });
-
-    if (job.recommendationId) {
-      const recId = ctx.db.normalizeId("recommendations", job.recommendationId);
-      const rec = recId ? inTenant(await ctx.db.get(recId), tenantId) : null;
-      if (recId && rec) {
-        await ctx.db.patch(recId, {
-          status: "approved",
-          updatedAt: timestamp,
-        });
+    const classification = classifyFile(file.path, file.name);
+    const regenerable = ["CACHE", "RENDER_PREVIEW", "PROXY"].includes(classification);
+    if ((["CACHE", "RENDER_PREVIEW"].includes(classification) && !rules.cacheDelete) ||
+      (classification === "PROXY" && !rules.proxyDelete)) {
+      throw new ConvexError(`Cleanup is disabled by the workspace/project rules for ${file.name}.`);
+    }
+    if (!regenerable) {
+      if (!file.fullHash) throw new ConvexError(`A verified duplicate is required before cleaning ${file.name}.`);
+      if (!clusters.has(file.fullHash)) clusters.set(file.fullHash,
+        await ctx.db.query("duplicateClusters").withIndex("by_tenant_hashKey", (q: any) =>
+          q.eq("tenantId", tenantId).eq("hashKey", file.fullHash)).first());
+      const cluster = clusters.get(file.fullHash);
+      const keepIds: string[] = cluster ? [cluster.recommendedKeepFileId, ...cluster.fileIds]
+        .filter((keepId: string | undefined): keepId is string => Boolean(keepId) && keepId !== String(file._id) && !selected.has(keepId!)) : [];
+      let keep: any = null;
+      for (const keepId of new Set(keepIds)) {
+        const candidateId = ctx.db.normalizeId("files", keepId);
+        const candidate = candidateId ? await ctx.db.get(candidateId) : null;
+        if (candidate?.tenantId === tenantId && !candidate.deletedAt && candidate.fullHash === file.fullHash && candidate.sizeBytes === file.sizeBytes && !(await reserved(candidate))) {
+          keep = candidate;
+          break;
+        }
+      }
+      if (!cluster || cluster.type !== "exact" || !cluster.fileIds.includes(String(file._id)) ||
+        !keep || keep.tenantId !== tenantId || keep.deletedAt || selected.has(String(keep._id)) ||
+        keep._id === file._id || keep.fullHash !== file.fullHash || keep.sizeBytes !== file.sizeBytes) {
+        throw new ConvexError(`No separate verified keep copy is available for ${file.name}.`);
       }
     }
+    files.push({ ...file, machineId: await fileMachine(ctx, file, tenantId) });
+  }
+  return files;
+}
 
-    await ctx.db.insert("auditLogs", {
-      tenantId,
-      actorId: args.approvedBy,
-      action: "job_approve",
-      entityType: "cleanupJob",
-      entityId: id,
-      message: `Approved cleanup job for action "${job.action}" requested by ${job.requestedBy}`,
-      createdAt: timestamp,
-    });
-  },
-});
-
-// ---- CLI Agent Endpoints (internal: reached only via the authenticated HTTP route) ----
-
-export const pollPendingJobs = internalQuery({
-  args: { machineId: v.string(), tenantId: v.optional(v.string()) },
-  handler: async (ctx, args) => {
-    const tenantId = args.tenantId || "";
-    // Only the two actionable statuses, via the (tenant,status) index — never
-    // the whole job history. This query runs on every agent poll, so reading the
-    // full cleanupJobs table (which accumulates completed/failed rows forever,
-    // and now also the auto-purge jobs from "Delete permanently") would grow
-    // more expensive every day the workspace is used. Bounded read = stable cost.
-    const approved = await ctx.db
-      .query("cleanupJobs")
-      .withIndex("by_tenant_status", (q) => q.eq("tenantId", tenantId).eq("status", "approved"))
-      .take(200);
-    const queued = await ctx.db
-      .query("cleanupJobs")
-      .withIndex("by_tenant_status", (q) => q.eq("tenantId", tenantId).eq("status", "queued"))
-      .take(200);
-
-    const machineJobs = [...approved, ...queued].filter(
-      (job) => !job.machineId || job.machineId === args.machineId
-    );
-
-    const hydratedJobs = [];
-    for (const job of machineJobs) {
-      const filesList = [];
-      for (const fId of job.affectedFileIds) {
-        const fileIdObj = ctx.db.normalizeId("files", fId);
-        if (fileIdObj) {
-          const file = await ctx.db.get(fileIdObj);
-          if (file && file.tenantId === tenantId) filesList.push(file);
-        }
-      }
-      hydratedJobs.push({ ...job, files: filesList });
-    }
-
-    return hydratedJobs;
-  },
-});
-
-export const updateJobStatus = internalMutation({
-  args: {
-    jobId: v.string(),
-    status: v.string(), // "running" | "completed" | "failed"
-    result: v.optional(v.any()),
-    tenantId: v.optional(v.string()),
-    quarantineFiles: v.optional(
-      v.array(
-        v.object({
-          fileId: v.string(),
-          originalPath: v.string(),
-          quarantinePath: v.string(),
-          sizeBytes: v.number(),
-        })
-      )
-    ),
-  },
-  handler: async (ctx, args) => {
-    const tenantId = args.tenantId || "";
-    const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
-    if (!id) return;
-
-    const job = await ctx.db.get(id);
-    if (!job || job.tenantId !== tenantId) return;
-
-    const timestamp = Date.now();
-    await ctx.db.patch(id, {
-      status: args.status,
-      result: args.result || job.result,
-      updatedAt: timestamp,
-    });
-
-    if (args.status === "completed") {
-      if (job.action === "quarantine" && args.quarantineFiles) {
-        // Collect the freshly-created quarantine items so a purge-after job can
-        // reference them by id + on-disk path.
-        const createdItems: { quarantineItemId: string; quarantinePath: string }[] = [];
-        for (const qf of args.quarantineFiles) {
-          const fileIdObj = ctx.db.normalizeId("files", qf.fileId);
-
-          const qItemId = await ctx.db.insert("quarantineItems", {
-            tenantId,
-            cleanupJobId: args.jobId,
-            originalPath: qf.originalPath,
-            quarantinePath: qf.quarantinePath,
-            fileId: qf.fileId,
-            sizeBytes: qf.sizeBytes,
-            movedAt: timestamp,
-            // purge-after items get no rollback window (immediate delete intent).
-            rollbackUntil: job.purgeAfter ? timestamp : (job.rollbackUntil || (timestamp + 14 * 24 * 60 * 60 * 1000)),
-            status: "quarantined",
-          });
-          createdItems.push({ quarantineItemId: String(qItemId), quarantinePath: qf.quarantinePath });
-
-          if (fileIdObj) {
-            const file = await ctx.db.get(fileIdObj);
-            if (file && file.tenantId === tenantId) {
-              await ctx.db.patch(fileIdObj, { deletedAt: timestamp });
-            }
-          }
-        }
-
-        // "Delete permanently" flow: the file has moved to quarantine and is
-        // blocked-or-not by the same protected-file guard as any quarantine.
-        // Now auto-queue an approved purge job so the agent erases exactly those
-        // items from disk on its next poll. Only queues if something moved.
-        if (job.purgeAfter && createdItems.length > 0) {
-          const purgeJobId = await ctx.db.insert("cleanupJobs", {
-            tenantId,
-            machineId: job.machineId,
-            requestedBy: job.requestedBy,
-            action: "purge",
-            status: "approved", // auto-approved: the type-to-confirm delete WAS the approval
-            approvedBy: job.approvedBy || job.requestedBy,
-            affectedFileIds: job.affectedFileIds,
-            affectedBytes: job.affectedBytes,
-            result: { purgeItems: createdItems },
-            createdAt: timestamp,
-            updatedAt: timestamp,
-          });
-          await ctx.db.insert("auditLogs", {
-            tenantId,
-            machineId: job.machineId,
-            action: "purge_request",
-            entityType: "cleanupJob",
-            entityId: purgeJobId,
-            message: `Auto-queued permanent deletion of ${createdItems.length} quarantined item(s) (Delete permanently)`,
-            createdAt: timestamp,
-          });
-        }
-      }
-
-      if (job.action === "restore") {
-        const fileId = job.affectedFileIds[0];
-        if (fileId) {
-          const fileIdObj = ctx.db.normalizeId("files", fileId);
-          if (fileIdObj) {
-            const file = await ctx.db.get(fileIdObj);
-            if (file && file.tenantId === tenantId) {
-              await ctx.db.patch(fileIdObj, { deletedAt: undefined });
-            }
-          }
-
-          const qItems = await ctx.db
-            .query("quarantineItems")
-            .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
-            .filter((q) => q.eq(q.field("fileId"), fileId))
-            .collect();
-
-          for (const item of qItems) {
-            await ctx.db.patch(item._id, {
-              status: "restored",
-              restoredAt: timestamp,
-            });
-          }
-        }
-      }
-
-      // Purge job finalize: only the items the agent confirms deleted flip to
-      // permanently_deleted, so a partial failure leaves the rest recoverable.
-      // Each item is re-checked against the tenant before mutating.
-      if (job.action === "purge") {
-        const purgedIds: string[] = (args.result && args.result.purgedItemIds) || [];
-        for (const itemId of purgedIds) {
-          const qid = ctx.db.normalizeId("quarantineItems", itemId);
-          if (!qid) continue;
-          const item = await ctx.db.get(qid);
-          if (item && item.tenantId === tenantId) {
-            await ctx.db.patch(qid, { status: "permanently_deleted", deletedAt: timestamp });
-          }
-        }
-      }
-
-      if (job.recommendationId) {
-        const recId = ctx.db.normalizeId("recommendations", job.recommendationId);
-        if (recId) {
-          const rec = await ctx.db.get(recId);
-          if (rec && rec.tenantId === tenantId) {
-            await ctx.db.patch(recId, { status: "completed", updatedAt: timestamp });
-          }
-        }
-      }
-    }
-
-    await ctx.db.insert("auditLogs", {
-      tenantId,
-      machineId: job.machineId,
-      action: `job_${args.status}`,
-      entityType: "cleanupJob",
-      entityId: id,
-      message: `Cleanup job ${job.action} status changed to ${args.status}`,
-      createdAt: timestamp,
-    });
-  },
-});
-
-// Dashboard "Restore" button — restores a quarantined file in the caller's tenant.
-export const markQuarantineRestored = mutation({
-  args: { quarantineId: v.string() },
-  handler: async (ctx, args) => {
-    const { tenantId } = await requireMember(ctx);
-    await restoreQuarantine(ctx, args.quarantineId, tenantId);
-  },
-});
-
-// Agent variant (internal): same restore, tenant from the verified machine token.
-export const markQuarantineRestoredAgent = internalMutation({
-  args: { quarantineId: v.string(), tenantId: v.optional(v.string()) },
-  handler: async (ctx, args) => {
-    await restoreQuarantine(ctx, args.quarantineId, args.tenantId || "");
-  },
-});
-
-async function restoreQuarantine(ctx: any, quarantineId: string, tenantId: string) {
-  const id = ctx.db.normalizeId("quarantineItems", quarantineId);
-  if (!id) return;
-
-  const item = await ctx.db.get(id);
-  if (!item || item.tenantId !== tenantId) return;
-
-  const timestamp = Date.now();
-  await ctx.db.patch(id, {
-    status: "restored",
-    restoredAt: timestamp,
-  });
-
-  const fileId = ctx.db.normalizeId("files", item.fileId);
-  if (fileId) {
-    const file = await ctx.db.get(fileId);
-    if (file && file.tenantId === tenantId) {
-      await ctx.db.patch(fileId, {
-        deletedAt: undefined,
-        lastSeenAt: timestamp,
-      });
+async function queueFiles(ctx: any, member: any, ids: string[], purgeAfter = false, recommendationId?: string,
+  selectedRecommendationIds: string[] = recommendationId ? [recommendationId] : []) {
+  if (purgeAfter && member.role !== "admin") throw new ConvexError("Only admins can permanently delete files.");
+  const files = await validatedFiles(ctx, member.tenantId, ids);
+  const groups = new Map<string, any[]>();
+  for (const file of files) groups.set(file.machineId, [...(groups.get(file.machineId) ?? []), file]);
+  const { retentionDays } = await workspaceSettings(ctx, member.tenantId);
+  const jobIds = [];
+  const clusterIds = new Set<string>();
+  const visitedHashes = new Set<string>();
+  for (const file of files) {
+    if (!file.fullHash || visitedHashes.has(file.fullHash)) continue;
+    visitedHashes.add(file.fullHash);
+    const cluster = await ctx.db.query("duplicateClusters").withIndex("by_tenant_hashKey", (q: any) => q.eq("tenantId", member.tenantId).eq("hashKey", file.fullHash)).first();
+    if (cluster && cluster.fileIds.some((id: string) => ids.includes(id))) {
+      clusterIds.add(String(cluster._id));
+      if (cluster.status === "open") await ctx.db.patch(cluster._id, { status: "queued", updatedAt: Date.now() });
     }
   }
-
-  await ctx.db.insert("auditLogs", {
-    tenantId,
-    action: "quarantine_restore",
-    entityType: "quarantineItem",
-    entityId: id,
-    message: `Restored quarantined file ${item.originalPath}`,
-    createdAt: timestamp,
-  });
+  for (const [machineId, group] of groups) {
+    const jobId = await insertApprovedJob(ctx, {
+      tenantId: member.tenantId, machineId, requestedBy: member.email, action: "quarantine",
+      fileIds: group.map(f => String(f._id)), bytes: group.reduce((s, f) => s + f.sizeBytes, 0),
+      recommendationId, purgeAfter: purgeAfter || undefined,
+      rollbackUntil: purgeAfter ? undefined : Date.now() + retentionDays * 86400000,
+    });
+    jobIds.push(jobId);
+    for (const file of group) await ctx.db.patch(file._id, { pendingCleanupJobId: String(jobId) });
+  }
+  // The same file can appear in a cache recommendation and in Duplicate
+  // Center. Remove reserved IDs from other open cleanup cards in this same
+  // transaction so those cards cannot offer stale files while jobs are queued.
+  const selectedSizes = new Map<string, number>(files.map(file => [String(file._id), file.sizeBytes]));
+  const explicitlySelected = new Set(selectedRecommendationIds);
+  const relatedRecommendationIds = new Set(selectedRecommendationIds);
+  const openRecommendations = await ctx.db.query("recommendations")
+    .withIndex("by_tenant_status", (q: any) => q.eq("tenantId", member.tenantId).eq("status", "open")).collect();
+  for (const rec of openRecommendations) {
+    if (!CLEANUP_RECOMMENDATION_TYPES.has(rec.type) || explicitlySelected.has(String(rec._id))) continue;
+    const removed = rec.affectedFileIds.filter((id: string) => selectedSizes.has(id));
+    if (!removed.length) continue;
+    const remaining = rec.affectedFileIds.filter((id: string) => !selectedSizes.has(id));
+    const removedBytes = [...new Set<string>(removed)].reduce((sum, id) => sum + selectedSizes.get(id)!, 0);
+    await ctx.db.patch(rec._id, {
+      affectedFileIds: remaining,
+      affectedBytes: remaining.length ? Math.max(0, rec.affectedBytes - removedBytes) : 0,
+      status: remaining.length ? "open" : "approved",
+      updatedAt: Date.now(),
+    });
+    if (!remaining.length) relatedRecommendationIds.add(String(rec._id));
+  }
+  for (const jobId of jobIds) await ctx.db.patch(jobId, { result: {
+    clusterIds: [...clusterIds], batchJobIds: jobIds, recommendationIds: [...relatedRecommendationIds],
+  } });
+  return { jobIds, queued: files.length, bytes: files.reduce((s, f) => s + f.sizeBytes, 0) };
 }
+
+export const queueQuarantine = mutation({
+  args: { fileIds: v.array(v.string()), purgeAfter: v.optional(v.boolean()), clusterId: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const member = await requireRole(ctx, EDITORS);
+    let cluster: any = null;
+    if (args.clusterId) {
+      const cid = ctx.db.normalizeId("duplicateClusters", args.clusterId);
+      cluster = cid ? inTenant(await ctx.db.get(cid), member.tenantId) : null;
+      if (!cluster || cluster.type !== "exact" || cluster.status !== "open" || args.fileIds.some(id => !cluster.fileIds.includes(id)))
+        throw new ConvexError("The selected files are not part of an available exact duplicate cluster.");
+    }
+    const queued = await queueFiles(ctx, member, args.fileIds, args.purgeAfter);
+    if (cluster) {
+      for (const jobId of queued.jobIds) {
+        const id = ctx.db.normalizeId("cleanupJobs", jobId)!;
+        const job = await ctx.db.get(id);
+        await ctx.db.patch(jobId, { result: { ...job?.result, clusterId: String(cluster._id), batchJobIds: queued.jobIds } });
+      }
+      await ctx.db.patch(cluster._id, { status: "queued", updatedAt: Date.now() });
+    }
+    return queued;
+  },
+});
+
+export const queueRecommendations = mutation({
+  args: { recommendationIds: v.array(v.string()), purgeAfter: v.optional(v.boolean()) },
+  handler: async (ctx, args) => {
+    const member = await requireRole(ctx, EDITORS);
+    if (!args.recommendationIds.length || args.recommendationIds.length > 100) throw new ConvexError("Choose 1 to 100 recommendations.");
+    const records = [];
+    for (const recId of new Set(args.recommendationIds)) {
+      const id = ctx.db.normalizeId("recommendations", recId);
+      const rec = id ? inTenant(await ctx.db.get(id), member.tenantId) : null;
+      if (!rec || rec.status !== "open" || !CLEANUP_RECOMMENDATION_TYPES.has(rec.type)) {
+        throw new ConvexError("This recommendation cannot be used for file cleanup. Refresh the list.");
+      }
+      records.push(rec);
+    }
+    const ids = Array.from(new Set(records.flatMap(r => r.affectedFileIds)));
+    const result = await queueFiles(ctx, member, ids, args.purgeAfter, records.length === 1 ? String(records[0]._id) : undefined,
+      records.map(rec => String(rec._id)));
+    // Store all related recommendations on every grouped job so final state can
+    // be recomputed across machines instead of completing on the first agent.
+    for (const jobId of result.jobIds) {
+      const id = ctx.db.normalizeId("cleanupJobs", jobId)!;
+      const job = await ctx.db.get(id);
+      await ctx.db.patch(jobId, { result: { ...job?.result,
+        recommendationIds: Array.from(new Set([...(job?.result?.recommendationIds ?? []), ...records.map(r => String(r._id))])),
+        batchJobIds: result.jobIds } });
+    }
+    for (const rec of records) await ctx.db.patch(rec._id, { status: "approved", updatedAt: Date.now() });
+    return result;
+  },
+});
+
+// Backwards-compatible entry point for existing duplicate-center clients.
+export const createJob = mutation({
+  args: { recommendationId: v.optional(v.string()), machineId: v.optional(v.string()), requestedBy: v.string(),
+    action: v.string(), affectedFileIds: v.array(v.string()), affectedBytes: v.number(),
+    purgeAfter: v.optional(v.boolean()), result: v.optional(v.any()) },
+  handler: async (ctx, args) => {
+    const member = await requireRole(ctx, EDITORS);
+    if (args.action !== "quarantine") throw new ConvexError("Use the dedicated scan, restore, or project action.");
+    if (args.recommendationId) {
+      const rid = ctx.db.normalizeId("recommendations", args.recommendationId);
+      const rec = rid ? inTenant(await ctx.db.get(rid), member.tenantId) : null;
+      if (!rec || !CLEANUP_RECOMMENDATION_TYPES.has(rec.type) || args.affectedFileIds.some(id => !rec.affectedFileIds.includes(id)))
+        throw new ConvexError("The recommendation does not authorize these files.");
+    }
+    const queued = await queueFiles(ctx, member, args.affectedFileIds, args.purgeAfter, args.recommendationId);
+    return queued.jobIds[0];
+  },
+});
+
+export const approveJob = mutation({ args: { jobId: v.string(), approvedBy: v.string() }, handler: async (ctx, args) => {
+  const member = await requireRole(ctx, EDITORS);
+  const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
+  const job = id ? inTenant(await ctx.db.get(id), member.tenantId) : null;
+  if (!job) throw new ConvexError("Unknown job.");
+  if (job.status === "approved" || job.status === "queued") return;
+  if (job.status !== "pending_approval" || !job.machineId) throw new ConvexError("This job cannot be approved. Create a new machine-targeted request.");
+  if (job.action === "quarantine") await validatedFiles(ctx, member.tenantId, job.affectedFileIds);
+  await ctx.db.patch(job._id, { status: "approved", approvedBy: member.email, updatedAt: Date.now() });
+}});
+
+async function queuePurge(ctx: any, member: any, items: any[]) {
+  const groups = new Map<string, any[]>();
+  for (const item of items) {
+    const machineId = await quarantineMachine(ctx, item, member.tenantId);
+    groups.set(machineId, [...(groups.get(machineId) ?? []), item]);
+  }
+  const jobIds = [];
+  for (const [machineId, group] of groups) jobIds.push(await insertApprovedJob(ctx, {
+    tenantId: member.tenantId, machineId, requestedBy: member.email, action: "purge",
+    fileIds: group.map(i => i.fileId), bytes: group.reduce((s, i) => s + i.sizeBytes, 0),
+    result: { purgeItems: group.map(i => ({ quarantineItemId: String(i._id), quarantinePath: i.quarantinePath })) },
+  }));
+  for (const item of items) await ctx.db.patch(item._id, { status: "pending_purge" });
+  return { queued: items.length, jobIds, jobId: jobIds[0] };
+}
+
+export const purgeExpired = mutation({ args: { requestedBy: v.string() }, handler: async (ctx) => {
+  const member = await requireRole(ctx, ["admin"]);
+  const all = await ctx.db.query("quarantineItems").withIndex("by_tenant", q => q.eq("tenantId", member.tenantId)).collect();
+  return queuePurge(ctx, member, all.filter(i => i.status === "quarantined" && i.rollbackUntil <= Date.now()));
+}});
+
+export const purgeItem = mutation({ args: { quarantineId: v.string(), requestedBy: v.string() }, handler: async (ctx, args) => {
+  const member = await requireRole(ctx, ["admin"]);
+  const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
+  const item = id ? inTenant(await ctx.db.get(id), member.tenantId) : null;
+  if (!item || item.status !== "quarantined") throw new ConvexError("This item is not available for deletion.");
+  return queuePurge(ctx, member, [item]);
+}});
+
+async function requestRestoreJob(ctx: any, quarantineId: string) {
+  const member = await requireRole(ctx, EDITORS);
+  const id = ctx.db.normalizeId("quarantineItems", quarantineId);
+  const item = id ? inTenant(await ctx.db.get(id), member.tenantId) : null;
+  if (!item || item.status !== "quarantined") throw new ConvexError("This item is not available for restoration.");
+  const machineId = await quarantineMachine(ctx, item, member.tenantId);
+  const jobId = await insertApprovedJob(ctx, {
+    tenantId: member.tenantId, machineId, requestedBy: member.email, action: "restore",
+    fileIds: [item.fileId], bytes: item.sizeBytes,
+    result: { quarantineId: String(item._id), originalPath: item.originalPath, quarantinePath: item.quarantinePath },
+  });
+  await ctx.db.patch(item._id, { status: "pending_restore", machineId });
+  return { jobId };
+}
+export const requestRestore = mutation({ args: { quarantineId: v.string() }, handler: (ctx, args) => requestRestoreJob(ctx, args.quarantineId) });
+export const markQuarantineRestored = mutation({ args: { quarantineId: v.string() }, handler: (ctx, args) => requestRestoreJob(ctx, args.quarantineId) });
+
+export const getJob = internalQuery({ args: { jobId: v.string(), tenantId: v.optional(v.string()), machineId: v.optional(v.string()) }, handler: async (ctx, args) => {
+  const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
+  const job = id ? inTenant(await ctx.db.get(id), args.tenantId || "") : null;
+  if (!job || (args.machineId && job.machineId !== args.machineId)) return null;
+  const files = [];
+  for (const fid of job.affectedFileIds) {
+    const id = ctx.db.normalizeId("files", fid);
+    const file = id ? inTenant(await ctx.db.get(id), args.tenantId || "") : null;
+    if (file) files.push(file);
+  }
+  return { ...job, files };
+}});
+
+export const getQuarantineItem = internalQuery({ args: { quarantineId: v.string(), tenantId: v.optional(v.string()), machineId: v.optional(v.string()) }, handler: async (ctx, args) => {
+  const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
+  const item = id ? inTenant(await ctx.db.get(id), args.tenantId || "") : null;
+  if (!item || (args.machineId && await quarantineMachine(ctx, item, args.tenantId || "") !== args.machineId)) return null;
+  return item;
+}});
+
+export const pollPendingJobs = internalQuery({ args: { machineId: v.string(), tenantId: v.optional(v.string()) }, handler: async (ctx, args) => {
+  const tenantId = args.tenantId || "";
+  const approved = await ctx.db.query("cleanupJobs").withIndex("by_tenant_status", q => q.eq("tenantId", tenantId).eq("status", "approved")).take(200);
+  const queued = await ctx.db.query("cleanupJobs").withIndex("by_tenant_status", q => q.eq("tenantId", tenantId).eq("status", "queued")).take(200);
+  const result = [];
+  for (const job of [...approved, ...queued].filter(j => j.machineId === args.machineId)) {
+    const files = [];
+    for (const fid of job.affectedFileIds) {
+      const id = ctx.db.normalizeId("files", fid);
+      const file = id ? inTenant(await ctx.db.get(id), tenantId) : null;
+      if (file) files.push(file);
+    }
+    result.push({ ...job, files });
+  }
+  return result;
+}});
+
+async function finishRestore(ctx: any, item: any, tenantId: string) {
+  if (!ACTIVE_QUARANTINE.has(item.status) || item.status === "pending_purge") throw new ConvexError("The quarantine item is not restorable.");
+  const now = Date.now();
+  await ctx.db.patch(item._id, { status: "restored", restoredAt: now });
+  const fid = ctx.db.normalizeId("files", item.fileId);
+  const file = fid ? inTenant(await ctx.db.get(fid), tenantId) : null;
+  if (file) await ctx.db.patch(file._id, { deletedAt: undefined, lastSeenAt: now });
+  await ctx.db.insert("auditLogs", { tenantId, action: "quarantine_restore", entityType: "quarantineItem", entityId: item._id,
+    message: `Restored quarantined file ${item.originalPath}`, createdAt: now });
+}
+
+export const markQuarantineRestoredAgent = internalMutation({ args: { quarantineId: v.string(), tenantId: v.optional(v.string()), machineId: v.optional(v.string()) }, handler: async (ctx, args) => {
+  const tenantId = args.tenantId || "";
+  const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
+  const item = id ? inTenant(await ctx.db.get(id), tenantId) : null;
+  if (!item || (args.machineId && await quarantineMachine(ctx, item, tenantId) !== args.machineId)) throw new ConvexError("Unknown quarantine item.");
+  await finishRestore(ctx, item, tenantId);
+}});
+
+export const updateJobStatus = internalMutation({ args: {
+  jobId: v.string(), status: v.string(), result: v.optional(v.any()), tenantId: v.optional(v.string()), machineId: v.optional(v.string()),
+  quarantineFiles: v.optional(v.array(v.object({ fileId: v.string(), originalPath: v.string(), quarantinePath: v.string(), sizeBytes: v.number() }))),
+}, handler: async (ctx, args) => {
+  const tenantId = args.tenantId || "";
+  const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
+  const job = id ? inTenant(await ctx.db.get(id), tenantId) : null;
+  if (!job || !job.machineId || (args.machineId && job.machineId !== args.machineId)) throw new ConvexError("Unknown machine job.");
+  if (job.status === "completed") return { claimed: false };
+  if (!["running", "completed", "failed"].includes(args.status)) throw new ConvexError("Invalid job status.");
+  if (args.status === "running" && !["approved", "queued"].includes(job.status)) return { claimed: false };
+  const now = Date.now();
+  const result = { ...(job.result || {}), ...(args.result || {}) };
+  const terminal = args.status === "completed" || args.status === "failed";
+  if (job.action === "quarantine" && terminal && args.quarantineFiles?.length) {
+    const createdItems = [];
+    for (const qf of args.quarantineFiles) {
+      if (!job.affectedFileIds.includes(qf.fileId)) throw new ConvexError("Unexpected quarantine file.");
+      const fid = ctx.db.normalizeId("files", qf.fileId);
+      const file = fid ? inTenant(await ctx.db.get(fid), tenantId) : null;
+      if (!file || protectedFile(file) || file.path !== qf.originalPath || await fileMachine(ctx, file, tenantId) !== job.machineId)
+        throw new ConvexError("Quarantine confirmation does not match the requested file.");
+      if (file.deletedAt) continue;
+      const qid = await ctx.db.insert("quarantineItems", {
+        tenantId, machineId: job.machineId, cleanupJobId: String(job._id), fileId: qf.fileId,
+        originalPath: qf.originalPath, quarantinePath: qf.quarantinePath, sizeBytes: file.sizeBytes,
+        movedAt: now, rollbackUntil: job.purgeAfter ? now : job.rollbackUntil ?? now + (await workspaceSettings(ctx, tenantId)).retentionDays * 86400000,
+        status: "quarantined",
+      });
+      createdItems.push({ quarantineItemId: String(qid), quarantinePath: qf.quarantinePath });
+      await ctx.db.patch(file._id, { deletedAt: now, pendingCleanupJobId: undefined });
+      if (file.fullHash) {
+        const cluster = await ctx.db.query("duplicateClusters").withIndex("by_tenant_hashKey", q => q.eq("tenantId", tenantId).eq("hashKey", file.fullHash!)).first();
+        if (cluster?.fileIds.includes(qf.fileId)) {
+          const remaining = cluster.fileIds.filter(id => id !== qf.fileId);
+          const perFileBytes = cluster.fileCount ? cluster.totalBytes / cluster.fileCount : file.sizeBytes;
+          await ctx.db.patch(cluster._id, { fileIds: remaining, fileCount: remaining.length,
+            totalBytes: perFileBytes * remaining.length, wastedBytes: perFileBytes * Math.max(0, remaining.length - 1),
+            recommendedKeepFileId: remaining.includes(cluster.recommendedKeepFileId ?? "") ? cluster.recommendedKeepFileId : remaining[0],
+            status: remaining.length < 2 ? "resolved" : cluster.status, updatedAt: now });
+        }
+      }
+    }
+    if (job.purgeAfter && createdItems.length) {
+      await insertApprovedJob(ctx, { tenantId, machineId: job.machineId, requestedBy: job.requestedBy, action: "purge",
+        fileIds: args.quarantineFiles.map(f => f.fileId), bytes: args.quarantineFiles.reduce((s, f) => s + f.sizeBytes, 0), result: { purgeItems: createdItems } });
+      for (const item of createdItems) await ctx.db.patch(item.quarantineItemId as any, { status: "pending_purge" });
+    }
+  }
+  if (job.action === "quarantine" && terminal) {
+    // Confirmed moves above are soft-deleted. Remaining rows were not moved by
+    // this finished attempt and may be selected again after an explicit retry.
+    for (const fileId of job.affectedFileIds) {
+      const fid = ctx.db.normalizeId("files", fileId);
+      const file = fid ? inTenant(await ctx.db.get(fid), tenantId) : null;
+      if (file?.pendingCleanupJobId === String(job._id))
+        await ctx.db.patch(file._id, { pendingCleanupJobId: undefined });
+    }
+  }
+  if (job.action === "restore" && terminal) {
+    const qid = ctx.db.normalizeId("quarantineItems", job.result?.quarantineId ?? "");
+    const item = qid ? inTenant(await ctx.db.get(qid), tenantId) : null;
+    if (args.status === "completed") {
+      if (!item || !(args.result?.restoredQuarantineIds ?? []).includes(String(item._id))) throw new ConvexError("The agent did not confirm the restore.");
+      await finishRestore(ctx, item, tenantId);
+    } else if (item?.status === "pending_restore") await ctx.db.patch(item._id, { status: "quarantined" });
+  }
+  if (job.action === "purge" && terminal) {
+    const allowed = new Set((job.result?.purgeItems ?? []).map((i: any) => i.quarantineItemId));
+    const purged = new Set<string>(args.result?.purgedItemIds ?? []);
+    for (const qid of purged) if (!allowed.has(qid)) throw new ConvexError("Unexpected purge confirmation.");
+    for (const itemId of allowed) {
+      const qid = ctx.db.normalizeId("quarantineItems", itemId as string);
+      const item = qid ? inTenant(await ctx.db.get(qid), tenantId) : null;
+      if (!item || await quarantineMachine(ctx, item, tenantId) !== job.machineId) continue;
+      await ctx.db.patch(item._id, purged.has(String(item._id)) ? { status: "permanently_deleted", deletedAt: now } : { status: "quarantined" });
+    }
+  }
+  if (job.action === "generate_manifest" && args.status === "failed" && job.result?.verify && job.result?.projectId) {
+    const manifests = await ctx.db.query("archiveManifests").withIndex("by_tenant", q => q.eq("tenantId", tenantId))
+      .order("desc").filter(q => q.eq(q.field("projectId"), job.result.projectId)).take(50);
+    for (const manifest of manifests) {
+      if (manifest.status === "verified" && manifest.checksum === job.result.expectedManifestChecksum)
+        await ctx.db.patch(manifest._id, { status: "failed", verificationResult: { verified: false, error: result.error ?? "Agent checksum verification failed." } });
+    }
+  }
+  await ctx.db.patch(job._id, { status: args.status, result, updatedAt: now });
+  if (terminal) {
+    const related = job.result?.recommendationIds ?? (job.recommendationId ? [job.recommendationId] : []);
+    const siblings = job.result?.batchJobIds ?? [String(job._id)];
+    const siblingJobs = [];
+    for (const sid of siblings) {
+      const siblingId = ctx.db.normalizeId("cleanupJobs", sid);
+      const sibling = siblingId ? inTenant(await ctx.db.get(siblingId), tenantId) : null;
+      if (sibling) siblingJobs.push(sibling);
+    }
+    const status = siblingJobs.some(j => j.status === "failed") ? "failed" : siblingJobs.every(j => j.status === "completed") ? "completed" : "approved";
+    for (const recId of related) {
+      const rid = ctx.db.normalizeId("recommendations", recId);
+      const rec = rid ? inTenant(await ctx.db.get(rid), tenantId) : null;
+      if (rec) await ctx.db.patch(rec._id, { status, updatedAt: now });
+    }
+    if (siblingJobs.every(j => ["completed", "failed"].includes(j.status))) {
+      const clusterIds: string[] = job.result?.clusterIds ?? (job.result?.clusterId ? [job.result.clusterId] : []);
+      for (const clusterId of clusterIds) {
+        const cid = ctx.db.normalizeId("duplicateClusters", clusterId);
+        const cluster = cid ? inTenant(await ctx.db.get(cid), tenantId) : null;
+        if (cluster && cluster.status === "queued") await ctx.db.patch(cluster._id, { status: cluster.fileCount < 2 ? "resolved" : "open", updatedAt: now });
+      }
+    }
+  }
+  await ctx.db.insert("auditLogs", { tenantId, machineId: job.machineId, action: `job_${args.status}`, entityType: "cleanupJob", entityId: job._id,
+    message: `Agent ${job.action} job ${args.status}.`, createdAt: now });
+  return { claimed: true };
+}});

@@ -1,5 +1,9 @@
 import React from "react";
 import { DB } from "@/data";
+import { useQuery } from "convex/react";
+import { api } from "@/convexApi";
+import { groupCatalogFiles } from "@/catalog";
+import { formatBytes } from "@/lib/download";
 import {
   Icon,
   fmtTB,
@@ -113,11 +117,12 @@ type AnyRecord = Record<string, any>;
   }
 
   // ---- Overview ----
-  function DrivesScreen({ go }: ScreenProps) {
+  function DrivesScreen({ go, requestScan, actionBusy }: ScreenProps) {
     const [owner, setOwner] = React.useState("all");
     const [loc, setLoc] = React.useState("all");
     const [status, setStatus] = React.useState("all");
     const [view, setView] = React.useState("grid");
+    const [showAdd, setShowAdd] = React.useState(false);
 
     const locations = [...new Set(DB.drives.map((d) => d.location))];
     let list = DB.drives.filter((d) =>
@@ -131,8 +136,8 @@ type AnyRecord = Record<string, any>;
 
     return h("div", { className: "page-inner" },
       h(PageHead, { eyebrow: "Storage", title: "Drives", desc: "Every tracked hard drive, RAID, and cloud volume across the studio and remote agents.",
-        actions: [h("button", { key: 1, className: "btn" }, h(Icon, { name: "refresh", size: 15 }), "Scan All"),
-          h("button", { key: 2, className: "btn primary" }, h(Icon, { name: "plus", size: 16 }), "Add Drive")] }),
+        actions: [h("button", { key: 1, className: "btn", disabled: actionBusy || DB.drives.length === 0, onClick: () => void requestScan() }, h(Icon, { name: "refresh", size: 15 }), "Scan All"),
+          h("button", { key: 2, className: "btn primary", onClick: () => setShowAdd(true) }, h(Icon, { name: "plus", size: 16 }), "Add Drive")] }),
 
       h("div", { style: { display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: "var(--gap)", marginBottom: "var(--gap)" } },
         kpiMini("Online", online, "ok", "hdd"),
@@ -156,7 +161,8 @@ type AnyRecord = Record<string, any>;
         view === "grid"
           ? h("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: "var(--gap)" } },
               list.map((d) => h(DriveCard, { key: d.id, d, go })))
-          : h(DriveTable, { list, go }));
+          : h(DriveTable, { list, go }),
+      showAdd && h(AddDriveModal, { go, onClose: () => setShowAdd(false) }));
   }
 
   function DriveTable({ list, go }: ScreenProps) {
@@ -204,139 +210,71 @@ type AnyRecord = Record<string, any>;
   // ============================================================
   //  DRIVE DETAIL
   // ============================================================
-  function driveFileTypes(d: any) {
-    // synthesize per-drive distribution scaled to usedTB
-    const weights: Record<string, number> = { raw: 0.5, proxy: 0.12, cache: 0.1, export: 0.09, stock: 0.08, audio: 0.05, gfx: 0.04, unknown: 0.02 };
-    return DB.fileTypes.map((f) => ({ label: f.label, value: +(d.usedTB * (weights[f.key] || 0.03)).toFixed(2), color: getVar(f.color), key: f.key }));
+  function AddDriveModal({ go, onClose }: ScreenProps) {
+    return <Modal title="Connect a drive" subtitle="DriveOS reads your disks through a local agent" icon="hdd" onClose={onClose}
+      footer={[<button key="close" className="btn" onClick={onClose}>Close</button>, <button key="app" className="btn primary" onClick={() => { onClose(); go("download"); }}>Get desktop app</button>]}>
+      <ol style={{ paddingLeft: 20, lineHeight: 1.8, color: "var(--tx)" }}>
+        <li>Install and open the DriveOS desktop app on the computer attached to the drive.</li>
+        <li>Use Settings → Machines / Agents to issue a connection token for that computer.</li>
+        <li>Connect the app, choose Add drive, and select the drive or folder locally.</li>
+        <li>Run Scan Now. Its catalog will appear here after the agent finishes.</li>
+      </ol>
+      <p className="muted" style={{ fontSize: 12 }}>DriveOS uploads file metadata and hashes. Your media stays on its original disk.</p>
+      <button className="btn" onClick={() => { onClose(); go("settings"); }}>Manage agents</button>
+    </Modal>;
   }
-  const FOLDERS = [
-    { name: "02_RAW/A_CAM", type: "raw", w: 0.34 }, { name: "02_RAW/B_CAM", type: "raw", w: 0.18 },
-    { name: "05_PROXIES", type: "proxy", w: 0.12 }, { name: "06_RENDERS_CACHE", type: "cache", w: 0.1 },
-    { name: "04_ASSETS/STOCK_FOOTAGE", type: "stock", w: 0.08 }, { name: "07_EXPORTS/FINAL", type: "export", w: 0.07 },
-  ];
 
-  function DriveDetail({ params, go, toast }: ScreenProps) {
-    const d = (DB.driveById as AnyRecord)[params.id];
-    if (!d) return h("div", { className: "page-inner" }, h("div", { className: "muted" }, "Drive not found."));
-    const owner = DB.teamById[d.owner] || DB.teamById.founder || { name: "Studio" };
-    const ft = driveFileTypes(d);
-    const p = pct(d.usedTB, d.capTB);
-
-    if (d.status === "uninit") return h(UninitDrive, { d, go, toast });
-
-    const head = h(PageHead, {
-      eyebrow: owner.name + " · " + d.location,
-      title: d.name,
-      desc: d.model + " · " + d.bus,
-      actions: [
-        h("button", { key: 1, className: "btn", onClick: () => toast("Watching " + d.name, "eye", "accent") }, h(Icon, { name: "eye", size: 15 }), "Watch Drive"),
-        h("button", { key: 2, className: "btn", onClick: () => toast("Scan started on " + d.name, "refresh", "accent") }, h(Icon, { name: "refresh", size: 15 }), "Start Scan"),
-        h("button", { key: 3, className: "btn primary", onClick: () => go("cleanup") }, h(Icon, { name: "broom", size: 15 }), "Generate Cleanup Plan"),
-      ],
-    });
-
-    // status strip
-    const strip = h("div", { className: "card card-pad fade-up", style: { display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 1fr 1fr", gap: 22, marginBottom: "var(--gap)", alignItems: "center" } },
-      h("div", null,
-        h("div", { className: "row", style: { gap: 9, marginBottom: 9 } }, h(StatusBadge, { status: d.status }), h(RiskBadge, { risk: d.risk })),
-        h(CapMeter, { d, height: 9 })),
-      stripCell("Last Seen", d.lastSeen, "clock"),
-      stripCell("Projects", d.projects.length, "folder"),
-      stripCell("Duplicates", fmtTB(d.dupTB), "copy", "var(--warn)"),
-      stripCell("Safe Cleanup", fmtTB(d.cleanTB), "broom", "var(--ok)"));
-
-    const projBreakdown = cardShell("Storage by Project", "folder", "var(--tx-mut)", null,
-      h("div", { style: { padding: "8px 0" } }, d.projects.map((pid: string) => {
-        const pr = (DB.projectById as AnyRecord)[pid] || { name: pid, sizeTB: d.usedTB / d.projects.length, client: "—" };
-        const share = pr.sizeTB;
-        return h("div", { key: pid, className: "offender-row", onClick: () => (DB.projectById as AnyRecord)[pid] && go("project", { id: pid }), style: { padding: "10px 18px", cursor: (DB.projectById as AnyRecord)[pid] ? "pointer" : "default" } },
-          h("div", { className: "spread", style: { marginBottom: 5 } },
-            h("span", { className: "hi", style: { fontWeight: 600, fontSize: 13 } }, pr.name),
-            h("span", { className: "mono", style: { fontSize: 12, color: "var(--tx)" } }, fmtTB(share))),
-          h(Bar, { value: share, max: Math.max(...d.projects.map((x: string) => ((DB.projectById as AnyRecord)[x] || { sizeTB: 1 }).sizeTB)), height: 5 }));
-      })));
-
-    const typeCard = cardShell("File-Type Breakdown", "pieChart", "var(--tx-mut)", h(Badge, { square: true }, fmtTB(d.usedTB)),
-      h("div", { className: "card-pad", style: { display: "flex", gap: 18, alignItems: "center" } },
-        h(Donut, { data: ft, size: 140, thickness: 19 },
-          h("div", { className: "stat-num", style: { fontSize: 17 } }, ft[0].value > 0 ? Math.round(ft[0].value / d.usedTB * 100) + "%" : "—"),
-          h("div", { style: { fontSize: 9, color: "var(--tx-dim)", fontFamily: "var(--font-mono)" } }, "RAW")),
-        h("div", { style: { flex: 1 } }, h(Legend, { data: ft.filter((x) => x.value > 0.05) }))));
-
-    const folders = cardShell("Biggest Folders", "folder", "var(--tx-mut)", null,
-      h("div", { style: { padding: "6px 0" } }, FOLDERS.map((fo, i) => {
-        const size = d.usedTB * fo.w;
-        return h("div", { key: i, className: "row", style: { padding: "9px 18px", gap: 12 } },
-          h("span", { style: { width: 9, height: 9, borderRadius: 2, background: getVar("var(--ft-" + fo.type + ")"), flexShrink: 0 } }),
-          h("span", { className: "mono", style: { fontSize: 12, color: "var(--tx)", flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, "/" + fo.name),
-          h("span", { className: "mono", style: { fontSize: 12, color: "var(--tx-hi)", flexShrink: 0 } }, fmtTB(size)));
-      })));
-
-    const dupes = DB.duplicates.filter((du) => du.locations.some((l) => l.drive === d.id)).slice(0, 4);
-    const dupCard = cardShell("Duplicate Clusters", "copy", "var(--warn)", h("button", { className: "btn sm ghost", onClick: () => go("duplicates") }, "Review all"),
-      h("div", { style: { padding: "6px 0" } }, dupes.length ? dupes.map((du) =>
-        h("div", { key: du.id, className: "offender-row spread", onClick: () => go("duplicates"), style: { padding: "10px 18px", cursor: "pointer" } },
-          h("div", { className: "row", style: { gap: 9, minWidth: 0 } }, h(FileTypePill, { type: du.type }),
-            h("span", { className: "mono hi", style: { fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, du.name)),
-          h("div", { className: "row", style: { gap: 8, flexShrink: 0 } }, h(Badge, { kind: RISK_META[du.risk].cls }, du.copies + " copies"),
-            h("span", { className: "mono", style: { fontSize: 12, color: "var(--tx-hi)" } }, du.sizeGB + " GB")))) :
-        h("div", { className: "muted", style: { padding: "14px 18px", fontSize: 12.5 } }, "No duplicate clusters detected on this drive.")));
-
-    const cleanupActions = [
-      { title: "Quarantine Premiere cache", size: "0.3 TB", risk: "safe", why: "Regenerable peak + media cache." },
-      { title: "Remove delivered proxies", size: "0.18 TB", risk: "safe", why: "Originals verified on archive." },
-      { title: "Review old exports (v1–v4)", size: "0.13 TB", risk: "review", why: "Superseded review cuts." },
-    ];
-    const cleanCard = cardShell("Suggested Cleanup Actions", "broom", "var(--ok)", null,
-      h("div", { style: { padding: 14, display: "flex", flexDirection: "column", gap: 10 } }, cleanupActions.map((a, i) =>
-        h("div", { key: i, className: "spread", style: { padding: "11px 13px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
-          h("div", { style: { minWidth: 0 } },
-            h("div", { className: "row", style: { gap: 8, marginBottom: 3 } }, h(Badge, { kind: RISK_META[a.risk].cls }, RISK_META[a.risk].label),
-              h("span", { className: "hi", style: { fontWeight: 600, fontSize: 12.5 } }, a.title)),
-            h("div", { className: "muted", style: { fontSize: 11.5 } }, a.why)),
-          h("div", { className: "row", style: { gap: 10, flexShrink: 0 } }, h("span", { className: "stat-num", style: { fontSize: 14, color: "var(--ok)" } }, a.size),
-            h("button", { className: "btn sm", onClick: () => toast("Added to cleanup plan", "broom", "ok") }, "Plan"))))));
-
-    const risky = cardShell("Single-Copy Files (at risk)", "shield", "var(--risk)", h(Badge, { kind: "risk" }, "147 files"),
-      h("div", { className: "card-pad" },
-        h("div", { style: { padding: "14px 16px", borderRadius: "var(--r)", background: "var(--risk-soft)", border: "1px solid var(--risk-line)" } },
-          h("div", { className: "row", style: { gap: 9 } }, h(Icon, { name: "alert", size: 16, style: { color: "var(--risk)" } }),
-            h("div", null, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 13 } }, "0.9 TB exists only on this drive"),
-              h("div", { className: "muted", style: { fontSize: 12, marginTop: 3 } }, "147 RAW clips have no archive or cloud copy. Back up before any cleanup."))),
-          h("button", { className: "btn sm primary", style: { marginTop: 11 }, onClick: () => go("archive") }, h(Icon, { name: "archive", size: 14 }), "Send to Archive Queue"))));
-
-    // Live scan history from Convex (DB.scans), most-recent first, scoped to this drive when known.
-    const liveScans = (DB.scans || [])
-      .filter((s: any) => !s.driveId || !d.id || s.driveId === d.id)
-      .map((s: any) => ({
-        t: s.when,
-        e: s.status === "completed" ? "Scan complete" : s.status === "running" ? "Scan running" : "Scan " + (s.status || "—"),
-        n: fmtNum(s.files) + " files · " + fmtTB(s.sizeTB) + " indexed" + (s.errors ? " · " + s.errors + " errors" : ""),
-        k: s.status === "completed" ? "ok" : s.status === "running" ? "accent" : "warn",
-      }));
-    const scanItems = liveScans.length > 0 ? liveScans : [
-      { t: "2 min ago", e: "Full scan complete", n: "142,308 files · 3.6 TB indexed", k: "ok" },
-      { t: "Yesterday", e: "Incremental scan", n: "+1,204 files · +42 GB", k: "accent" },
-      { t: "Jun 1", e: "Duplicate detection run", n: "0.42 TB duplicates flagged", k: "warn" },
-      { t: "May 28", e: "Drive connected", n: "Thunderbolt 4 · auto-watch enabled", k: "" },
-    ];
-    const scans = cardShell("Scan Timeline", "activity", "var(--tx-mut)", null,
-      h("div", { style: { padding: "10px 18px" } }, scanItems.map((s, i, arr) => h("div", { key: i, className: "row", style: { gap: 13, alignItems: "flex-start", paddingBottom: i < arr.length - 1 ? 16 : 0, position: "relative" } },
-        h("div", { style: { display: "flex", flexDirection: "column", alignItems: "center", flexShrink: 0 } },
-          h("span", { style: { width: 10, height: 10, borderRadius: 99, background: s.k ? "var(--" + s.k + ")" : "var(--tx-faint)", boxShadow: s.k ? "0 0 8px var(--" + s.k + ")" : "none", zIndex: 1 } }),
-          i < arr.length - 1 && h("span", { style: { width: 1, flex: 1, background: "var(--line)", marginTop: 4, position: "absolute", top: 14, bottom: 0 } })),
-        h("div", { style: { flex: 1 } },
-          h("div", { className: "spread" }, h("span", { className: "hi", style: { fontWeight: 600, fontSize: 12.5 } }, s.e),
-            h("span", { className: "mono dim", style: { fontSize: 11 } }, s.t)),
-          h("div", { className: "muted", style: { fontSize: 11.5, marginTop: 2 } }, s.n))))));
-
-    return h("div", { className: "page-inner" },
-      h("button", { className: "btn ghost sm", style: { marginBottom: 12 }, onClick: () => go("drives") }, h(Icon, { name: "chevL", size: 15 }), "All drives"),
-      head, strip,
-      h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--gap)", marginBottom: "var(--gap)" } }, typeCard, projBreakdown),
-      h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--gap)", marginBottom: "var(--gap)" } }, folders, dupCard),
-      h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--gap)", marginBottom: "var(--gap)" } }, cleanCard, risky),
-      scans);
+  function DriveDetail({ params, go, toast, requestScan, requestAnalysis, actionBusy }: ScreenProps) {
+    const catalog = useQuery(api.files.list, { driveId: params.id, limit: 200 });
+    const d = DB.driveById[params.id];
+    if (!d) return <div className="page-inner"><div className="card card-pad muted">Drive not found.</div></div>;
+    const files = (catalog || []).filter((f: any) => !f.deletedAt);
+    const indexedBytes = files.reduce((sum: number, f: any) => sum + f.sizeBytes, 0);
+    const types = groupCatalogFiles(files, (f) => f.classification || "UNKNOWN");
+    const folders = groupCatalogFiles(files, (f) => f.path.replace(/\\/g, "/").split("/").slice(0, -1).join("/")).slice(0, 6);
+    const projectGroups = groupCatalogFiles(files.filter((f: any) => f.projectId), (f) => f.projectId);
+    const driveFileIds = new Set(files.map((f: any) => String(f._id)));
+    const dupes = DB.duplicates.filter((du) => (du.locations || []).some((location: any) => location.drive === d.id || driveFileIds.has(location.fileId)));
+    const recommendations = DB.cleanup.filter((rec) => rec.driveId === d.id || rec.affectedFileIds.some((id: string) => driveFileIds.has(id)));
+    const scans = DB.scans.filter((scan) => scan.driveId === d.id).sort((a, b) => b.startedAt - a.startedAt).slice(0, 8);
+    const owner = ownerInfo(d.owner);
+    const sampleLabel = catalog === undefined ? "Loading catalog…" : "Catalog sample: " + files.length + " files (up to 200). Full volume usage is shown above.";
+    return <div className="page-inner">
+      <button className="btn ghost sm" style={{ marginBottom: 12 }} onClick={() => go("drives")}><Icon name="chevL" size={15} />All drives</button>
+      <PageHead eyebrow={owner.name + " · " + d.location} title={d.name} desc={d.mountPath || d.model}
+        actions={[
+          <button key="watch" className="btn" onClick={() => go("download")}><Icon name="eye" size={15} />Manage local agent</button>,
+          <button key="scan" className="btn" disabled={actionBusy} onClick={() => void requestScan(d.id)}><Icon name="refresh" size={15} />Start Scan</button>,
+          <button key="analysis" className="btn primary" disabled={actionBusy} onClick={() => void requestAnalysis()}><Icon name="broom" size={15} />Generate Cleanup Plan</button>,
+        ]} />
+      <div className="card card-pad" style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr 1fr", gap: 22, marginBottom: "var(--gap)" }}>
+        <div><div className="row" style={{ gap: 8, marginBottom: 10 }}><StatusBadge status={d.status} /><RiskBadge risk={d.risk} /></div><CapMeter d={d} /></div>
+        {stripCell("Last seen", d.lastSeen, "clock")}
+        {stripCell("Scan sessions", scans.length, "refresh")}
+      </div>
+      <p className="muted" style={{ fontSize: 12 }}>{sampleLabel}</p>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--gap)", marginBottom: "var(--gap)" }}>
+        <div className="card"><div className="card-head"><div className="card-title">Indexed File Types</div><span className="mono">{formatBytes(indexedBytes)}</span></div><div className="card-pad">
+          {types.length ? types.map((type) => <div className="spread" style={{ padding: "8px 0" }} key={type.name}><span>{type.name} · {type.count} files</span><span className="mono">{formatBytes(type.bytes)}</span></div>) : <span className="muted">No indexed files in this sample.</span>}
+        </div></div>
+        <div className="card"><div className="card-head"><div className="card-title">Storage by Project</div></div><div className="card-pad">
+          {projectGroups.length ? projectGroups.map((group) => <button className="btn ghost spread" style={{ width: "100%" }} key={group.name} onClick={() => go("project", { id: group.name })}><span>{DB.projectById[group.name]?.name || "Tracked project"}</span><span className="mono">{formatBytes(group.bytes)}</span></button>) : <span className="muted">No project-linked files in this sample.</span>}
+        </div></div>
+        <div className="card"><div className="card-head"><div className="card-title">Largest Indexed Folders</div></div><div className="card-pad">
+          {folders.length ? folders.map((folder) => <div key={folder.name} className="spread" style={{ gap: 12, padding: "8px 0" }}><span className="mono" style={{ overflowWrap: "anywhere", fontSize: 11 }}>{folder.name}</span><span className="mono" style={{ flexShrink: 0 }}>{formatBytes(folder.bytes)}</span></div>) : <span className="muted">No folder totals available yet.</span>}
+        </div></div>
+        <div className="card"><div className="card-head"><div className="card-title">Duplicate Clusters</div><button className="btn sm ghost" onClick={() => go("duplicates")}>Review all</button></div><div className="card-pad">
+          {dupes.length ? dupes.map((du) => <div key={du.id} className="spread" style={{ padding: "8px 0" }}><span>{du.name}</span><span>{du.copies} copies</span></div>) : <span className="muted">No current duplicate clusters on this drive.</span>}
+        </div></div>
+        <div className="card"><div className="card-head"><div className="card-title">Cleanup Recommendations</div><button className="btn sm ghost" onClick={() => go("cleanup")}>Review</button></div><div className="card-pad">
+          {recommendations.length ? recommendations.map((rec) => <div key={rec.id} style={{ padding: "8px 0" }}><div>{rec.title}</div><div className="muted" style={{ fontSize: 12 }}>{rec.why}</div></div>) : <span className="muted">No recommendations for these indexed files. Generate a cleanup plan after scanning.</span>}
+        </div></div>
+        <div className="card"><div className="card-head"><div className="card-title">Backup Verification</div><Badge kind="warn">Not verified</Badge></div><div className="card-pad muted">The catalog does not establish that every file has a verified archive or cloud copy. No single-copy count or backup assurance is inferred from volume usage.</div></div>
+      </div>
+      <div className="card"><div className="card-head"><div className="card-title">Scan Timeline</div></div><div className="card-pad">
+        {scans.length ? scans.map((scan) => <div key={scan.id} className="spread" style={{ padding: "10px 0", gap: 14 }}><div><div>Scan {scan.status}</div><div className="muted" style={{ fontSize: 12 }}>{scan.files} files · {formatBytes(scan.bytes)} indexed{scan.errors ? " · " + scan.errors + " errors" : ""}</div></div><span className="mono dim" style={{ fontSize: 11 }}>{scan.when}</span></div>) : <span className="muted">No scan history for this drive.</span>}
+      </div></div>
+    </div>;
   }
 
   function stripCell(label: React.ReactNode, value: React.ReactNode, icon: string, color = "") {
@@ -345,27 +283,5 @@ type AnyRecord = Record<string, any>;
         h("span", { className: "eyebrow", style: { fontSize: 9.5 } }, label)),
       h("div", { className: "stat-num", style: { fontSize: 19, color: color || "var(--tx-hi)" } }, value));
   }
-
-  function UninitDrive({ d, go, toast }: ScreenProps) {
-    const [step, setStep] = React.useState(0);
-    const owner = DB.teamById[d.owner] || DB.teamById.founder || { name: "Studio" };
-    return h("div", { className: "page-inner" },
-      h("button", { className: "btn ghost sm", style: { marginBottom: 12 }, onClick: () => go("drives") }, h(Icon, { name: "chevL", size: 15 }), "All drives"),
-      h(PageHead, { eyebrow: owner.name + " · " + d.location, title: d.name, desc: d.model + " · " + d.bus }),
-      h("div", { className: "card", style: { maxWidth: 640, margin: "0 auto" } },
-        h("div", { className: "card-pad", style: { textAlign: "center", padding: 36 } },
-          h("div", { style: { width: 64, height: 64, borderRadius: 16, margin: "0 auto 18px", display: "grid", placeItems: "center", background: "var(--warn-soft)", color: "var(--warn)", border: "1px solid var(--warn-line)" } }, h(Icon, { name: "hdd", size: 28 })),
-          h("h3", { style: { fontSize: 19, marginBottom: 8 } }, "Drive not initialized"),
-          h("div", { className: "muted", style: { fontSize: 13.5, maxWidth: 380, margin: "0 auto 22px" } }, "This new " + fmtTB(d.capTB) + " volume was detected by the Tokyo agent but isn't tracked yet. Initialize it to enable scanning, watching, and cleanup."),
-          h("div", { style: { display: "flex", flexDirection: "column", gap: 10, maxWidth: 360, margin: "0 auto", textAlign: "left" } },
-            ["Index existing files and compute hashes", "Apply studio storage tier and watch rules", "Enable duplicate + single-copy detection"].map((t, i) =>
-              h("div", { key: i, className: "row", style: { gap: 10 } }, h("span", { className: "chk " + (step > i ? "on" : ""), style: { width: 18, height: 18 } }, h(Icon, { name: "check", size: 12, stroke: 3, style: { color: "#fff" } })), h("span", { style: { fontSize: 13 } }, t)))),
-          h("button", { className: "btn primary lg", style: { marginTop: 24 }, onClick: () => { setStep(3); toast("Initializing " + d.name + "…", "zap", "accent"); } },
-            h(Icon, { name: "zap", size: 16 }), step >= 3 ? "Initializing…" : "Initialize Drive"))));
-  }
-
-  
-  
-
 
 export { DrivesScreen, DriveDetail };
