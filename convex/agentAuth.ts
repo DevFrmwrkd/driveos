@@ -1,6 +1,6 @@
 import { v, ConvexError } from "convex/values";
 import { internalQuery, mutation } from "./_generated/server";
-import { requireMember } from "./access";
+import { requireRole } from "./access";
 import { rateLimiter } from "./rateLimits";
 
 // Per-machine agent tokens, scoped to the issuing member's tenant.
@@ -32,14 +32,14 @@ function generateToken(): string {
     .join("");
 }
 
-// Dashboard-only: mint (or rotate) a token for a machine. Requires a team member.
+// Dashboard-only: mint (or rotate) a token for a machine. Viewers cannot grant agent write access.
 export const issueMachineToken = mutation({
   args: {
     machineName: v.string(),
     ownerId: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    const member = await requireMember(ctx);
+    const member = await requireRole(ctx, ["admin", "producer", "editor", "assistant_editor"]);
     await rateLimiter.limit(ctx, "issueToken", { key: member.email, throws: true });
 
     const token = generateToken();
@@ -107,7 +107,7 @@ export const verifyMachineToken = internalQuery({
 export const revokeMachineToken = mutation({
   args: { machineId: v.string() },
   handler: async (ctx, args) => {
-    const member = await requireMember(ctx);
+    const member = await requireRole(ctx, ["admin", "producer", "editor", "assistant_editor"]);
     const id = ctx.db.normalizeId("machines", args.machineId);
     if (!id) throw new ConvexError("Unknown machine.");
     const machine = await ctx.db.get(id);

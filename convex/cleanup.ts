@@ -4,13 +4,15 @@ import { requireMember, requireRole, inTenant } from "./access";
 import { CLEANUP_RECOMMENDATION_TYPES, fileMachine, insertApprovedJob, protectedFile, quarantineMachine } from "./jobUtils";
 import { workspaceSettings } from "./settings";
 import { classifyFile } from "../packages/shared/src/index";
+import { decideJobLease, jobAvailableToAgent, withoutClaimToken } from "./jobLease";
 
 const EDITORS = ["admin", "producer", "editor", "assistant_editor"];
 const ACTIVE_QUARANTINE = new Set(["quarantined", "pending_restore", "pending_purge"]);
 
 export const listJobs = query({ args: {}, handler: async ctx => {
   const { tenantId } = await requireMember(ctx);
-  return ctx.db.query("cleanupJobs").withIndex("by_tenant", q => q.eq("tenantId", tenantId)).order("desc").take(200);
+  const jobs = await ctx.db.query("cleanupJobs").withIndex("by_tenant", q => q.eq("tenantId", tenantId)).order("desc").take(200);
+  return jobs.map(withoutClaimToken);
 }});
 
 export const listQuarantine = query({ args: {}, handler: async ctx => {
@@ -267,7 +269,7 @@ export const approveJob = mutation({ args: { jobId: v.string(), approvedBy: v.st
   if (job.status === "approved" || job.status === "queued") return;
   if (job.status !== "pending_approval" || !job.machineId) throw new ConvexError("This job cannot be approved. Create a new machine-targeted request.");
   if (job.action === "quarantine") await validatedFiles(ctx, member.tenantId, job.affectedFileIds);
-  await ctx.db.patch(job._id, { status: "approved", approvedBy: member.email, updatedAt: Date.now() });
+  await ctx.db.patch(job._id, { status: "approved", approvedBy: member.email, leaseRequired: true, updatedAt: Date.now() });
 }});
 
 async function queuePurge(ctx: any, member: any, items: any[]) {
@@ -300,22 +302,41 @@ export const purgeItem = mutation({ args: { quarantineId: v.string(), requestedB
   return queuePurge(ctx, member, [item]);
 }});
 
-async function requestRestoreJob(ctx: any, quarantineId: string) {
-  const member = await requireRole(ctx, EDITORS);
-  const id = ctx.db.normalizeId("quarantineItems", quarantineId);
-  const item = id ? inTenant(await ctx.db.get(id), member.tenantId) : null;
-  if (!item || item.status !== "quarantined") throw new ConvexError("This item is not available for restoration.");
-  const machineId = await quarantineMachine(ctx, item, member.tenantId);
+async function queueRestoreJob(ctx: any, item: any, tenantId: string, machineId: string, requestedBy: string) {
+  if (item.status === "pending_restore") {
+    for (const status of ["approved", "queued", "running"]) {
+      const existing = await ctx.db.query("cleanupJobs").withIndex("by_tenant_machine_status", (q: any) =>
+        q.eq("tenantId", tenantId).eq("machineId", machineId).eq("status", status))
+        .filter((q: any) => q.and(q.eq(q.field("action"), "restore"), q.eq(q.field("result.quarantineId"), String(item._id)))).first();
+      if (existing) return { jobId: existing._id };
+    }
+    throw new ConvexError("A restoration is pending but its job is unavailable. Contact your workspace administrator.");
+  }
+  if (item.status !== "quarantined") throw new ConvexError("This item is not available for restoration.");
   const jobId = await insertApprovedJob(ctx, {
-    tenantId: member.tenantId, machineId, requestedBy: member.email, action: "restore",
+    tenantId, machineId, requestedBy, action: "restore",
     fileIds: [item.fileId], bytes: item.sizeBytes,
     result: { quarantineId: String(item._id), originalPath: item.originalPath, quarantinePath: item.quarantinePath },
   });
   await ctx.db.patch(item._id, { status: "pending_restore", machineId });
   return { jobId };
 }
+async function requestRestoreJob(ctx: any, quarantineId: string) {
+  const member = await requireRole(ctx, EDITORS);
+  const id = ctx.db.normalizeId("quarantineItems", quarantineId);
+  const item = id ? inTenant(await ctx.db.get(id), member.tenantId) : null;
+  if (!item) throw new ConvexError("This item is not available for restoration.");
+  return queueRestoreJob(ctx, item, member.tenantId, await quarantineMachine(ctx, item, member.tenantId), member.email);
+}
 export const requestRestore = mutation({ args: { quarantineId: v.string() }, handler: (ctx, args) => requestRestoreJob(ctx, args.quarantineId) });
 export const markQuarantineRestored = mutation({ args: { quarantineId: v.string() }, handler: (ctx, args) => requestRestoreJob(ctx, args.quarantineId) });
+
+export const requestRestoreAgent = internalMutation({ args: { quarantineId: v.string(), tenantId: v.string(), machineId: v.string() }, handler: async (ctx, args) => {
+  const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
+  const item = id ? inTenant(await ctx.db.get(id), args.tenantId) : null;
+  if (!item || await quarantineMachine(ctx, item, args.tenantId) !== args.machineId) throw new ConvexError("Unknown machine quarantine item.");
+  return queueRestoreJob(ctx, item, args.tenantId, args.machineId, `machine:${args.machineId}`);
+}});
 
 export const getJob = internalQuery({ args: { jobId: v.string(), tenantId: v.optional(v.string()), machineId: v.optional(v.string()) }, handler: async (ctx, args) => {
   const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
@@ -327,7 +348,7 @@ export const getJob = internalQuery({ args: { jobId: v.string(), tenantId: v.opt
     const file = id ? inTenant(await ctx.db.get(id), args.tenantId || "") : null;
     if (file) files.push(file);
   }
-  return { ...job, files };
+  return { ...withoutClaimToken(job), files };
 }});
 
 export const getQuarantineItem = internalQuery({ args: { quarantineId: v.string(), tenantId: v.optional(v.string()), machineId: v.optional(v.string()) }, handler: async (ctx, args) => {
@@ -337,19 +358,42 @@ export const getQuarantineItem = internalQuery({ args: { quarantineId: v.string(
   return item;
 }});
 
-export const pollPendingJobs = internalQuery({ args: { machineId: v.string(), tenantId: v.optional(v.string()) }, handler: async (ctx, args) => {
+export const pollPendingJobs = internalQuery({ args: { machineId: v.string(), tenantId: v.optional(v.string()), leaseProtocol: v.optional(v.number()) }, handler: async (ctx, args) => {
   const tenantId = args.tenantId || "";
-  const approved = await ctx.db.query("cleanupJobs").withIndex("by_tenant_status", q => q.eq("tenantId", tenantId).eq("status", "approved")).take(200);
-  const queued = await ctx.db.query("cleanupJobs").withIndex("by_tenant_status", q => q.eq("tenantId", tenantId).eq("status", "queued")).take(200);
+  const maximumJobs = 4;
+  const maximumFiles = 4000;
+  const jobs = [];
+  const pendingJobs = [];
+  const now = Date.now();
+  for (const status of ["approved", "queued"]) {
+    let pending = ctx.db.query("cleanupJobs").withIndex("by_tenant_machine_status", q =>
+      q.eq("tenantId", tenantId).eq("machineId", args.machineId).eq("status", status));
+    if (args.leaseProtocol !== 1) pending = pending.filter(q =>
+      q.and(q.neq(q.field("leaseRequired"), true), q.eq(q.field("claimToken"), undefined)));
+    pendingJobs.push(...await pending.take(maximumJobs));
+  }
+  if (args.leaseProtocol === 1) {
+    // Range-scope before the limit: old tokenless jobs and active long jobs
+    // cannot hide an expired lease behind the first 200 running records.
+    jobs.push(...await ctx.db.query("cleanupJobs").withIndex("by_tenant_machine_status_lease", q =>
+      q.eq("tenantId", tenantId).eq("machineId", args.machineId).eq("status", "running")
+        .gt("leaseExpiresAt", 0).lte("leaseExpiresAt", now))
+      .filter(q => q.neq(q.field("claimToken"), undefined)).take(maximumJobs));
+  }
+  jobs.push(...pendingJobs.sort((a, b) => a.createdAt - b.createdAt));
   const result = [];
-  for (const job of [...approved, ...queued].filter(j => j.machineId === args.machineId)) {
+  let hydratedFiles = 0;
+  for (const job of jobs.filter(j => jobAvailableToAgent(j, now, args.leaseProtocol))) {
+    if (result.length >= maximumJobs) break;
+    if (hydratedFiles + job.affectedFileIds.length > maximumFiles) continue;
     const files = [];
     for (const fid of job.affectedFileIds) {
       const id = ctx.db.normalizeId("files", fid);
       const file = id ? inTenant(await ctx.db.get(id), tenantId) : null;
       if (file) files.push(file);
     }
-    result.push({ ...job, files });
+    hydratedFiles += job.affectedFileIds.length;
+    result.push({ ...withoutClaimToken(job), files });
   }
   return result;
 }});
@@ -366,25 +410,29 @@ async function finishRestore(ctx: any, item: any, tenantId: string) {
 }
 
 export const markQuarantineRestoredAgent = internalMutation({ args: { quarantineId: v.string(), tenantId: v.optional(v.string()), machineId: v.optional(v.string()) }, handler: async (ctx, args) => {
-  const tenantId = args.tenantId || "";
-  const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
-  const item = id ? inTenant(await ctx.db.get(id), tenantId) : null;
-  if (!item || (args.machineId && await quarantineMachine(ctx, item, tenantId) !== args.machineId)) throw new ConvexError("Unknown quarantine item.");
-  await finishRestore(ctx, item, tenantId);
+  // Metadata-only confirmations cannot prove which execution attempt moved the
+  // file. Updated agents request a restore and finish its fenced job instead.
+  throw new ConvexError("Upgrade the agent and request a leased restore job before confirming a restoration.");
 }});
 
 export const updateJobStatus = internalMutation({ args: {
   jobId: v.string(), status: v.string(), result: v.optional(v.any()), tenantId: v.optional(v.string()), machineId: v.optional(v.string()),
+  claimToken: v.optional(v.string()),
   quarantineFiles: v.optional(v.array(v.object({ fileId: v.string(), originalPath: v.string(), quarantinePath: v.string(), sizeBytes: v.number() }))),
 }, handler: async (ctx, args) => {
   const tenantId = args.tenantId || "";
   const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
   const job = id ? inTenant(await ctx.db.get(id), tenantId) : null;
   if (!job || !job.machineId || (args.machineId && job.machineId !== args.machineId)) throw new ConvexError("Unknown machine job.");
-  if (job.status === "completed") return { claimed: false };
   if (!["running", "completed", "failed"].includes(args.status)) throw new ConvexError("Invalid job status.");
-  if (args.status === "running" && !["approved", "queued"].includes(job.status)) return { claimed: false };
   const now = Date.now();
+  const lease = decideJobLease(job, args.status, args.claimToken, now);
+  if (!lease.accepted) return { claimed: false, reason: lease.reason, status: job.status };
+  if (lease.renewing) {
+    // A heartbeat never changes the action's original inputs or writes audit spam.
+    await ctx.db.patch(job._id, { ...lease.patch, updatedAt: now });
+    return { claimed: true, claimToken: lease.patch.claimToken, leaseExpiresAt: lease.patch.leaseExpiresAt };
+  }
   const result = { ...(job.result || {}), ...(args.result || {}) };
   const terminal = args.status === "completed" || args.status === "failed";
   if (job.action === "quarantine" && terminal && args.quarantineFiles?.length) {
@@ -459,7 +507,7 @@ export const updateJobStatus = internalMutation({ args: {
         await ctx.db.patch(manifest._id, { status: "failed", verificationResult: { verified: false, error: result.error ?? "Agent checksum verification failed." } });
     }
   }
-  await ctx.db.patch(job._id, { status: args.status, result, updatedAt: now });
+  await ctx.db.patch(job._id, { ...lease.patch, status: args.status, result, updatedAt: now });
   if (terminal) {
     const related = job.result?.recommendationIds ?? (job.recommendationId ? [job.recommendationId] : []);
     const siblings = job.result?.batchJobIds ?? [String(job._id)];
@@ -486,5 +534,5 @@ export const updateJobStatus = internalMutation({ args: {
   }
   await ctx.db.insert("auditLogs", { tenantId, machineId: job.machineId, action: `job_${args.status}`, entityType: "cleanupJob", entityId: job._id,
     message: `Agent ${job.action} job ${args.status}.`, createdAt: now });
-  return { claimed: true };
+  return { claimed: true, claimToken: lease.patch.claimToken ?? job.claimToken, leaseExpiresAt: lease.patch.leaseExpiresAt };
 }});

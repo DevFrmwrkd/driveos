@@ -11,6 +11,7 @@ type Mode = "signIn" | "signUp" | "resetRequest" | "resetVerify";
 export function LoginScreen() {
   const { signIn } = useAuthActions();
   const [mode, setMode] = React.useState<Mode>("signIn");
+  const [invitationToken, setInvitationToken] = React.useState("");
   const [orgName, setOrgName] = React.useState("");
   const [name, setName] = React.useState("");
   const [email, setEmail] = React.useState("");
@@ -19,6 +20,20 @@ export function LoginScreen() {
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [notice, setNotice] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    const readInvitation = () => {
+      const [kind, token, invitedEmail] = window.location.hash.slice(1).split("/");
+      setInvitationToken(kind === "invite" ? token || "" : "");
+      if (kind === "invite" && token) {
+        try { setEmail(decodeURIComponent(invitedEmail || "")); } catch { setEmail(""); }
+        setMode("signUp");
+      }
+    };
+    readInvitation();
+    window.addEventListener("hashchange", readInvitation);
+    return () => window.removeEventListener("hashchange", readInvitation);
+  }, []);
 
   const reset = () => {
     setError(null);
@@ -40,6 +55,7 @@ export function LoginScreen() {
           password,
           name: name.trim(),
           orgName: orgName.trim(),
+          invitationToken,
           flow: "signUp",
         });
       } else if (mode === "resetRequest") {
@@ -78,7 +94,7 @@ export function LoginScreen() {
           <h1 style={{ fontSize: 20, fontWeight: 700, color: "var(--tx-hi)" }}>DriveOS</h1>
           <div className="muted" style={{ fontSize: 13, marginTop: 4 }}>
             {mode === "signUp"
-              ? "Create your studio's storage command center"
+              ? invitationToken ? "Accept your workspace invitation" : "Create your studio's storage command center"
               : isReset
               ? "Reset your password"
               : "Sign in to your Storage Command Center"}
@@ -103,7 +119,8 @@ export function LoginScreen() {
         )}
 
         <form onSubmit={submit} style={{ padding: 24, display: "flex", flexDirection: "column", gap: 14 }}>
-          {mode === "signUp" && (
+          {invitationToken && <p className="muted" style={{ fontSize: 12, margin: 0 }}>Create an account to accept this invitation. If you already have an account, sign in first. Each account belongs to one workspace.</p>}
+          {mode === "signUp" && !invitationToken && (
             <div>
               <label className="field-label">Workspace / studio name</label>
               <input
@@ -178,7 +195,7 @@ export function LoginScreen() {
               : mode === "signIn"
               ? "Sign in"
               : mode === "signUp"
-              ? "Create workspace"
+              ? invitationToken ? "Accept invitation & sign up" : "Create workspace"
               : mode === "resetRequest"
               ? "Send reset code"
               : "Set new password & sign in"}
@@ -234,6 +251,7 @@ function friendlyError(err: any, mode: Mode): string {
   if (/Resend|email/i.test(msg) && mode === "resetRequest") {
     return "Couldn't send the reset email right now. Please try again shortly.";
   }
+  if (/invitation|already belongs|valid email|workspace administrator/i.test(msg)) return msg;
   if (msg.includes("required")) return "Please fill in all fields.";
   return mode === "signUp"
     ? "Could not create your workspace. Please try again."

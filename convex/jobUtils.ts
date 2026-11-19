@@ -41,6 +41,7 @@ export async function insertApprovedJob(ctx: any, input: {
   const jobId = await ctx.db.insert("cleanupJobs", {
     tenantId: input.tenantId, machineId: input.machineId, requestedBy: input.requestedBy,
     approvedBy: input.requestedBy, action: input.action, status: "approved",
+    leaseRequired: true,
     affectedFileIds: input.fileIds ?? [], affectedBytes: input.bytes ?? 0,
     result: input.result, recommendationId: input.recommendationId,
     rollbackUntil: input.rollbackUntil, purgeAfter: input.purgeAfter,

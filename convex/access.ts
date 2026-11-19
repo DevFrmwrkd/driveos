@@ -16,12 +16,12 @@ export interface Member {
 //
 // Convex Auth's Password provider does NOT put `email` in the JWT identity — the
 // identity's `subject` is the auth user's _id. We resolve the user row first
-// (the authoritative link to teamMember + tenant), and fall back to email.
+// (the authoritative link to teamMember + tenant). Email is not authorization.
 export async function requireMember(ctx: QueryCtx | MutationCtx): Promise<Member> {
   const member = await resolveMember(ctx);
   if (!member) {
     throw new ConvexError(
-      "Your account is not linked to a DriveOS workspace. Sign out and sign up again."
+      "Your account is not linked to a DriveOS workspace. Ask an administrator for an invitation link."
     );
   }
   return member;
@@ -42,7 +42,8 @@ export async function resolveMember(
     if (user?.teamMemberId) {
       const memberId = ctx.db.normalizeId("teamMembers", user.teamMemberId);
       const member: any = memberId ? await ctx.db.get(memberId) : null;
-      if (member && member.tenantId) {
+      if (member && member.tenantId && member.tenantId === user.tenantId &&
+          member.email === String(user.email ?? "").trim().toLowerCase()) {
         return {
           _id: member._id,
           name: member.name,
@@ -51,24 +52,6 @@ export async function resolveMember(
           tenantId: member.tenantId,
         };
       }
-    }
-  }
-
-  // 2) Fallback: resolve by email (older accounts not yet linked via users row).
-  const email = await resolveIdentityEmail(ctx);
-  if (email) {
-    const member: any = await ctx.db
-      .query("teamMembers")
-      .withIndex("by_email", (q) => q.eq("email", email))
-      .first();
-    if (member && member.tenantId) {
-      return {
-        _id: member._id,
-        name: member.name,
-        email: member.email,
-        role: member.role,
-        tenantId: member.tenantId,
-      };
     }
   }
 

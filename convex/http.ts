@@ -162,6 +162,11 @@ post("getQuarantineItem", async (ctx, body, machine) => {
   return { success: true, item };
 });
 
+post("requestRestore", async (ctx, body, machine) => {
+  const result = await ctx.runMutation(internal.cleanup.requestRestoreAgent, { ...scoped(body, machine), machineId: machine.machineId });
+  return { success: true, ...result };
+});
+
 post("markQuarantineRestored", async (ctx, body, machine) => {
   await ctx.runMutation(internal.cleanup.markQuarantineRestoredAgent, { ...scoped(body, machine), machineId: machine.machineId });
   return { success: true };

@@ -4,25 +4,21 @@ import { ConvexError } from "convex/values";
 import type { MutationCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { ResendOTPPasswordReset } from "./ResendOTP";
+import { consumeInvitation, invitationMember, normalizedEmail } from "./invitations";
 
-// Email + password auth, multi-tenant and open signup.
-//
-//  - A brand-new email creates its own tenant (organization) plus an admin
-//    teamMember, and links the auth user to both.
-//  - An email that already belongs to a teamMember (e.g. invited into an
-//    existing workspace) signs into THAT workspace instead of creating a new one.
-//  - Password reset codes are delivered via Resend (see ResendOTP.ts). Email
-//    verification is intentionally NOT a hard gate so signup is never blocked by
-//    email deliverability; a best-effort welcome email is sent instead.
+// Open signup creates an isolated workspace. Joining an existing workspace
+// requires an administrator's single-use invitation; email alone never grants
+// membership. Existing linked accounts keep their current workspace.
 export const { auth, signIn, signOut, store, isAuthenticated } = convexAuth({
   providers: [
     Password({
       // Map sign-in/up params -> stored profile. Signup passes name + orgName.
       profile(params) {
         return {
-          email: String((params as any).email ?? "").trim().toLowerCase(),
+          email: normalizedEmail(String(params.email ?? "")),
           name: (params as any).name ? String((params as any).name) : undefined,
-          orgName: (params as any).orgName ? String((params as any).orgName) : undefined,
+          orgName: params.orgName ? String(params.orgName) : undefined,
+          invitationToken: params.flow === "signUp" && params.invitationToken ? String(params.invitationToken) : undefined,
         } as any;
       },
       reset: ResendOTPPasswordReset,
@@ -30,14 +26,14 @@ export const { auth, signIn, signOut, store, isAuthenticated } = convexAuth({
   ],
   callbacks: {
     async createOrUpdateUser(ctx: MutationCtx, args) {
-      const email = (args.profile.email ?? "").toString().trim().toLowerCase();
-      if (!email) {
-        throw new ConvexError("An email is required to sign in.");
-      }
+      const email = normalizedEmail(String(args.profile.email ?? ""));
 
-      // Returning user signing in again — keep their existing user row.
       if (args.existingUserId) {
-        await ensureUserLinked(ctx, args.existingUserId, email, args.profile);
+        // Reset-code verification may update the existing account, but must
+        // never backfill workspace membership from a user-supplied address.
+        if (args.type === "verification" && args.profile.emailVerified === true) {
+          await ctx.db.patch(args.existingUserId, { emailVerificationTime: Date.now() });
+        }
         return args.existingUserId;
       }
 
@@ -45,18 +41,22 @@ export const { auth, signIn, signOut, store, isAuthenticated } = convexAuth({
       const personName =
         (args.profile as any).name?.toString().trim() || email.split("@")[0];
 
-      // Email already known as a team member -> join that existing workspace.
-      const existingMember: any = await ctx.db
-        .query("teamMembers")
-        .withIndex("by_email", (q) => q.eq("email", email))
-        .first();
-      if (existingMember && existingMember.tenantId) {
-        return ctx.db.insert("users", {
+      const invitationToken = String((args.profile as any).invitationToken ?? "");
+      if (invitationToken) {
+        const member = await invitationMember(ctx, invitationToken, email);
+        const userId = await ctx.db.insert("users", {
           email,
-          name: existingMember.name || personName,
-          teamMemberId: existingMember._id,
-          tenantId: existingMember.tenantId,
-        } as any);
+          name: member.name || personName,
+          teamMemberId: member._id,
+          tenantId: member.tenantId,
+        });
+        await consumeInvitation(ctx, member._id);
+        return userId;
+      }
+      const existingMember = await ctx.db.query("teamMembers")
+        .withIndex("by_email", (q) => q.eq("email", email)).first();
+      if (existingMember) {
+        throw new ConvexError("Use the invitation link from your workspace administrator to join this workspace.");
       }
 
       // Brand-new account -> create a fresh tenant + admin member.
@@ -97,31 +97,6 @@ export const { auth, signIn, signOut, store, isAuthenticated } = convexAuth({
     },
   },
 });
-
-// Backfill the user<->member<->tenant link for older accounts created before
-// the multi-tenant migration, so they resolve correctly on next sign-in.
-async function ensureUserLinked(
-  ctx: MutationCtx,
-  userId: any,
-  email: string,
-  profile: any
-) {
-  const user: any = await ctx.db.get(userId);
-  if (!user) return;
-  if (user.tenantId && user.teamMemberId) return;
-
-  const member: any = await ctx.db
-    .query("teamMembers")
-    .withIndex("by_email", (q) => q.eq("email", email))
-    .first();
-  if (member && member.tenantId) {
-    await ctx.db.patch(userId, {
-      teamMemberId: member._id,
-      tenantId: member.tenantId,
-      name: user.name || member.name || profile?.name,
-    });
-  }
-}
 
 function defaultOrgName(email: string): string {
   const domain = email.split("@")[1] || "";

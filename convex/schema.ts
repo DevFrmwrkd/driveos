@@ -51,6 +51,8 @@ export default defineSchema({
     location: v.optional(v.string()),
     usedTB: v.optional(v.number()),
     drives: v.optional(v.number()),
+    invitationTokenHash: v.optional(v.string()),
+    invitationExpiresAt: v.optional(v.number()),
     createdAt: v.number(),
   })
     .index("by_tenant", ["tenantId"])
@@ -269,13 +271,20 @@ export default defineSchema({
     // file still moves to quarantine first (so protected files are blocked by
     // the same guard), then is erased from disk on the agent's next poll.
     purgeAfter: v.optional(v.boolean()),
+    // New jobs require a lease-capable agent. Tokens fence stale attempts.
+    leaseRequired: v.optional(v.boolean()),
+    claimToken: v.optional(v.string()),
+    leaseExpiresAt: v.optional(v.number()),
+    attempts: v.optional(v.number()),
     result: v.optional(v.any()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_status", ["status"])
     .index("by_tenant", ["tenantId"])
-    .index("by_tenant_status", ["tenantId", "status"]),
+    .index("by_tenant_status", ["tenantId", "status"])
+    .index("by_tenant_machine_status", ["tenantId", "machineId", "status"])
+    .index("by_tenant_machine_status_lease", ["tenantId", "machineId", "status", "leaseExpiresAt"]),
 
   quarantineItems: defineTable({
     tenantId: v.optional(v.string()),
