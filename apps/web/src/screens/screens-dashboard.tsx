@@ -74,9 +74,10 @@ function liveStats() {
   const cleanup = (DB.cleanup || []) as any[];
 
   const totalTrackedTB = drives.reduce((s: number, d: any) => s + (d.usedTB || 0), 0);
-  const safeCleanupTB = cleanup.reduce((s: number, c: any) => s + (c.recoverTB || 0), 0);
+  const safeIds = new Set(cleanup.filter((c: any) => c.status === "open" && c.risk === "safe" && ["delete_cache", "delete_proxies", "remove_duplicate"].includes(c.type)).flatMap((c: any) => c.affectedFileIds || []));
+  const safeCleanupTB = DB.files.filter((file) => safeIds.has(file.id)).reduce((sum, file) => sum + (file.sizeBytes || 0), 0) / 1024 ** 4;
   const dupTB = duplicates.reduce((s: number, c: any) => s + ((c.sizeGB || 0) * (c.copies || 1)) / 1024, 0);
-  const dupRecoverTB = duplicates.reduce((s: number, c: any) => s + (c.recoverGB || 0) / 1024, 0);
+  const dupRecoverTB = duplicates.filter((c: any) => c.kind === "exact").reduce((s: number, c: any) => s + (c.recoverGB || 0) / 1024, 0);
 
   const online = drives.filter((d: any) => d.status === "online");
   const offline = drives.filter((d: any) => d.status === "offline");
@@ -84,7 +85,7 @@ function liveStats() {
 
   return {
     drives, projects, duplicates, cleanup,
-    totalTrackedTB, safeCleanupTB, dupTB, dupRecoverTB,
+    totalTrackedTB, safeCleanupTB, safeFileCount: safeIds.size, dupTB, dupRecoverTB,
     onlineCount: online.length, offlineCount: offline.length, uninitCount: uninit.length,
     clusterCount: duplicates.length,
   };
@@ -97,8 +98,8 @@ function KpiStrip() {
   return h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "var(--gap)" } },
     h(StatCard, { label: "Total Tracked", value: s.totalTrackedTB.toFixed(1), unit: "TB", icon: "database", accent: "var(--accent-hi)",
       spark: h(Bar, { value: s.totalTrackedTB, max: maxTB, kind: "", height: 7 }), sub: "Across all tracked drives" }),
-    h(StatCard, { label: "Safe Cleanup", value: s.safeCleanupTB.toFixed(1), unit: "TB", icon: "broom", accent: "var(--ok)",
-      spark: h(Bar, { value: s.safeCleanupTB, max: maxTB, kind: "ok", height: 7 }), sub: "Recoverable from cleanup" }),
+    h(StatCard, { label: "Cleanup Candidates", value: String(s.safeFileCount), unit: "files", icon: "broom", accent: "var(--ok)",
+      spark: h(Bar, { value: s.safeCleanupTB, max: maxTB, kind: "ok", height: 7 }), sub: "Unique safe-recommendation file IDs" }),
     h(StatCard, { label: "Duplicates", value: s.dupTB.toFixed(1), unit: "TB", icon: "copy", accent: "var(--warn)",
       spark: h(Bar, { value: s.dupTB, max: maxTB, kind: "warn", height: 7 }), sub: s.clusterCount + " cluster" + (s.clusterCount === 1 ? "" : "s") }),
     h(StatCard, { label: "Drives", value: String(s.onlineCount), unit: "online", icon: "hdd", accent: "var(--cloud)",
@@ -120,14 +121,14 @@ function HealthCard() {
   return h("div", { className: "card card-pad fade-up", style: { display: "flex", flexDirection: "column", alignItems: "center", gap: 14 } },
     h("div", { className: "spread", style: { width: "100%" } },
       h("div", { className: "eyebrow" }, "Storage Health")),
-    h(HealthRing, { score: health, size: 156 }),
+    s.drives.length ? h(HealthRing, { score: health, size: 156 }) : h("div", { className: "stat-num dim", style: { fontSize: 64, padding: 30 } }, "—"),
     h("div", { style: { fontSize: 12.5, color: "var(--tx-mut)", textAlign: "center", maxWidth: 220 } },
       fullDrives > 0
         ? ["Pulled down by ", h("b", { key: 1, style: { color: "var(--risk)" } }, fullDrives + (fullDrives === 1 ? " full drive" : " full drives")), s.dupTB > 0 ? [" and ", h("b", { key: 2, style: { color: "var(--warn)" } }, s.dupTB.toFixed(1) + " TB duplicates")] : "", "."]
         : s.drives.length === 0 ? "No drives tracked yet." : "Storage looks healthy."),
     h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, width: "100%" } },
       miniStat("Duplicates", s.dupTB.toFixed(1) + " TB", "var(--ft-proxy)"),
-      miniStat("Safe cleanup", s.safeCleanupTB.toFixed(1) + " TB", "var(--ft-export)")));
+      miniStat("Cleanup candidates", s.safeFileCount + " files", "var(--ft-export)")));
 }
 
 // ---- Storage map (by drive, from live data) ----
@@ -170,7 +171,7 @@ function TiersCard() {
   const rows = grouped.map((t) => h("div", { key: t.key },
     h("div", { className: "spread", style: { fontSize: 12, marginBottom: 4 } },
       h("span", { className: "row", style: { gap: 7 } }, h("span", { style: { width: 8, height: 8, borderRadius: 2, background: getVar(t.color) } }), h("span", { className: "hi", style: { fontWeight: 600 } }, (TIER_META[t.key] && TIER_META[t.key].label) || t.key)),
-      h("span", { className: "mono dim", style: { fontSize: 11 } }, fmtTB(t.used) + (t.cap > 0 ? " / " + t.cap.toFixed(0) + " TB" : ""))),
+      h("span", { className: "mono dim", style: { fontSize: 11 } }, fmtTB(t.used) + (t.cap > 0 ? " / " + fmtTB(t.cap) : ""))),
     h(Bar, { value: t.used, max: t.cap > 0 ? t.cap : Math.max(t.used, 1), kind: tierKind(pct(t.used, t.cap > 0 ? t.cap : t.used)), height: 5 })));
   const body = grouped.length === 0
     ? h("div", { className: "card-pad empty", style: { padding: "30px 0" } }, h("div", { className: "muted" }, "No tiered drives yet."))
@@ -191,7 +192,7 @@ function CloudMiniCard({ go }: ScreenProps) {
     const body = h("div", { className: "card-pad empty", style: { padding: "30px 16px", textAlign: "center" } },
       h(Icon, { name: "cloud", size: 22, style: { color: "var(--tx-dim)" } }),
       h("div", { className: "muted", style: { fontSize: 12.5, marginTop: 8 } }, "No cloud provider connected yet."),
-      h("button", { className: "btn sm", style: { marginTop: 10 }, onClick: () => go("cloud") }, "Connect a provider"));
+      h("button", { className: "btn sm", style: { marginTop: 10 }, onClick: () => go("cloud") }, "Cloud availability"));
     return cardShell("Cloud Storage", "cloud", "var(--cloud)", right, body);
   }
 
@@ -228,11 +229,10 @@ function DupCleanupCard({ go }: ScreenProps) {
   const cacheTB = byCat("Cache");
   const proxyTB = byCat("Proxies");
   const reviewTB = byCat("Review exports");
-  const totalSafe = s.safeCleanupTB;
 
   return h("div", { className: "card card-pad fade-up", style: { display: "flex", flexDirection: "column", gap: 14 } },
     h("div", { className: "spread" }, h("div", { className: "card-title" }, "Duplicate & Cleanup"),
-      h(Badge, { kind: "ok", icon: "shieldCheck" }, "Safe to recover")),
+      h(Badge, { kind: "ok", icon: "shieldCheck" }, "Cleanup candidates")),
     h("div", { className: "spread", style: { gap: 10 } },
       recoverTile("Exact duplicates", s.dupRecoverTB.toFixed(1) + " TB", "copy", "var(--warn)", () => go("duplicates")),
       recoverTile("Proxies / cache", (proxyTB + cacheTB).toFixed(1) + " TB", "cpu", "var(--ft-proxy)", () => go("cleanup"))),
@@ -240,7 +240,7 @@ function DupCleanupCard({ go }: ScreenProps) {
       recoverTile("Review exports", reviewTB.toFixed(1) + " TB", "download", "var(--ft-export)", () => go("cleanup")),
       recoverTile("Clusters", String(s.clusterCount), "globe", "var(--ft-stock)", () => go("duplicates"))),
     h("button", { className: "btn primary", style: { width: "100%" }, onClick: () => go("cleanup") },
-      h(Icon, { name: "broom", size: 15 }), "Recover " + totalSafe.toFixed(1) + " TB safely"));
+      h(Icon, { name: "broom", size: 15 }), "Review " + s.safeFileCount + " cleanup candidates"));
 }
 
 // ---- Ready to archive ----
@@ -251,8 +251,8 @@ function ReadyArchiveCard({ go }: ScreenProps) {
       h("div", { className: "hi", style: { fontWeight: 600, fontSize: 13 } }, p.name),
       h("div", { className: "muted", style: { fontSize: 11.5, marginTop: 1 } }, p.client + " · " + fmtTB(p.sizeTB))),
     h("div", { className: "row", style: { gap: 10, flexShrink: 0 } },
-      h("div", { style: { width: 54 } }, h(Bar, { value: p.archiveReady, max: 100, kind: p.archiveReady >= 90 ? "ok" : "warn", height: 5 })),
-      h("span", { className: "mono", style: { fontSize: 11, color: "var(--tx-mut)", width: 32, textAlign: "right" } }, p.archiveReady + "%"))));
+      p.archiveReady != null && h("div", { style: { width: 54 } }, h(Bar, { value: p.archiveReady, max: 100, kind: p.archiveReady >= 90 ? "ok" : "warn", height: 5 })),
+      h("span", { className: "mono", style: { fontSize: 11, color: "var(--tx-mut)", width: p.archiveReady == null ? undefined : 32, textAlign: "right" } }, p.archiveReady == null ? "Not assessed" : p.archiveReady + "%"))));
   return cardShell("Ready to Archive", "archive", "var(--auto)", h(Badge, { kind: "auto" }, list.length + " projects"), h("div", { style: { padding: "6px 0" } }, rows));
 }
 
@@ -358,9 +358,9 @@ function ActivityRail({ go }: ScreenProps) {
 }
 
 // ============================================================
-function Dashboard({ go, toast }: ScreenProps) {
+function Dashboard({ go, toast, requestScan, actionBusy }: ScreenProps) {
   const actions = [
-    { label: "Scan Drive", icon: "refresh", onClick: () => toast("Scans run from the desktop agent — use Scan Now there.", "refresh", "accent") },
+    { label: "Scan Drive", icon: "refresh", onClick: () => void requestScan(), disabled: actionBusy || DB.drives.length === 0 },
     { label: "Create Project", icon: "plus", primary: true, onClick: () => go("wizard") },
     { label: "Review Duplicates", icon: "copy", onClick: () => go("duplicates") },
     { label: "Clean Up Safely", icon: "broom", onClick: () => go("cleanup") },
@@ -376,12 +376,12 @@ function Dashboard({ go, toast }: ScreenProps) {
           h("b", { className: "hi" }, (DB.drives || []).length + (DB.drives && DB.drives.length === 1 ? " drive" : " drives")), " and ",
           h("b", { className: "hi" }, (DB.projects || []).length + (DB.projects && DB.projects.length === 1 ? " project" : " projects")), ".")),
       h("div", { className: "page-head-actions" },
-        h("button", { className: "btn", onClick: actions[0].onClick }, h(Icon, { name: "refresh", size: 15 }), "Scan Drive"),
+        h("button", { className: "btn", disabled: actions[0].disabled, onClick: actions[0].onClick }, h(Icon, { name: "refresh", size: 15 }), "Scan Drive"),
         h("button", { className: "btn primary", onClick: () => go("wizard") }, h(Icon, { name: "plus", size: 16 }), "Create Project"))),
 
     h("div", { className: "card card-pad", style: { display: "flex", gap: 10, marginBottom: 18, flexWrap: "wrap", alignItems: "center" } },
       h("div", { className: "eyebrow", style: { marginRight: 4 } }, "Quick Actions"),
-      actions.map((a) => h("button", { key: a.label, className: "btn " + (a.primary ? "primary" : ""), onClick: a.onClick },
+      actions.map((a) => h("button", { key: a.label, className: "btn " + (a.primary ? "primary" : ""), disabled: a.disabled, onClick: a.onClick },
         h(Icon, { name: a.icon, size: 15 }), a.label))),
 
     h("div", { style: { display: "grid", gridTemplateColumns: "1fr 332px", gap: "var(--gap)", alignItems: "start" } },

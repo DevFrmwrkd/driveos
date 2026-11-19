@@ -2,44 +2,11 @@ import React from "react";
 import { useQuery, useMutation } from "convex/react";
 import { api } from "@/convexApi";
 import { DB } from "@/data";
-import {
-  Icon,
-  fmtTB,
-  fmtGB,
-  pct,
-  fmtNum,
-  STATUS_META,
-  RISK_META,
-  PROJ_STATUS,
-  TIER_META,
-  tierKind,
-  Avatar,
-  Badge,
-  StatusBadge,
-  RiskBadge,
-  Bar,
-  MultiBar,
-  Donut,
-  HealthRing,
-  Sparkline,
-  MiniBars,
-  Treemap,
-  StatCard,
-  Check,
-  Seg,
-  FileTypePill,
-  FT_ICON,
-  Modal,
-  SectionTitle,
-  Legend,
-  PageHead,
-  cardShell,
-  getVar
-} from "@/components";
+import { csvCell, downloadText, formatBytes } from "@/lib/download";
+import { Icon } from "@/components/icons";
+import { fmtTB, pct, TIER_META, tierKind, Badge, StatusBadge, Bar, Modal, PageHead, getVar } from "@/components/components";
 const h: any = React.createElement;
 type ScreenProps = Record<string, any>;
-type ToggleMap = Record<string, boolean>;
-
 
 
 /* ============================================================
@@ -63,8 +30,8 @@ type ToggleMap = Record<string, boolean>;
     { id: "audit", label: "Audit Log", icon: "list" },
   ];
 
-  function Toggle({ on, onChange }: { on: boolean; onChange: (next: boolean) => void }) {
-    return h("div", { onClick: () => onChange(!on), style: { width: 42, height: 24, borderRadius: 99, flexShrink: 0, cursor: "pointer", background: on ? "var(--accent)" : "var(--bg-elevated)", border: "1px solid " + (on ? "var(--accent-lo)" : "var(--line-strong)"), position: "relative", transition: "background .15s" } },
+  function Toggle({ on, onChange, label, disabled }: { on: boolean; onChange: (next: boolean) => void; label?: string; disabled?: boolean }) {
+    return h("button", { type: "button", role: "switch", "aria-label": label || "Toggle setting", "aria-checked": on, disabled, onClick: () => onChange(!on), style: { width: 42, height: 24, borderRadius: 99, flexShrink: 0, cursor: disabled ? "default" : "pointer", opacity: disabled ? .55 : 1, background: on ? "var(--accent)" : "var(--bg-elevated)", border: "1px solid " + (on ? "var(--accent-lo)" : "var(--line-strong)"), position: "relative", transition: "background .15s" } },
       h("span", { style: { position: "absolute", top: 2, left: on ? 20 : 2, width: 18, height: 18, borderRadius: 99, background: "#fff", transition: "left .15s", boxShadow: "0 1px 3px rgba(0,0,0,.4)" } }));
   }
   function Row({ title, desc, control }: ScreenProps) {
@@ -88,11 +55,11 @@ type ToggleMap = Record<string, boolean>;
           sec === "drives" && h(DriveSettings, { toast }),
           sec === "agents" && h(AgentSettings, { toast }),
           sec === "templates" && h(TemplateSettings, { toast }),
-          sec === "rules" && h(RuleSettings, null),
+          sec === "rules" && h(RuleSettings, { toast }),
           sec === "classify" && h(ClassifySettings, null),
           sec === "cloud" && h(CloudSettings, { toast }),
           sec === "tiers" && h(TierSettings, null),
-          sec === "safedelete" && h(SafeDeleteSettings, null),
+          sec === "safedelete" && h(SafeDeleteSettings, { toast }),
           sec === "notif" && h(NotifSettings, null),
           sec === "audit" && h(AuditSettings, null))));
   }
@@ -252,8 +219,8 @@ type ToggleMap = Record<string, boolean>;
   }
 
   function TokenModal({ issued, convexUrl, toast, onClose }: ScreenProps) {
-    const copy = (text: string, label: string) => {
-      try { navigator.clipboard.writeText(text); toast(label + " copied", "copy", "ok"); } catch { toast("Copy failed", "alert", "risk"); }
+    const copy = async (text: string, label: string) => {
+      try { await navigator.clipboard.writeText(text); toast(label + " copied", "copy", "ok"); } catch { toast("Copy failed", "alert", "risk"); }
     };
     const cmd = `driveos-agent connect --machine "${issued.machineName}" --token ${issued.token}` + (convexUrl ? ` --convex ${convexUrl}` : "");
     return h(Modal, { title: "Connect token for " + issued.machineName, subtitle: "Shown once — copy it now", icon: "shield", iconKind: "accent", onClose, width: 620, footer: [
@@ -275,25 +242,32 @@ type ToggleMap = Record<string, boolean>;
   }
 
   function TemplateSettings({ toast }: ScreenProps) {
-    return h(Panel, { title: "Folder Templates", desc: "Structures used by the Create Project wizard.", action: h("button", { className: "btn sm primary", onClick: () => toast("New template", "plus", "accent") }, h(Icon, { name: "plus", size: 14 }), "New Template") },
+    return h(Panel, { title: "Folder Templates", desc: "The built-in folder structure supported by the agent. Custom template editing is not available.", action: h("button", { className: "btn sm", disabled: true, title: "Custom templates are not supported yet" }, h(Icon, { name: "plus", size: 14 }), "New Template") },
       h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 } }, DB.templates.filter((t) => t.id !== "custom").map((t) =>
         h("div", { key: t.id, className: "spread", style: { padding: "14px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
           h("div", null, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 13.5 } }, t.name), h("div", { className: "muted", style: { fontSize: 11.5, marginTop: 2 } }, t.desc), h("div", { className: "mono dim", style: { fontSize: 10.5, marginTop: 4 } }, t.folders + " folders")),
-          h("button", { className: "btn sm ghost icon" }, h(Icon, { name: "settings", size: 15 }))))));
+          h(Badge, { kind: "accent" }, "Built-in")))));
   }
 
-  function RuleSettings() {
-    const [rules, setRules] = React.useState<ToggleMap>({ raw: true, proxy: true, cache: true, finals: true, license: true, abandoned: false });
-    const items = [
-      ["raw", "Protect RAW footage", "Never auto-delete original camera files", "shield"],
-      ["proxy", "Auto-quarantine proxies after delivery", "Once a project is Delivered", "layers"],
-      ["cache", "Auto-quarantine cache after confirmation", "Premiere / DaVinci regenerable cache", "cpu"],
-      ["finals", "Protect final exports", "Delivery masters never auto-cleaned", "download"],
-      ["license", "Protect license & admin docs", "Music, SFX, paperwork stay with archive", "lock"],
-      ["abandoned", "Flag abandoned project copies", "No edits in 60+ days with archive copy present", "box"],
-    ];
-    return h(Panel, { title: "Cleanup Rules", desc: "Global defaults applied across all projects. Per-project overrides are set in the wizard." },
-      items.map(([k, t, d]) => h(Row, { key: k, title: t, desc: d, control: h(Toggle, { on: rules[k], onChange: (v: boolean) => setRules((r: ToggleMap) => ({ ...r, [k]: v })) }) })));
+  function RuleSettings({ toast }: ScreenProps) {
+    const settings = useQuery(api.settings.get);
+    const context = useQuery(api.tenants.currentContext);
+    const saveSettings = useMutation(api.settings.update);
+    const [rules, setRules] = React.useState({ rawKeep: true, proxyDelete: true, cacheDelete: true, finalKeep: true, licenseKeep: true });
+    const [busy, setBusy] = React.useState(false);
+    React.useEffect(() => { if (settings) setRules(settings.cleanupRules); }, [settings]);
+    const canEdit = context?.member.role === "admin";
+    const save = async () => {
+      setBusy(true);
+      try { await saveSettings({ cleanupRules: rules }); toast("Cleanup rules saved", "check", "ok"); }
+      catch (error) { toast(error instanceof Error ? error.message : "Could not save rules", "alert", "risk"); }
+      finally { setBusy(false); }
+    };
+    return h(Panel, { title: "Cleanup Rules", desc: "Saved workspace defaults control eligibility. Cleanup still requires an explicit approval." },
+      ["RAW footage", "Final exports", "License and admin documents"].map(title => h(Row, { key: title, title: "Protect " + title, desc: "This protection cannot be disabled.", control: h(Badge, { kind: "ok", icon: "lock" }, "Always protected") })),
+      h(Row, { title: "Allow proxy cleanup", desc: "Proxies may be offered for cleanup after delivery.", control: h(Toggle, { label: "Allow proxy cleanup", on: rules.proxyDelete, disabled: !settings || !canEdit || busy, onChange: (value: boolean) => setRules(r => ({ ...r, proxyDelete: value })) }) }),
+      h(Row, { title: "Allow cache cleanup", desc: "Regenerable cache may be offered for approved cleanup.", control: h(Toggle, { label: "Allow cache cleanup", on: rules.cacheDelete, disabled: !settings || !canEdit || busy, onChange: (value: boolean) => setRules(r => ({ ...r, cacheDelete: value })) }) }),
+      h("button", { className: "btn primary", style: { marginTop: 16 }, disabled: !settings || !canEdit || busy, onClick: save }, busy ? "Saving…" : "Save cleanup rules"));
   }
 
   function ClassifySettings() {
@@ -306,20 +280,18 @@ type ToggleMap = Record<string, boolean>;
       [".wav, .aif, .mp3", "audio", "Audio"],
       [".aep, .psd, .ai, .prproj", "gfx", "Graphics / AE"],
     ];
-    return h(Panel, { title: "File-Type Classification", desc: "How DriveOS classifies files by extension and path pattern.", action: h("button", { className: "btn sm" }, h(Icon, { name: "plus", size: 14 }), "Add Rule") },
+    return h(Panel, { title: "File-Type Classification", desc: "Built-in extension and path rules. Custom rule editing is not available.", action: h("button", { className: "btn sm", disabled: true, title: "Custom classification rules are not supported yet" }, h(Icon, { name: "plus", size: 14 }), "Add Rule") },
       h("div", { style: { display: "flex", flexDirection: "column", gap: 9 } }, rules.map(([pat, key, label], i) =>
         h("div", { key: i, className: "spread", style: { padding: "12px 14px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
           h("div", { className: "row", style: { gap: 11 } }, h("span", { style: { width: 9, height: 9, borderRadius: 2, background: getVar("var(--ft-" + key + ")"), flexShrink: 0 } }), h("span", { className: "hi", style: { fontWeight: 600, fontSize: 13, width: 130 } }, label), h("span", { className: "mono dim", style: { fontSize: 11.5 } }, pat)),
-          h("button", { className: "btn sm ghost icon" }, h(Icon, { name: "settings", size: 14 }))))));
+          h(Badge, null, "Built-in")))));
   }
 
   function CloudSettings({ toast }: ScreenProps) {
-    return h(Panel, { title: "Cloud Integrations", desc: "Connected cloud storage providers." },
-      h("div", { className: "spread", style: { padding: "15px 16px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--cloud-line)" } },
-        h("div", { className: "row", style: { gap: 13 } }, h("div", { style: { width: 42, height: 42, borderRadius: 11, display: "grid", placeItems: "center", background: "var(--cloud-soft)", color: "var(--cloud)", border: "1px solid var(--cloud-line)" } }, h(Icon, { name: "cloud", size: 20 })),
-          h("div", null, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 14 } }, "Google Workspace"), h("div", { className: "mono dim", style: { fontSize: 11.5 } }, DB.cloud.account + " · 13.4 / 20 TB"))),
-        h("div", { className: "row", style: { gap: 9 } }, h(Badge, { kind: "ok", icon: "checkCircle" }, "Connected"), h("button", { className: "btn sm" }, "Manage"))),
-      h("div", { style: { marginTop: 12 } }, h("button", { className: "btn", onClick: () => toast("Connecting…", "link", "accent") }, h(Icon, { name: "plus", size: 15 }), "Connect another provider")));
+    const connections = useQuery(api.cloud.listConnections);
+    return h(Panel, { title: "Cloud Integrations", desc: "Cloud account linking and sync are not available in this version." },
+      connections === undefined ? h("p", { className: "muted" }, "Loading saved connections…") : connections.length === 0 ? h("p", { className: "muted" }, "No cloud provider connected.") : connections.map((connection: any) => h("div", { key: connection._id, className: "card card-pad", style: { marginBottom: 10 } }, h("b", null, connection.provider), h("div", { className: "muted" }, connection.accountEmail || connection.accountName || "Saved connection"), h(Badge, null, "Saved metadata; sync unavailable"))),
+      h("button", { className: "btn", disabled: true, title: "Cloud linking is not available yet" }, h(Icon, { name: "plus", size: 15 }), "Connect another provider"));
   }
 
   function TierSettings() {
@@ -331,33 +303,43 @@ type ToggleMap = Record<string, boolean>;
           h("div", { className: "row", style: { gap: 14 } }, h("span", { className: "mono dim", style: { fontSize: 11.5 } }, fmtTB(t.usedTB) + " / " + t.capTB + " TB"), h("div", { style: { width: 90 } }, h(Bar, { value: t.usedTB, max: t.capTB, kind: tierKind(pct(t.usedTB, t.capTB)), height: 6 })))))));
   }
 
-  function SafeDeleteSettings() {
-    const [days, setDays] = React.useState(30);
-    const [confirm, setConfirm] = React.useState(true);
-    const [autoSafe, setAutoSafe] = React.useState(true);
-    return h(Panel, { title: "Quarantine & Safe Delete", desc: "The safety net. Quarantine is always the primary action — permanent deletion is protected." },
+  function SafeDeleteSettings({ toast }: ScreenProps) {
+    const settings = useQuery(api.settings.get);
+    const context = useQuery(api.tenants.currentContext);
+    const saveSettings = useMutation(api.settings.update);
+    const [days, setDays] = React.useState(14);
+    const [busy, setBusy] = React.useState(false);
+    React.useEffect(() => { if (settings) setDays(settings.retentionDays); }, [settings]);
+    const canEdit = context?.member.role === "admin";
+    const save = async () => {
+      setBusy(true);
+      try { await saveSettings({ retentionDays: days }); toast("Retention policy saved", "check", "ok"); }
+      catch (error) { toast(error instanceof Error ? error.message : "Could not save retention", "alert", "risk"); }
+      finally { setBusy(false); }
+    };
+    return h(Panel, { title: "Quarantine & Safe Delete", desc: "Retention is saved for new cleanup jobs. Existing quarantine items retain the deadline set when they were approved." },
       h(Row, { title: "Quarantine retention period", desc: "How long files stay restorable before they can be purged.", control: h("div", { className: "row", style: { gap: 12 } },
-        h("input", { type: "range", min: 7, max: 90, step: 1, value: days, onChange: (e: React.ChangeEvent<HTMLInputElement>) => setDays(+e.target.value), style: { width: 160, accentColor: getVar("var(--accent)") } }),
+        h("input", { type: "range", "aria-label": "Quarantine retention period", min: 7, max: 90, step: 1, value: days, disabled: !settings || !canEdit || busy, onChange: (e: React.ChangeEvent<HTMLInputElement>) => setDays(+e.target.value), style: { width: 160, accentColor: getVar("var(--accent)") } }),
         h("span", { className: "mono hi", style: { fontWeight: 600, width: 60 } }, days + " days")) }),
-      h(Row, { title: "Auto-quarantine safe categories", desc: "Let the agent quarantine regenerable cache without approval.", control: h(Toggle, { on: autoSafe, onChange: setAutoSafe }) }),
-      h(Row, { title: "Require confirmation for permanent delete", desc: "Force a typed confirmation before any purge.", control: h(Toggle, { on: confirm, onChange: setConfirm }) }),
+      h(Row, { title: "Auto-quarantine safe categories", desc: "Automatic unapproved cleanup is not enabled. Approve individual or bulk recommendations explicitly.", control: h(Badge, null, "Off") }),
+      h(Row, { title: "Require confirmation for permanent delete", desc: "The dashboard always requires typed confirmation before permanent deletion.", control: h(Badge, { kind: "ok", icon: "lock" }, "Always required") }),
+      h("button", { className: "btn primary", style: { marginTop: 16 }, disabled: !settings || !canEdit || busy, onClick: save }, busy ? "Saving…" : "Save retention policy"),
       h("div", { style: { marginTop: 16, padding: "13px 15px", borderRadius: "var(--r)", background: "var(--risk-soft)", border: "1px solid var(--risk-line)", display: "flex", gap: 11 } },
         h(Icon, { name: "lock", size: 16, style: { color: "var(--risk)", flexShrink: 0, marginTop: 1 } }),
-        h("div", { style: { fontSize: 12.5, color: "var(--tx)", lineHeight: 1.5 } }, h("b", { className: "hi" }, "Permanent deletion is disabled by default. "), "Only Admins can purge, and only after the retention window — with a typed confirmation.")));
+        h("div", { style: { fontSize: 12.5, color: "var(--tx)", lineHeight: 1.5 } }, h("b", { className: "hi" }, "Permanent deletion is irreversible. "), "Only admins can queue a purge. Empty expired targets past-deadline items; a per-file delete is an explicit early purge.")));
   }
 
   function NotifSettings() {
-    const [n, setN] = React.useState<ToggleMap>({ full: true, single: true, archive: true, weekly: true, agent: false });
-    const items = [["full", "Drive over 90% full", "Alert when any working drive is nearly full"], ["single", "Single-copy file detected", "Files with no archive or cloud backup"], ["archive", "Project ready to archive", "When a delivered project passes readiness checks"], ["weekly", "Weekly storage digest", "Health summary every Monday"], ["agent", "Agent went offline", "When a machine stops reporting"]];
-    const rows = items.map(([k, t, d]) => {
-      const control = h(Toggle, { on: n[k], onChange: (v: boolean) => setN((x: ToggleMap) => ({ ...x, [k]: v })) });
-      return h(Row, { key: k, title: t, desc: d, control });
-    });
-    return h(Panel, { title: "Notifications", desc: "What DriveOS alerts you about." }, rows);
+    return h(Panel, { title: "Notifications", desc: "Notification delivery and scheduled digests are not connected in this version." },
+      h("p", { className: "muted", style: { fontSize: 13, lineHeight: 1.6 } }, "Storage warnings remain available in the dashboard. No email, push, or weekly digest subscriptions are active."));
   }
 
   function AuditSettings() {
-    return h(Panel, { title: "Audit Log", desc: "Every quarantine, restore, scan, and config change — retained for compliance.", action: h("button", { className: "btn sm" }, h(Icon, { name: "download", size: 14 }), "Export CSV") },
+    const exportCsv = () => {
+      const rows = [["Date", "Time", "Actor", "Action", "Kind"], ...DB.audit.map(a => [a.date, a.time, a.who, a.action, a.kind])];
+      downloadText("driveos-audit.csv", rows.map(row => row.map(csvCell).join(",")).join("\r\n"), "text/csv;charset=utf-8");
+    };
+    return h(Panel, { title: "Audit Log", desc: "Recorded quarantine, restore, scan, and configuration changes.", action: h("button", { className: "btn sm", disabled: DB.audit.length === 0, onClick: exportCsv }, h(Icon, { name: "download", size: 14 }), "Export CSV") },
       h("div", { style: { display: "flex", flexDirection: "column", gap: 0 } }, DB.audit.map((a, i) =>
         h("div", { key: i, className: "row", style: { gap: 13, padding: "12px 4px", borderBottom: i < DB.audit.length - 1 ? "1px solid var(--line-faint)" : "none" } },
           h("span", { className: "mono dim", style: { fontSize: 11, width: 70, flexShrink: 0 } }, a.date),

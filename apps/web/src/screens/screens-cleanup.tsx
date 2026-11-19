@@ -2,455 +2,147 @@ import React from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convexApi";
-import { DB } from "@/data";
-import {
-  Icon,
-  fmtTB,
-  fmtGB,
-  pct,
-  fmtNum,
-  STATUS_META,
-  RISK_META,
-  PROJ_STATUS,
-  TIER_META,
-  tierKind,
-  Avatar,
-  Badge,
-  StatusBadge,
-  RiskBadge,
-  Bar,
-  MultiBar,
-  Donut,
-  HealthRing,
-  Sparkline,
-  MiniBars,
-  Treemap,
-  StatCard,
-  Check,
-  Seg,
-  FileTypePill,
-  FT_ICON,
-  Modal,
-  SectionTitle,
-  Legend,
-  PageHead,
-  cardShell,
-  getVar
-} from "@/components";
-const h: any = React.createElement;
+import { Icon } from "@/components/icons";
+import { Badge, Modal, PageHead } from "@/components/components";
+import { downloadText, formatBytes } from "@/lib/download";
 
-type ScreenProps = Record<string, any>;
-type CleanupPreviewState = any | null;
-type RecState = "quarantined" | "ignored" | "deleted" | null;
-type QuarantineItem = any;
+type ScreenProps = { go: (screen: string, params?: Record<string, string>) => void; toast: (message: string, icon?: string, kind?: string) => void };
+type Recommendation = { _id: string; type: string; title: string; explanation: string; riskLevel: string; status: string; affectedFileIds: string[]; affectedBytes: number };
+type Preview = { title: string; recommendations: Recommendation[] };
+const CLEANUP_TYPES = new Set(["delete_cache", "delete_proxies", "remove_duplicate"]);
+const category = (type: string) => ({ delete_cache: "Cache", delete_proxies: "Proxies", remove_duplicate: "Duplicates", move_to_warm: "Storage", archive_project: "Archive", copy_to_cloud: "Backup" } as Record<string, string>)[type] || "Review";
+const errorText = (error: unknown) => error instanceof Error ? error.message : "The request could not be completed.";
 
+export function CleanupScreen({ go, toast }: ScreenProps) {
+  const recommendations = useQuery(api.recommendations.list) as Recommendation[] | undefined;
+  const settings = useQuery(api.settings.get);
+  const context = useQuery(api.tenants.currentContext);
+  const queue = useMutation(api.cleanup.queueRecommendations);
+  const updateStatus = useMutation(api.recommendations.updateStatus);
+  const [preview, setPreview] = React.useState<Preview | null>(null);
+  const [deleting, setDeleting] = React.useState<Recommendation | null>(null);
+  const [busyId, setBusyId] = React.useState<string | null>(null);
+  const [filter, setFilter] = React.useState("all");
+  const all = recommendations || [];
+  const safe = all.filter(r => CLEANUP_TYPES.has(r.type) && r.status === "open" && r.riskLevel === "green" && r.affectedFileIds.length > 0);
+  const safeBatch: Recommendation[] = [];
+  const batchIds = new Set<string>();
+  for (const recommendation of safe) {
+    const merged = new Set([...batchIds, ...recommendation.affectedFileIds]);
+    if (merged.size <= 4000 && safeBatch.length < 100) {
+      safeBatch.push(recommendation);
+      for (const id of merged) batchIds.add(id);
+    }
+  }
+  const categories = [...new Set(all.map(r => category(r.type)))];
+  const shown = filter === "all" ? all : all.filter(r => category(r.type) === filter);
+  const safeIds = [...new Set(safe.flatMap(r => r.affectedFileIds))];
+  const canPurge = context?.member.role === "admin";
+  const retention = settings?.retentionDays ?? 14;
 
-
-/* ============================================================
-   DriveOS — Cleanup, Cleanup Preview Modal, Quarantine
-   ============================================================ */
-
-
-  
-
-  const GROUPS = [
-    { risk: "safe", label: "Safe to recover", desc: "Regenerable or fully redundant. Auto-eligible.", icon: "shieldCheck" },
-    { risk: "review", label: "Needs review", desc: "Requires producer or editor approval before quarantine.", icon: "info" },
-    { risk: "danger", label: "Do not delete", desc: "Protected. Flagged for manual review only.", icon: "lock" },
-  ];
-
-  const CLEANUP_REQUESTER = "founder";
-
-  // Create + approve a quarantine job from a recommendation. The local agent's
-  // `run-jobs` command picks up the approved job and performs the actual move.
-  // When `purgeAfter` is true ("Delete permanently"), the file still moves to
-  // quarantine first — so the agent's protected-file guard still applies — and
-  // the backend then auto-queues a purge that erases it from disk. Same net
-  // effect the user wants (file gone from the device) without a new delete path.
-  function useQuarantineRecommendation() {
-    const createJob = useMutation(api.cleanup.createJob);
-    const approveJob = useMutation(api.cleanup.approveJob);
-    return React.useCallback(async (r: any, opts?: { purgeAfter?: boolean }) => {
-      const jobId = await createJob({
-        recommendationId: typeof r.id === "string" ? r.id : undefined,
-        requestedBy: CLEANUP_REQUESTER,
-        action: "quarantine",
-        affectedFileIds: r.affectedFileIds || [],
-        affectedBytes: r.affectedBytes || 0,
-        purgeAfter: opts?.purgeAfter || undefined,
-      });
-      if (jobId) await approveJob({ jobId, approvedBy: CLEANUP_REQUESTER });
-      return jobId;
-    }, [createJob, approveJob]);
+  async function enqueue(recs: Recommendation[], purgeAfter = false) {
+    if (busyId || !settings) return;
+    setBusyId(recs[0]?._id || "bulk");
+    try {
+      const result = await queue({ recommendationIds: recs.map(r => r._id), purgeAfter: purgeAfter || undefined });
+      toast(`Queued ${result.queued} file(s) for ${purgeAfter ? "permanent deletion" : "quarantine"}`, purgeAfter ? "trash" : "shield", purgeAfter ? "risk" : "ok");
+      setDeleting(null); setPreview(null);
+    } catch (error) { toast(errorText(error), "alert", "risk"); }
+    finally { setBusyId(null); }
+  }
+  async function ignore(r: Recommendation) {
+    setBusyId(r._id);
+    try { await updateStatus({ recommendationId: r._id, status: "ignored" }); }
+    catch (error) { toast(errorText(error), "alert", "risk"); }
+    finally { setBusyId(null); }
   }
 
-  function RecCard({ r, go, toast, onPreview }: ScreenProps) {
-    const [state, setState] = React.useState<RecState>(null);
-    const [busy, setBusy] = React.useState(false);
-    const [confirmDelete, setConfirmDelete] = React.useState(false);
-    const quarantine = useQuarantineRecommendation();
-    const onQuarantine = async () => {
-      if (busy) return;
-      setBusy(true);
-      try {
-        await quarantine(r);
-        setState("quarantined");
-      } catch (err: any) {
-        toast(err?.message || "Could not queue quarantine", "alert", "risk");
-      } finally {
-        setBusy(false);
-      }
-    };
-    // Permanent delete: quarantine-then-auto-purge. Confirmed via type-to-confirm
-    // modal because it's irreversible — no 14-day rollback.
-    const onDelete = async () => {
-      if (busy) return;
-      setBusy(true);
-      try {
-        await quarantine(r, { purgeAfter: true });
-        setConfirmDelete(false);
-        setState("deleted");
-      } catch (err: any) {
-        toast(err?.message || "Could not queue permanent delete", "alert", "risk");
-      } finally {
-        setBusy(false);
-      }
-    };
-    if (state === "quarantined")
-      return h("div", { className: "card", style: { borderColor: "var(--ok-line)", background: "var(--ok-soft)" } },
-        h("div", { className: "card-pad row", style: { gap: 11 } }, h(Icon, { name: "clock", size: 18, style: { color: "var(--ok)" } }),
-          h("div", { style: { flex: 1 } },
-            h("span", { className: "hi", style: { fontWeight: 600, display: "block" } }, r.title + " — queued for quarantine (" + fmtTB(r.recoverTB) + ")"),
-            h("span", { className: "muted", style: { fontSize: 11.5 } }, "The agent moves these files on its next poll, then this recommendation clears.")),
-          h("button", { className: "btn sm ghost", onClick: () => setState(null) }, "Dismiss")));
-    if (state === "deleted")
-      return h("div", { className: "card", style: { borderColor: "var(--risk-line)", background: "var(--risk-soft)" } },
-        h("div", { className: "card-pad row", style: { gap: 11 } }, h(Icon, { name: "trash", size: 18, style: { color: "var(--risk)" } }),
-          h("div", { style: { flex: 1 } },
-            h("span", { className: "hi", style: { fontWeight: 600, display: "block" } }, r.title + " — queued for permanent deletion (" + fmtTB(r.recoverTB) + ")"),
-            h("span", { className: "muted", style: { fontSize: 11.5 } }, "The agent removes these files from the drive on its next poll. This cannot be undone.")),
-          h("button", { className: "btn sm ghost", onClick: () => setState(null) }, "Dismiss")));
-    if (state === "ignored")
-      return h("div", { className: "card", style: { opacity: 0.55 } }, h("div", { className: "card-pad row", style: { gap: 11 } }, h(Icon, { name: "x", size: 16, style: { color: "var(--tx-dim)" } }),
-        h("span", { className: "muted", style: { flex: 1 } }, r.title + " — ignored"), h("button", { className: "btn sm ghost", onClick: () => setState(null) }, "Restore")));
+  return <div className="page-inner">
+    <PageHead eyebrow="Maintenance" title="Cleanup Recommendations" desc="Review actual files before approving cleanup. The agent reports when each move completes." actions={[<button key="q" className="btn" onClick={() => go("quarantine")}><Icon name="shield" size={15} />View Quarantine</button>]} />
+    {recommendations === undefined ? <div className="card card-pad muted">Loading recommendations…</div> : all.length === 0 ? <div className="card"><div className="empty"><Icon name="shieldCheck" size={24} /><h3>No cleanup recommendations yet</h3><div className="muted">Scan your drives, then run analysis from the Drives screen.</div></div></div> : <>
+      <div className="card card-pad" style={{ marginBottom: "var(--gap)" }}>
+        <div className="spread" style={{ gap: 20 }}><div><div className="eyebrow">Safe cleanup</div><h2 style={{ margin: "8px 0" }}>{safeIds.length} unique file(s)</h2><div className="muted">Only eligible cache, proxies, and redundant copies are included.</div>{safeBatch.length < safe.length && <p className="muted" style={{ fontSize: 12 }}>This batch contains {batchIds.size} files. Remaining recommendations can be reviewed in the next batch.</p>}</div><button className="btn primary lg" disabled={!settings || batchIds.size === 0 || busyId !== null} onClick={() => setPreview({ title: safeBatch.length === safe.length ? "All safe cleanup" : "Safe cleanup batch", recommendations: safeBatch })}><Icon name="broom" size={16} />{safeBatch.length === safe.length ? "Quarantine all safe" : "Quarantine safe batch"}</button></div>
+        <div className="mono dim" style={{ marginTop: 14, fontSize: 12 }}>New quarantine jobs retain files for {retention} days. Existing items keep their original restore deadline.</div>
+      </div>
+      <div className="chip-row" style={{ marginBottom: "var(--gap)" }}>{["all", ...categories].map(c => <button key={c} className={`badge ${filter === c ? "accent" : ""}`} style={{ cursor: "pointer", padding: "6px 12px" }} onClick={() => setFilter(c)}>{c === "all" ? "All categories" : c}</button>)}</div>
+      <div style={{ display: "grid", gap: 12 }}>{shown.map(r => {
+        const supported = CLEANUP_TYPES.has(r.type);
+        const eligible = supported && r.status === "open" && r.riskLevel !== "red" && r.affectedFileIds.length > 0;
+        return <div className="card card-pad" key={r._id}>
+          <div className="spread"><h3 style={{ margin: 0, fontSize: 15 }}>{r.title}</h3><Badge kind={r.riskLevel === "red" ? "risk" : r.riskLevel === "green" ? "ok" : "warn"}>{r.riskLevel === "red" ? "Protected" : r.riskLevel === "green" ? "Safe to review" : "Needs review"}</Badge></div>
+          <p className="muted" style={{ fontSize: 13, lineHeight: 1.6 }}>{r.explanation}</p><div className="mono dim" style={{ fontSize: 12 }}>{r.affectedFileIds.length} listed file(s) · {formatBytes(r.affectedBytes)} · {category(r.type)}</div>
+          {!supported && <p className="muted" style={{ fontSize: 12 }}>This recommendation needs a storage or backup decision. It does not authorize deleting the original files.</p>}
+          {r.status === "failed" && <p style={{ color: "var(--risk)", fontSize: 12 }}>A previous cleanup attempt failed. Run analysis again to refresh the remaining files before approving another move.</p>}
+          <div className="row" style={{ gap: 8, marginTop: 14, flexWrap: "wrap" }}><button className="btn sm" onClick={() => setPreview({ title: r.title, recommendations: [r] })}><Icon name="eye" size={13} />Preview</button>{eligible && <button className="btn sm primary" disabled={!settings || busyId !== null} onClick={() => void enqueue([r])}><Icon name="shield" size={13} />{busyId === r._id ? "Queuing…" : "Quarantine"}</button>}{eligible && canPurge && <button className="btn sm danger" disabled={!settings || busyId !== null} onClick={() => setDeleting(r)}><Icon name="trash" size={13} />Delete permanently</button>}<button className="btn sm ghost" disabled={busyId !== null} onClick={() => void ignore(r)}>Ignore</button></div>
+        </div>;
+      })}</div>
+    </>}
+    {preview && <CleanupPreviewModal preview={preview} retention={retention} busy={busyId !== null} onClose={() => setPreview(null)} onQueue={() => void enqueue(preview.recommendations)} />}
+    {deleting && <DeleteConfirmModal title={deleting.title} count={deleting.affectedFileIds.length} busy={busyId !== null} onClose={() => setDeleting(null)} onConfirm={() => void enqueue([deleting], true)} />}
+  </div>;
+}
 
-    return h("div", { className: "card fade-up" },
-      h("div", { className: "card-pad", style: { display: "flex", gap: 14 } },
-        h("div", { style: { width: 42, height: 42, borderRadius: 11, flexShrink: 0, display: "grid", placeItems: "center", background: "var(--" + r.risk + "-soft)", color: "var(--" + r.risk + ")", border: "1px solid var(--" + r.risk + "-line)" } },
-          h(Icon, { name: catIcon(r.cat), size: 19 })),
-        h("div", { style: { flex: 1, minWidth: 0 } },
-          h("div", { className: "spread" },
-            h("div", { className: "row", style: { gap: 9, minWidth: 0 } }, h("span", { className: "hi", style: { fontWeight: 600, fontSize: 14 } }, r.title),
-              r.approval && h(Badge, { kind: "warn", icon: "user" }, "Approval required")),
-            h("div", { className: "row", style: { gap: 6, flexShrink: 0 } }, h("span", { className: "stat-num", style: { fontSize: 20, color: "var(--" + r.risk + ")" } }, fmtTB(r.recoverTB)))),
-          h("div", { className: "muted", style: { fontSize: 12.5, marginTop: 5, lineHeight: 1.5, maxWidth: "70ch" } }, r.why),
-          h("div", { className: "row", style: { gap: 14, marginTop: 10, flexWrap: "wrap", fontSize: 11.5 } },
-            h("span", { className: "tag" }, h(Icon, { name: "copy", size: 12 }), fmtNum(r.files) + " files"),
-            h("span", { className: "tag" }, h(Icon, { name: "folder", size: 12 }), r.projects[0] === "—" ? "Studio-wide" : r.projects.length + " projects"),
-            h("span", { className: "muted" }, h("b", { className: "hi" }, "Next: "), r.action)),
-          h("div", { className: "row", style: { gap: 8, marginTop: 14 } },
-            h("button", { className: "btn sm", onClick: () => onPreview(r) }, h(Icon, { name: "eye", size: 13 }), "Preview"),
-            r.risk !== "danger" && h("button", { className: "btn sm primary", disabled: busy, onClick: onQuarantine }, h(Icon, { name: "shield", size: 13 }), busy ? "Queuing…" : "Quarantine"),
-            r.risk !== "danger" && h("button", { className: "btn sm danger", disabled: busy, title: "Permanently delete these files from the drive (no 14-day rollback)", onClick: () => setConfirmDelete(true) }, h(Icon, { name: "trash", size: 13 }), "Delete permanently"),
-            h("button", { className: "btn sm ghost", onClick: () => setState("ignored") }, "Ignore"))),
-        confirmDelete && h(DeleteConfirmModal, { r, busy, onConfirm: onDelete, onClose: () => setConfirmDelete(false) })));
+function CleanupPreviewModal({ preview, retention, busy, onClose, onQueue }: { preview: Preview; retention: number; busy: boolean; onClose: () => void; onQueue: () => void }) {
+  const fileIds = [...new Set(preview.recommendations.flatMap(r => r.affectedFileIds))];
+  const files = useQuery(api.cleanup.previewFiles, { fileIds });
+  const [approved, setApproved] = React.useState(false);
+  const supported = preview.recommendations.every(r => CLEANUP_TYPES.has(r.type) && r.status === "open" && r.riskLevel !== "red");
+  const bytes = (files || []).reduce((sum: number, f: any) => sum + f.sizeBytes, 0);
+  const eligibleCount = (files || []).filter((f: any) => !f.protected && !f.deletedAt).length;
+  return <Modal title={preview.title} subtitle="Review actual catalog records before anything moves" icon="broom" iconKind="ok" onClose={onClose} width={820} footer={[
+    <label key="approve" className="row" style={{ gap: 8, marginRight: "auto", fontSize: 12 }}><input type="checkbox" checked={approved} onChange={e => setApproved(e.target.checked)} />I approve this move to quarantine.</label>,
+    <button key="cancel" className="btn" onClick={onClose}>Cancel</button>,
+    <button key="report" className="btn" disabled={!files} onClick={() => downloadText("driveos-cleanup-preview.json", JSON.stringify({ recommendations: preview.recommendations.map(r => r._id), files, retentionDays: retention }, null, 2), "application/json")}>Export Report</button>,
+    <button key="move" className="btn primary" disabled={!approved || busy || !files || !supported || eligibleCount === 0} onClick={onQueue}>{busy ? "Queuing…" : "Move to Quarantine"}</button>,
+  ]}>
+    <div className="card card-pad" style={{ marginBottom: 16 }}><b>{files ? files.length : "…"} cataloged file(s) · {formatBytes(bytes)}</b><p className="muted" style={{ marginBottom: 0, fontSize: 13 }}>Files are retained for {retention} days after approval. Archive and cloud copies have not been verified by this preview.</p></div>
+    {!supported && <p className="muted">This preview does not authorize a cleanup operation. Review the recommendation and refresh analysis before approving any move.</p>}
+    {files && files.length > 200 && <p className="dim" style={{ fontSize: 12 }}>Showing the first 200 of {files.length} catalog records. Export Report includes every listed record.</p>}
+    {files === undefined ? <p className="muted">Loading affected files…</p> : files.length === 0 ? <p className="muted">No active files are available for this recommendation.</p> : <div style={{ maxHeight: 330, overflow: "auto", border: "1px solid var(--line)", borderRadius: "var(--r)" }}><table className="tbl"><thead><tr><th>Actual file path</th><th>Classification</th><th>Size</th></tr></thead><tbody>{files.slice(0, 200).map((f: any) => <tr key={f._id}><td className="mono" style={{ fontSize: 11, overflowWrap: "anywhere" }}>{f.path}</td><td><Badge kind={f.protected ? "risk" : ""}>{f.classification}{f.protected ? " · protected" : ""}</Badge></td><td className="mono">{formatBytes(f.sizeBytes)}</td></tr>)}</tbody></table></div>}
+  </Modal>;
+}
+
+function DeleteConfirmModal({ title, count, busy, onClose, onConfirm }: { title: string; count: number; busy: boolean; onClose: () => void; onConfirm: () => void }) {
+  const [typed, setTyped] = React.useState("");
+  const armed = typed.trim().toUpperCase() === "DELETE";
+  if (typeof document === "undefined") return null;
+  return createPortal(<Modal title="Permanently delete files" subtitle={title} icon="trash" iconKind="risk" onClose={onClose} width={560} footer={[<button key="cancel" className="btn" onClick={onClose}>Cancel</button>, <button key="delete" className="btn danger" disabled={!armed || busy} onClick={onConfirm}>{busy ? "Queuing…" : "Permanently delete"}</button>]}><p>These {count} file(s) will be permanently removed by their local agent. This cannot be undone.</p><label className="field-label" htmlFor="permanent-delete-confirm">Type DELETE to confirm</label><input id="permanent-delete-confirm" className="input mono" placeholder="DELETE" value={typed} autoFocus onChange={e => setTyped(e.target.value)} /></Modal>, document.body);
+}
+
+export function QuarantineScreen({ go, toast }: ScreenProps) {
+  const query = useQuery(api.cleanup.listQuarantine);
+  const [clockTick, setClockTick] = React.useState(() => Math.floor(Date.now() / 60000));
+  React.useEffect(() => {
+    const timer = setInterval(() => setClockTick(Math.floor(Date.now() / 60000)), 60000);
+    return () => clearInterval(timer);
+  }, []);
+  const purgeable = useQuery(api.cleanup.purgeableCount, { refreshAt: clockTick });
+  const settings = useQuery(api.settings.get);
+  const context = useQuery(api.tenants.currentContext);
+  const requestRestore = useMutation(api.cleanup.requestRestore);
+  const purgeItem = useMutation(api.cleanup.purgeItem);
+  const purgeExpired = useMutation(api.cleanup.purgeExpired);
+  const [busyId, setBusyId] = React.useState<string | null>(null);
+  const [deleting, setDeleting] = React.useState<any | null>(null);
+  const active = (query || []).filter((q: any) => ["quarantined", "pending_restore", "pending_purge"].includes(q.status));
+  const canPurge = context?.member.role === "admin";
+  const restorable = active.filter((q: any) => q.status === "quarantined");
+  const deadline = restorable.reduce((earliest: number, q: any) => Math.min(earliest, q.rollbackUntil), Infinity);
+  const actor = context?.member.email || "";
+  async function restore(id: string) {
+    if (busyId) return; setBusyId(id);
+    try { await requestRestore({ quarantineId: id }); toast("Restore queued — waiting for the agent to move the file back", "rotate", "accent"); }
+    catch (error) { toast(errorText(error), "alert", "risk"); } finally { setBusyId(null); }
   }
-
-  // Type-to-confirm modal for permanent deletion. The button only enables once
-  // the user types DELETE, so an irreversible purge can't fire on a stray click.
-  // Rendered through a portal to document.body: the card wrapping this modal has
-  // a transform-based .fade-up animation, which creates a stacking context that
-  // would otherwise trap the position:fixed scrim *behind* sibling cards. The
-  // portal lifts it out so the modal overlays the whole screen like every other.
-  function DeleteConfirmModal({ r, busy, onConfirm, onClose }: ScreenProps) {
-    const [typed, setTyped] = React.useState("");
-    const armed = typed.trim().toUpperCase() === "DELETE";
-    const footer = [
-      h("button", { key: "c", className: "btn", onClick: onClose }, "Cancel"),
-      h("button", { key: "d", className: "btn danger", disabled: !armed || busy, onClick: onConfirm },
-        h(Icon, { name: "trash", size: 14 }), busy ? "Queuing…" : "Permanently delete"),
-    ];
-    const modal = h(Modal, { title: "Permanently delete files", subtitle: r.title, icon: "trash", iconKind: "risk", onClose, footer, width: 560 },
-      h("div", { style: { padding: "13px 15px", borderRadius: "var(--r)", background: "var(--risk-soft)", border: "1px solid var(--risk-line)", marginBottom: 16, display: "flex", gap: 10 } },
-        h(Icon, { name: "alert", size: 18, style: { color: "var(--risk)", flexShrink: 0 } }),
-        h("div", { style: { fontSize: 12.5, color: "var(--tx)", lineHeight: 1.5 } },
-          h("b", { className: "hi" }, "This cannot be undone. "),
-          "These " + fmtNum(r.files) + " file(s) (" + fmtTB(r.recoverTB) + ") will be removed from the drive with no 14-day rollback. Protected RAW, final exports, and project files are automatically skipped.")),
-      h("div", { className: "eyebrow", style: { marginBottom: 6 } }, "Type DELETE to confirm"),
-      h("input", { className: "input mono", value: typed, autoFocus: true, placeholder: "DELETE",
-        onChange: (e: React.ChangeEvent<HTMLInputElement>) => setTyped(e.target.value),
-        onKeyDown: (e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === "Enter" && armed && !busy) onConfirm(); },
-        style: { width: "100%", letterSpacing: "0.1em" } }));
-    // Guard against SSR (no document during server render).
-    return typeof document !== "undefined" ? createPortal(modal, document.body) : modal;
+  async function remove() {
+    if (!deleting || busyId) return; setBusyId(deleting === "expired" ? "expired" : deleting._id);
+    try { const result = deleting === "expired" ? await purgeExpired({ requestedBy: actor }) : await purgeItem({ quarantineId: deleting._id, requestedBy: actor }); toast(`Queued ${result.queued} file(s) for permanent deletion`, "trash", "risk"); setDeleting(null); }
+    catch (error) { toast(errorText(error), "alert", "risk"); } finally { setBusyId(null); }
   }
-  function catIcon(cat: string) {
-    const icons: Record<string, string> = { "Cache": "cpu", "Proxies": "layers", "Duplicate stock": "globe", "Review exports": "download", "Abandoned copies": "box", "Duplicate downloads": "copy", "Unknown": "alert" };
-    return icons[cat] || "broom";
-  }
-
-  function CleanupScreen({ go, toast }: ScreenProps) {
-    const [preview, setPreview] = React.useState<CleanupPreviewState>(null);
-    const [cat, setCat] = React.useState("all");
-    const cats = [...new Set(DB.cleanup.map((c) => c.cat))];
-    const filtered = cat === "all" ? DB.cleanup : DB.cleanup.filter((c) => c.cat === cat);
-    const byRisk = (rk: string) => filtered.filter((c) => c.risk === rk);
-    const safeT = DB.cleanup.filter((c) => c.risk === "safe").reduce((s, c) => s + c.recoverTB, 0);
-    const revT = DB.cleanup.filter((c) => c.risk === "review").reduce((s, c) => s + c.recoverTB, 0);
-    const protT = DB.cleanup.filter((c) => c.risk === "danger").reduce((s, c) => s + c.recoverTB, 0);
-    const totalT = DB.cleanup.reduce((s, c) => s + c.recoverTB, 0);
-    const heroMax = totalT > 0 ? totalT : 1;
-    const isEmpty = DB.cleanup.length === 0;
-
-    return h("div", { className: "page-inner" },
-      h(PageHead, { eyebrow: "Maintenance", title: "Cleanup Recommendations", desc: "Every recommendation explains what was found, why it's safe, and exactly what happens next. Nothing is deleted — files move to quarantine first.",
-        actions: [h("button", { key: 1, className: "btn", onClick: () => go("quarantine") }, h(Icon, { name: "shield", size: 15 }), "View Quarantine")] }),
-
-      // No real recommendations yet — never fabricate demo cards. Analysis
-      // generates these after a scan; until then, say so plainly.
-      isEmpty && h("div", { className: "card" },
-        h("div", { className: "empty" },
-          h("div", { className: "empty-ico" }, h(Icon, { name: "shieldCheck", size: 24 })),
-          h("h3", null, "No cleanup recommendations yet"),
-          h("div", { className: "muted", style: { maxWidth: "48ch" } }, "Once an agent scans your drives and analysis runs, safe-to-reclaim cache, proxies, and duplicates show up here with a preview before anything moves."))),
-
-      // hero
-      !isEmpty && h("div", { className: "card fade-up", style: { marginBottom: "var(--gap)", overflow: "hidden", background: "linear-gradient(135deg, var(--bg-panel), var(--bg-panel-2))" } },
-        h("div", { style: { display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 0 } },
-          h("div", { className: "card-pad", style: { padding: 28 } },
-            h("div", { className: "eyebrow", style: { marginBottom: 8 } }, "Potential recovery"),
-            h("div", { className: "row", style: { alignItems: "baseline", gap: 10 } },
-              h("span", { className: "stat-num", style: { fontSize: 52, color: "var(--ok)" } }, totalT.toFixed(1)), h("span", { style: { fontSize: 22, color: "var(--tx-mut)", fontWeight: 600 } }, "TB")),
-            h("div", { style: { fontSize: 13.5, color: "var(--tx-mut)", marginTop: 8, maxWidth: "44ch" } }, "Reclaimable across 8 categories without touching any RAW footage, final exports, or single-copy files."),
-            h("div", { className: "row", style: { gap: 10, marginTop: 20 } },
-              h("button", { className: "btn primary lg", onClick: () => setPreview({ title: "All safe cleanup", recoverTB: safeT, files: 36242, projects: ["studio"], risk: "safe", why: "Combined safe-to-recover categories.", action: "Move to quarantine" }) },
-                h(Icon, { name: "broom", size: 16 }), "Quarantine all safe (" + fmtTB(safeT) + ")"),
-              h("button", { className: "btn lg", onClick: () => go("quarantine") }, "Review queue"))),
-          h("div", { style: { borderLeft: "1px solid var(--line)", padding: 28, display: "flex", flexDirection: "column", justifyContent: "center", gap: 16 } },
-            recoverBar("Safe to recover", safeT, heroMax, "ok"),
-            recoverBar("Needs review", revT, heroMax, "warn"),
-            recoverBar("Protected (kept)", protT, heroMax, "risk"),
-            h("div", { className: "mono dim", style: { fontSize: 11, marginTop: 2 } }, "Quarantine retention: 30 days · full rollback")))),
-
-      // category chips
-      !isEmpty && h("div", { className: "chip-row", style: { marginBottom: "var(--gap)" } },
-        h("button", { className: "badge " + (cat === "all" ? "accent" : ""), style: { cursor: "pointer", height: 28, padding: "0 12px" }, onClick: () => setCat("all") }, "All categories"),
-        cats.map((c) => h("button", { key: c, className: "badge " + (cat === c ? "accent" : ""), style: { cursor: "pointer", height: 28, padding: "0 12px" }, onClick: () => setCat(c) },
-          h(Icon, { name: catIcon(c), size: 12 }), c))),
-
-      // grouped recommendations
-      GROUPS.map((g) => {
-        const items = byRisk(g.risk);
-        if (!items.length) return null;
-        return h("div", { key: g.risk, style: { marginBottom: 26 } },
-          h("div", { className: "row", style: { gap: 10, marginBottom: 13 } },
-            h("span", { style: { width: 28, height: 28, borderRadius: 8, display: "grid", placeItems: "center", background: "var(--" + g.risk + "-soft)", color: "var(--" + g.risk + ")" } }, h(Icon, { name: g.icon, size: 15 })),
-            h("h3", { style: { fontSize: 15 } }, g.label),
-            h(Badge, { kind: RISK_META[g.risk] ? RISK_META[g.risk].cls : "" }, items.length),
-            h("span", { className: "muted", style: { fontSize: 12 } }, g.desc)),
-          h("div", { style: { display: "flex", flexDirection: "column", gap: 11 } }, items.map((r) => h(RecCard, { key: r.id, r, go, toast, onPreview: setPreview }))));
-      }),
-
-      preview && h(CleanupPreviewModal, { r: preview, onClose: () => setPreview(null), toast, go }));
-  }
-
-  function recoverBar(label: React.ReactNode, val: number, max: number, kind: string) {
-    return h("div", null,
-      h("div", { className: "spread", style: { fontSize: 12, marginBottom: 5 } }, h("span", { className: "hi", style: { fontWeight: 600 } }, label), h("span", { className: "mono", style: { color: "var(--" + kind + ")" } }, fmtTB(val))),
-      h(Bar, { value: val, max, kind, height: 7 }));
-  }
-
-  // ---- Cleanup Preview Modal ----
-  function CleanupPreviewModal({ r, onClose, toast, go }: ScreenProps) {
-    const [approved, setApproved] = React.useState(false);
-    const [busy, setBusy] = React.useState(false);
-    const quarantine = useQuarantineRecommendation();
-    const onMove = async () => {
-      if (busy) return;
-      setBusy(true);
-      try {
-        await quarantine(r);
-        toast("Queued " + fmtNum(r.files) + " files for quarantine", "shield", "ok");
-        onClose();
-      } catch (err: any) {
-        toast(err?.message || "Could not queue quarantine", "alert", "risk");
-      } finally {
-        setBusy(false);
-      }
-    };
-    const sampleFiles = [
-      { path: "/Show_X/06_RENDERS_CACHE/Premiere Pro Video Previews/", size: "182 GB", type: "cache" },
-      { path: "/Show_X/05_PROXIES/A_CAM/A001_C004_proxy.mov", size: "4.2 GB", type: "proxy" },
-      { path: "/Brand_Films/06_RENDERS_CACHE/peakfiles/", size: "96 GB", type: "cache" },
-      { path: "/Japan_Ep03/05_PROXIES/DRONE/", size: "38 GB", type: "proxy" },
-      { path: "/Social_Q3/06_RENDERS_CACHE/auto-save/", size: "12 GB", type: "cache" },
-    ];
-    const footer = [
-      h("div", { key: "a", className: "row", style: { gap: 10, marginRight: "auto" } },
-        h(Check, { on: approved, onChange: setApproved }),
-        h("span", { style: { fontSize: 12.5, color: "var(--tx)" } }, "I understand these files move to quarantine and can be restored for 30 days.")),
-      h("button", { key: "c", className: "btn", onClick: onClose }, "Cancel"),
-      h("button", { key: "r", className: "btn", onClick: () => toast("Report exported", "download", "accent") }, h(Icon, { name: "download", size: 14 }), "Export Report"),
-      h("button", { key: "q", className: "btn primary", disabled: !approved || busy, onClick: onMove },
-        h(Icon, { name: "shield", size: 14 }), busy ? "Queuing…" : "Move to Quarantine"),
-    ];
-    return h(Modal, { title: r.title, subtitle: "Preview before anything moves", icon: "broom", iconKind: "ok", onClose, footer, width: 760 },
-      h("div", { style: { padding: "13px 15px", borderRadius: "var(--r)", background: "var(--ok-soft)", border: "1px solid var(--ok-line)", marginBottom: 18, display: "flex", gap: 10 } },
-        h(Icon, { name: "shieldCheck", size: 18, style: { color: "var(--ok)", flexShrink: 0 } }),
-        h("div", { style: { fontSize: 12.5, color: "var(--tx)", lineHeight: 1.5 } }, h("b", { className: "hi" }, "Nothing is permanently deleted. "), "Files move to a protected quarantine folder with a 30-day rollback window. You can restore everything until then.")),
-
-      h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 18 } },
-        previewStat("Files affected", fmtNum(r.files), "copy"),
-        previewStat("Total size", fmtTB(r.recoverTB), "database"),
-        previewStat("Risk level", RISK_META[r.risk].label, r.risk === "safe" ? "shieldCheck" : "info", "var(--" + r.risk + ")"),
-        previewStat("Rollback", "30 days", "rotate")),
-
-      h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 18 } },
-        verifyBox("Archive copy verified", true, "Originals checksum-matched on Brandon Archive 01"),
-        verifyBox("Cloud copy verified", true, "Delivery copies present in Google Drive")),
-
-      h("div", { className: "eyebrow", style: { marginBottom: 8 } }, "Affected files (sample)"),
-      h("div", { style: { border: "1px solid var(--line)", borderRadius: "var(--r)", overflow: "hidden" } },
-        sampleFiles.map((f, i) => h("div", { key: i, className: "spread", style: { padding: "9px 13px", borderBottom: i < sampleFiles.length - 1 ? "1px solid var(--line-faint)" : "none", background: "var(--bg-input)" } },
-          h("div", { className: "row", style: { gap: 9, minWidth: 0 } }, h("span", { style: { width: 7, height: 7, borderRadius: 2, background: "var(--ft-" + f.type + ")", flexShrink: 0 } }),
-            h("span", { className: "mono", style: { fontSize: 11.5, color: "var(--tx)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, f.path)),
-          h("span", { className: "mono", style: { fontSize: 11.5, color: "var(--tx-mut)", flexShrink: 0, marginLeft: 10 } }, f.size)))));
-  }
-  function previewStat(label: React.ReactNode, value: React.ReactNode, icon: string, color = "") {
-    return h("div", { style: { padding: "12px 13px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
-      h("div", { className: "row", style: { gap: 6, marginBottom: 5 } }, h(Icon, { name: icon, size: 13, style: { color: color || "var(--tx-dim)" } }), h("span", { className: "eyebrow", style: { fontSize: 9 } }, label)),
-      h("div", { className: "stat-num", style: { fontSize: 17, color: color || "var(--tx-hi)" } }, value));
-  }
-  function verifyBox(label: React.ReactNode, ok: boolean, note: React.ReactNode) {
-    return h("div", { style: { padding: "11px 13px", borderRadius: "var(--r)", background: "var(--ok-soft)", border: "1px solid var(--ok-line)", display: "flex", gap: 10 } },
-      h(Icon, { name: "checkCircle", size: 16, style: { color: "var(--ok)", flexShrink: 0, marginTop: 1 } }),
-      h("div", null, h("div", { className: "hi", style: { fontWeight: 600, fontSize: 12.5 } }, label), h("div", { className: "muted", style: { fontSize: 11 } }, note)));
-  }
-
-  // ============================================================
-  //  QUARANTINE
-  // ============================================================
-  const PURGE_REQUESTER = "founder";
-
-  function QuarantineScreen({ go, toast }: ScreenProps) {
-    const [items, setItems] = React.useState<QuarantineItem[]>(DB.quarantine);
-    const [busyId, setBusyId] = React.useState<any>(null);
-    const [purging, setPurging] = React.useState(false);
-    const markRestored = useMutation(api.cleanup.markQuarantineRestored);
-    const purgeExpired = useMutation(api.cleanup.purgeExpired);
-    const purgeItem = useMutation(api.cleanup.purgeItem);
-    // Live count of items past their rollback window, safe to permanently delete.
-    const purgeable = useQuery(api.cleanup.purgeableCount) || { count: 0, bytes: 0 };
-    // Keep local list in sync when the live Convex query updates DB.quarantine.
-    React.useEffect(() => { setItems(DB.quarantine); }, [DB.quarantine]);
-    const totalGB = items.reduce((s, q) => s + q.sizeGB, 0);
-    const restore = async (id: any) => {
-      if (busyId) return;
-      setBusyId(id);
-      try {
-        if (typeof id === "string" && id.length > 12) await markRestored({ quarantineId: id });
-        setItems((x) => x.filter((q) => q.id !== id));
-        toast("File restored to original location", "rotate", "accent");
-      } catch (err: any) {
-        toast(err?.message || "Could not restore file", "alert", "risk");
-      } finally {
-        setBusyId(null);
-      }
-    };
-    // Per-row permanent delete of a single item, regardless of its 14-day
-    // window. Queues a purge job the agent runs on its next poll — the row shows
-    // "Deleting…" until the agent confirms and the live query drops it. If the
-    // agent is offline the row stays; that's honest (nothing deleted yet).
-    const deleteOne = async (q: any) => {
-      if (busyId) return;
-      if (!window.confirm(`Permanently delete "${q.name}"? This cannot be undone.`)) return;
-      setBusyId(q.id);
-      try {
-        if (typeof q.id === "string" && q.id.length > 12) {
-          const r = await purgeItem({ quarantineId: q.id, requestedBy: PURGE_REQUESTER });
-          toast(r.queued ? "Queued for permanent deletion — the agent will remove it shortly" : "Could not queue delete", r.queued ? "trash" : "alert", r.queued ? "risk" : "risk");
-        }
-      } catch (err: any) {
-        toast(err?.message || "Could not delete file", "alert", "risk");
-      } finally {
-        setBusyId(null);
-      }
-    };
-    // Permanently delete every item past its 14-day window. Irreversible, so it
-    // confirms first and only ever targets expired items (the backend enforces
-    // this too). The agent does the actual on-disk deletion on its next poll.
-    const onPurgeExpired = async () => {
-      if (purging || purgeable.count === 0) return;
-      if (!window.confirm(`Permanently delete ${purgeable.count} expired file(s) and free ${fmtGB(purgeable.bytes / (1024 ** 3))}? This cannot be undone.`)) return;
-      setPurging(true);
-      try {
-        const r = await purgeExpired({ requestedBy: PURGE_REQUESTER });
-        toast(`Queued ${r.queued} file(s) for permanent deletion`, "trash", "risk");
-      } catch (err: any) {
-        toast(err?.message || "Could not queue purge", "alert", "risk");
-      } finally {
-        setPurging(false);
-      }
-    };
-
-    return h("div", { className: "page-inner" },
-      h(PageHead, { eyebrow: "Maintenance", title: "Quarantine", desc: "A safe deletion buffer. Files stay restorable for 14 days, then can be permanently removed to free disk space.",
-        actions: [
-          h("button", { key: 1, className: "btn", onClick: () => go("cleanup") }, h(Icon, { name: "chevL", size: 15 }), "Back to Cleanup"),
-          h("button", { key: 2, className: "btn danger", disabled: purging || purgeable.count === 0,
-            title: purgeable.count === 0 ? "No files have passed their 14-day window yet. Use the per-row Delete to remove one sooner." : `Permanently delete ${purgeable.count} expired file(s)`,
-            onClick: onPurgeExpired },
-            h(Icon, { name: "trash", size: 15 }), purging ? "Queuing…" : purgeable.count > 0 ? `Empty expired (${purgeable.count})` : "Empty expired"),
-        ] }),
-
-      h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "var(--gap)", marginBottom: "var(--gap)" } },
-        qkpi("In Quarantine", fmtGB(totalGB), "shield", "var(--warn)"),
-        qkpi("Items", items.length, "copy", "var(--tx-hi)"),
-        qkpi("Restorable", items.filter((q) => q.verified).length + " / " + items.length, "rotate", "var(--ok)"),
-        qkpi("Next purge", "Jun 16", "clock", "var(--tx-mut)")),
-
-      items.length === 0
-        ? h("div", { className: "card" }, h("div", { className: "empty" }, h("div", { className: "empty-ico" }, h(Icon, { name: "shieldCheck", size: 24 })), h("h3", null, "Quarantine is empty"), h("div", { className: "muted" }, "Cleared files appear here with a 30-day restore window.")))
-        : h("div", { className: "card", style: { overflow: "hidden", marginBottom: "var(--gap)" } },
-            h("table", { className: "tbl" },
-              h("thead", null, h("tr", null, ["File", "Reason", "Moved by", "Date", "Restore by", "Size", ""].map((c, i) => h("th", { key: i, className: i === 5 ? "num" : "" }, c)))),
-              h("tbody", null, items.map((q) => h("tr", { key: q.id, style: { cursor: "default" } },
-                h("td", null, h("div", { style: { minWidth: 0 } },
-                  h("div", { className: "mono hi", style: { fontSize: 12, fontWeight: 600 } }, q.name),
-                  h("div", { className: "mono dim", style: { fontSize: 10.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 280 } }, q.origin))),
-                h("td", { className: "muted", style: { fontSize: 12, maxWidth: 200 } }, q.reason),
-                h("td", null, h("div", { className: "row", style: { gap: 7 } }, q.by.includes("Agent") ? h(Icon, { name: "cpu", size: 15, style: { color: "var(--auto)" } }) : h(Avatar, { id: byName(q.by), size: 20 }), h("span", { style: { fontSize: 12 } }, q.by.replace("DriveOS ", "")))),
-                h("td", { className: "mono muted", style: { fontSize: 11.5 } }, q.date),
-                h("td", null, h("span", { className: "mono", style: { fontSize: 11.5, color: "var(--warn)" } }, q.deadline)),
-                h("td", { className: "num mono hi" }, fmtGB(q.sizeGB)),
-                h("td", null, h("div", { className: "row", style: { gap: 6, justifyContent: "flex-end" } },
-                  h("button", { className: "btn sm", disabled: busyId === q.id, onClick: () => restore(q.id) }, h(Icon, { name: "rotate", size: 13 }), busyId === q.id ? "…" : "Restore"),
-                  h("button", { className: "btn sm danger", disabled: busyId === q.id, title: "Permanently delete this file now", onClick: () => deleteOne(q) }, h(Icon, { name: "trash", size: 13 }), busyId === q.id ? "…" : "Delete"))))))) ),
-
-      // audit log
-      cardShell("Audit Log", "list", "var(--tx-mut)", null,
-        h("div", { style: { padding: "6px 0" } }, DB.audit.map((a, i) => h("div", { key: i, className: "row", style: { gap: 13, padding: "11px 18px", borderBottom: i < DB.audit.length - 1 ? "1px solid var(--line-faint)" : "none" } },
-          h("span", { style: { width: 28, height: 28, borderRadius: 7, display: "grid", placeItems: "center", flexShrink: 0, background: auditColor(a.kind) + "20", color: auditColor(a.kind) } }, h(Icon, { name: auditIcon(a.kind), size: 14 })),
-          h("div", { style: { flex: 1, minWidth: 0 } }, h("div", { style: { fontSize: 12.5, color: "var(--tx)" } }, h("b", { className: "hi" }, a.who), " — ", a.action)),
-          h("span", { className: "mono dim", style: { fontSize: 11, flexShrink: 0 } }, a.date + " · " + a.time))))));
-  }
-  function byName(name: string) { const m = DB.team.find((t) => t.name === name); return m ? m.id : "founder"; }
-  function auditColor(k: string) {
-    const colors: Record<string, string> = { quarantine: "var(--warn)", scan: "var(--accent)", auto: "var(--auto)", approve: "var(--ok)", create: "var(--cloud)", restore: "var(--ok)" };
-    return colors[k] || "var(--tx-mut)";
-  }
-  function auditIcon(k: string) {
-    const icons: Record<string, string> = { quarantine: "shield", scan: "refresh", auto: "cpu", approve: "check", create: "plus", restore: "rotate" };
-    return icons[k] || "activity";
-  }
-  function qkpi(label: React.ReactNode, value: React.ReactNode, icon: string, color: string) {
-    return h("div", { className: "card card-pad fade-up", style: { display: "flex", alignItems: "center", gap: 13 } },
-      h("div", { style: { width: 38, height: 38, borderRadius: 10, display: "grid", placeItems: "center", flexShrink: 0, background: "var(--bg-surface)", color, border: "1px solid var(--line)" } }, h(Icon, { name: icon, size: 18 })),
-      h("div", null, h("div", { className: "stat-num", style: { fontSize: 21, color } }, value), h("div", { className: "eyebrow", style: { fontSize: 9.5, marginTop: 1 } }, label)));
-  }
-
-  
-  
-
-
-export { CleanupScreen, QuarantineScreen };
+  return <div className="page-inner">
+    <PageHead eyebrow="Maintenance" title="Quarantine" desc={`Files remain recoverable until their recorded restore deadline. New jobs use a ${settings?.retentionDays ?? 14}-day retention period.`} actions={[<button key="back" className="btn" onClick={() => go("cleanup")}>Back to Cleanup</button>, ...(canPurge ? [<button key="purge" className="btn danger" disabled={!purgeable?.count || busyId !== null} onClick={() => setDeleting("expired")}>Empty expired{purgeable?.count ? ` (${purgeable.count})` : ""}</button>] : [])]} />
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "var(--gap)", marginBottom: "var(--gap)" }}>{[["In Quarantine", formatBytes(active.reduce((sum: number, q: any) => sum + q.sizeBytes, 0))], ["Items", active.length], ["Restorable", restorable.length], ["Earliest deadline", Number.isFinite(deadline) ? new Date(deadline).toLocaleDateString() : "—"]].map(([label, value]) => <div className="card card-pad" key={label}><div className="eyebrow">{label}</div><div className="stat-num" style={{ fontSize: 22, marginTop: 8 }}>{value}</div></div>)}</div>
+    {query === undefined ? <div className="card card-pad muted">Loading quarantine…</div> : active.length === 0 ? <div className="card"><div className="empty"><h3>Quarantine is empty</h3><div className="muted">Files appear here after an agent confirms their move. Restored and permanently deleted files leave this list.</div></div></div> : <div className="card" style={{ overflowX: "auto" }}><table className="tbl"><thead><tr><th>File</th><th>Status</th><th>Moved</th><th>Restore deadline</th><th>Size</th><th>Actions</th></tr></thead><tbody>{active.map((q: any) => <tr key={q._id}><td><div className="hi mono" style={{ fontSize: 12 }}>{q.originalPath.split(/[\\/]/).pop()}</div><div className="dim mono" style={{ fontSize: 10.5, overflowWrap: "anywhere", maxWidth: 480 }}>{q.originalPath}</div></td><td><Badge kind={q.status === "quarantined" ? "warn" : "accent"}>{q.status === "pending_restore" ? "Restore queued" : q.status === "pending_purge" ? "Delete queued" : "Quarantined"}</Badge></td><td className="mono muted">{new Date(q.movedAt).toLocaleString()}</td><td className="mono muted">{new Date(q.rollbackUntil).toLocaleString()}</td><td className="mono">{formatBytes(q.sizeBytes)}</td><td><div className="row" style={{ gap: 7 }}><button className="btn sm" disabled={q.status !== "quarantined" || busyId !== null} onClick={() => void restore(q._id)}>Restore</button>{canPurge && <button className="btn sm danger" disabled={q.status !== "quarantined" || busyId !== null} onClick={() => setDeleting(q)}>Delete</button>}</div></td></tr>)}</tbody></table></div>}
+    {deleting && <DeleteConfirmModal title={deleting === "expired" ? "Expired quarantine items" : deleting.originalPath.split(/[\\/]/).pop()} count={deleting === "expired" ? purgeable?.count || 0 : 1} busy={busyId !== null} onClose={() => setDeleting(null)} onConfirm={() => void remove()} />}
+  </div>;
+}

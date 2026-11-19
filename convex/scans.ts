@@ -1,7 +1,58 @@
-import { v } from "convex/values";
-import { internalAction, internalMutation, query } from "./_generated/server";
+import { ConvexError, v } from "convex/values";
+import { internalAction, internalMutation, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
-import { requireMember } from "./access";
+import { requireMember, requireRole } from "./access";
+
+const configuredManualLimit = Number(process.env.DRIVEOS_MANUAL_ANALYSIS_MAX_FILES || 250000);
+const MANUAL_ANALYSIS_MAX_FILES = Math.min(1000000, Math.max(1000,
+  Number.isFinite(configuredManualLimit) ? Math.floor(configuredManualLimit) : 250000));
+const MANUAL_ANALYSIS_COOLDOWN_MS = 5 * 60 * 1000;
+
+// Explicit dashboard requests never enable the expensive automatic scanner.
+// Bound the current in-memory analyzer while an incremental catalog analyzer
+// is unavailable, and report that boundary instead of silently reading millions
+// of documents or fabricating successful results.
+export const requestAnalysis = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const { tenantId } = await requireRole(ctx, ["admin", "producer", "editor", "assistant_editor"]);
+    const state = await ctx.db.query("analysisState").withIndex("by_tenant", q => q.eq("tenantId", tenantId)).first();
+    if (state?.scheduled) return { scheduled: false, message: "Analysis is already queued or running." };
+    if (state && state.lastRunAt + MANUAL_ANALYSIS_COOLDOWN_MS > Date.now())
+      return { scheduled: false, message: "Analysis was run recently. Try again in five minutes." };
+    const file = await ctx.db.query("files").withIndex("by_tenant", q => q.eq("tenantId", tenantId)).first();
+    if (!file) return { scheduled: false, message: "Scan a drive before running analysis." };
+    const now = Date.now();
+    if (state) await ctx.db.patch(state._id, { scheduled: true, lastRunAt: now });
+    else await ctx.db.insert("analysisState", { tenantId, dirtyCount: 0, scheduled: true, lastRunAt: now });
+    await ctx.scheduler.runAfter(0, internal.scans.runManualAnalysis, { tenantId });
+    return { scheduled: true, message: `Duplicate and cleanup analysis queued (up to ${MANUAL_ANALYSIS_MAX_FILES.toLocaleString()} catalog files).` };
+  },
+});
+
+export const runManualAnalysis = internalAction({
+  args: { tenantId: v.string() },
+  handler: async (ctx, args) => {
+    try {
+      await ctx.runAction(internal.duplicates.runDuplicateDetection, { ...args, maxFiles: MANUAL_ANALYSIS_MAX_FILES });
+      await ctx.runAction(internal.recommendations.generateRecommendations, { ...args, maxFiles: MANUAL_ANALYSIS_MAX_FILES });
+      await ctx.runMutation(internal.scans.finishManualAnalysis, { ...args, success: true });
+    } catch (error) {
+      await ctx.runMutation(internal.scans.finishManualAnalysis, { ...args, success: false, error: String(error) });
+      throw error;
+    }
+  },
+});
+
+export const finishManualAnalysis = internalMutation({
+  args: { tenantId: v.string(), success: v.boolean(), error: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const state = await ctx.db.query("analysisState").withIndex("by_tenant", q => q.eq("tenantId", args.tenantId)).first();
+    if (state) await ctx.db.patch(state._id, { scheduled: false, dirtyCount: args.success ? 0 : state.dirtyCount });
+    await ctx.db.insert("auditLogs", { tenantId: args.tenantId, action: args.success ? "analysis_complete" : "analysis_failed",
+      entityType: "analysis", message: args.success ? "Duplicate detection and cleanup analysis completed." : `Analysis failed: ${args.error}`, createdAt: Date.now() });
+  },
+});
 
 export const list = query({
   args: {},
@@ -84,9 +135,9 @@ export const complete = internalMutation({
     if (!id) return;
 
     const session = await ctx.db.get(id);
-    if (!session) return;
+    if (!session || session.tenantId !== (args.tenantId || "")) throw new ConvexError("Unknown scan session.");
 
-    const tenantId = session.tenantId || args.tenantId || "";
+    const tenantId = args.tenantId || "";
     const timestamp = Date.now();
     const filesScanned = args.filesSeen ?? session.filesScanned;
     const bytesScanned = args.bytesSeen ?? session.bytesScanned;

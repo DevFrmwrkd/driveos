@@ -157,11 +157,17 @@ export const uploadBatch = internalMutation({
       const existing = existingRaw && existingRaw.tenantId === tenantId ? existingRaw : null;
 
       if (existing) {
-        // A missing incoming hash keeps the stored one (quick scans don't
-        // recompute full hashes), and a scan guess never CLEARS a projectId —
+        // An unchanged quick scan keeps the stored full hash; changed content
+        // invalidates it. A scan guess never CLEARS a projectId —
         // it may have been assigned manually in the dashboard.
         const nextQuickHash = f.quickHash || existing.quickHash;
-        const nextFullHash = f.fullHash || existing.fullHash;
+        const sameContentFingerprint = existing.sizeBytes === f.sizeBytes &&
+          existing.modifiedAtFile === f.modifiedAtFile &&
+          (!f.quickHash || existing.quickHash === f.quickHash);
+        // A quick rescan cannot vouch for the previous full checksum after a
+        // content/stat change. Keeping it could classify an edited unique file
+        // as an exact duplicate until a full hash is recomputed.
+        const nextFullHash = f.fullHash || (sameContentFingerprint ? existing.fullHash : undefined);
         const nextProjectId = resolvedProjectId ?? existing.projectId;
 
         const unchanged =

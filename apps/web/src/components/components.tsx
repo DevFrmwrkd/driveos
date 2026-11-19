@@ -1,10 +1,11 @@
 import React from "react";
 import { Icon } from "./icons";
 import { DB } from "../data";
+import { formatBytes } from "../lib/download";
 
 // ---- formatting helpers ----
-export const fmtTB = (tb: number): string => tb >= 1 ? `${(+tb).toFixed(tb < 10 ? 2 : 1)} TB` : `${Math.round(tb * 1000)} GB`;
-export const fmtGB = (gb: number): string => gb >= 1000 ? `${(gb / 1000).toFixed(2)} TB` : `${gb < 10 ? (+gb).toFixed(1) : Math.round(gb)} GB`;
+export const fmtTB = (tb: number): string => formatBytes(tb * 1024 ** 4);
+export const fmtGB = (gb: number): string => formatBytes(gb * 1024 ** 3);
 export const pct = (a: number, b: number): number => b ? Math.round((a / b) * 100) : 0;
 export const fmtNum = (n: number): string => n.toLocaleString("en-US");
 

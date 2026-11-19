@@ -1,6 +1,8 @@
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { internalQuery, mutation, query } from "./_generated/server";
-import { requireMember, inTenant } from "./access";
+import { requireMember, requireRole, inTenant } from "./access";
+import { cleanupRulesValidator, DEFAULT_CLEANUP_RULES, validateCleanupRules } from "./settings";
+import { insertApprovedJob } from "./jobUtils";
 
 export const list = query({
   args: {},
@@ -45,15 +47,48 @@ export const create = mutation({
     status: v.string(), // "active" | "review" | "delivered" | "ready_to_archive" | "archived" | "paused"
     tier: v.string(), // "hot" | "warm" | "cloud" | "cold"
     rootPath: v.optional(v.string()),
+    driveId: v.optional(v.string()),
+    rules: v.optional(cleanupRulesValidator),
+    cloudRequested: v.optional(v.boolean()),
     folderTemplateId: v.optional(v.string()),
     template: v.optional(v.string()), // friendly template name
     dueDate: v.optional(v.number()),
     notes: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    const { tenantId } = await requireMember(ctx);
+    const member = await requireRole(ctx, ["admin", "producer", "editor", "assistant_editor"]);
+    const { tenantId } = member;
     const timestamp = Date.now();
     const slug = args.name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+    if (!args.name.trim() || !args.client.trim()) throw new ConvexError("Project name and client are required.");
+    if (args.cloudRequested) throw new ConvexError("Cloud folder creation is not available yet.");
+    if (args.template && args.template !== "YouTube Show") throw new ConvexError("Only the studio standard folder template is currently supported.");
+    const rules = args.rules ?? DEFAULT_CLEANUP_RULES;
+    validateCleanupRules(rules);
+    let drive: any = null;
+    if (args.driveId) {
+      const did = ctx.db.normalizeId("drives", args.driveId);
+      drive = did ? inTenant(await ctx.db.get(did), tenantId) : null;
+      if (!drive) throw new ConvexError("Choose a tracked drive in this workspace.");
+    }
+    if (args.rootPath) {
+      const normalized = args.rootPath.replace(/\\/g, "/");
+      if (!/^(?:[A-Za-z]:\/|\/)/.test(normalized) || normalized.includes("\0") || normalized.split("/").some(p => p === ".." || p === "."))
+        throw new ConvexError("Choose an absolute project folder without relative path segments.");
+      const key = (s: string) => {
+        const value = s.replace(/\\/g, "/").replace(/\/+$/, "");
+        return /^(?:[A-Za-z]:|\/\/)/.test(value) ? value.toLowerCase() : value;
+      };
+      const inside = (root: string) => key(normalized) === key(root) || key(normalized).startsWith(key(root) + "/");
+      if (!drive) {
+        const candidates = await ctx.db.query("drives").withIndex("by_tenant", q => q.eq("tenantId", tenantId)).collect();
+        drive = candidates.filter(d => inside(d.mountPath)).sort((a, b) => b.mountPath.length - a.mountPath.length)[0];
+      }
+      if (!drive?.machineId || !inside(drive.mountPath)) throw new ConvexError("The project folder must be inside the selected tracked drive.");
+      const mid = ctx.db.normalizeId("machines", drive.machineId);
+      const machine = mid ? inTenant(await ctx.db.get(mid), tenantId) : null;
+      if (!machine) throw new ConvexError("The selected drive is not linked to a machine.");
+    }
 
     const projectId = await ctx.db.insert("projects", {
       tenantId,
@@ -66,11 +101,14 @@ export const create = mutation({
       status: args.status,
       tier: args.tier,
       rootPath: args.rootPath,
+      driveId: drive ? String(drive._id) : undefined,
+      machineId: drive?.machineId,
+      cleanupRules: rules,
       folderTemplateId: args.folderTemplateId,
       template: args.template,
       dueDate: args.dueDate,
       createdAt: timestamp,
-      storageHealthScore: 100, // starts healthy
+      storageHealthScore: 0, // health is unknown until files are scanned and analyzed
       totalBytes: 0,
       duplicateBytes: 0,
       safeCleanupBytes: 0,
@@ -80,13 +118,8 @@ export const create = mutation({
 
     // Create a background job for local agent to create the folder structure if rootPath is specified
     if (args.rootPath) {
-      await ctx.db.insert("cleanupJobs", {
-        tenantId,
-        action: "create_folder_structure",
-        status: "pending_approval", // auto-approving below to queued
-        requestedBy: args.ownerId,
-        affectedFileIds: [],
-        affectedBytes: 0,
+      const setupJobId = await insertApprovedJob(ctx, {
+        tenantId, machineId: drive.machineId, requestedBy: member.email, action: "create_folder_structure",
         result: {
           projectId,
           projectName: args.name,
@@ -96,9 +129,8 @@ export const create = mutation({
           rootPath: args.rootPath,
           template: args.template || "YouTube Show",
         },
-        createdAt: timestamp,
-        updatedAt: timestamp,
       });
+      await ctx.db.patch(projectId, { setupJobId: String(setupJobId) });
     }
 
     await ctx.db.insert("auditLogs", {
@@ -115,18 +147,39 @@ export const create = mutation({
   },
 });
 
+export const setupStatus = query({
+  args: { projectId: v.string() },
+  handler: async (ctx, args) => {
+    const { tenantId } = await requireMember(ctx);
+    const id = ctx.db.normalizeId("projects", args.projectId);
+    const project = id ? inTenant(await ctx.db.get(id), tenantId) : null;
+    if (!project) return null;
+    const jid = project.setupJobId ? ctx.db.normalizeId("cleanupJobs", project.setupJobId) : null;
+    const job = jid ? inTenant(await ctx.db.get(jid), tenantId) : null;
+    return { status: job?.status ?? "not_requested", jobId: job?._id,
+      error: job?.result?.error ?? job?.result?.failures?.[0]?.error };
+  },
+});
+
 export const updateStatus = mutation({
   args: {
     projectId: v.string(),
     status: v.string(),
   },
   handler: async (ctx, args) => {
-    const { tenantId } = await requireMember(ctx);
+    const { tenantId } = await requireRole(ctx, ["admin", "producer", "editor", "assistant_editor"]);
     const projectId = ctx.db.normalizeId("projects", args.projectId);
     if (!projectId) return;
 
     const project = inTenant(await ctx.db.get(projectId), tenantId);
     if (!project) return;
+
+    if (args.status === "archived") {
+      const latest = await ctx.db.query("archiveManifests").withIndex("by_tenant", q => q.eq("tenantId", tenantId))
+        .order("desc").filter(q => q.eq(q.field("projectId"), args.projectId)).first();
+      if (!latest || latest.status !== "verified" || !latest.manifestPath.replace(/\\/g, "/").endsWith("/archive_manifest.json"))
+        throw new ConvexError("Generate and verify the project's inventory manifest before marking it archived.");
+    }
 
     await ctx.db.patch(projectId, {
       status: args.status,

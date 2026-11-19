@@ -37,7 +37,7 @@ DriveOS is structured as a **Monorepo** to share types, business rules, and mode
 
 ### 📋 Prerequisites
 
-Ensure you have **Node.js 18+** installed.
+Use **Node.js 22+**, matching the supported desktop build workflow.
 
 ### 1️⃣ Install Dependencies
 Run the package installation at the root workspace:
@@ -188,4 +188,12 @@ Use this checklist to verify full operational readiness:
 - [x] **Unit tests**: `npm test` runs with 100% success inside `@driveos/shared`.
 - [x] **Agent initialization**: Running `init` command successfully scaffolds the `driveos-config.json` configuration block.
 - [x] **Recursive scanning**: Running `scan` successfully walks deep trees, filters > 1 MB, skips ignored directories, and calculates quick hashes.
-- [x] **Mock data compatibility**: Next.js dashboard compiles and launches in standalone local mode with high-fidelity seed data if Convex is offline.
+- [x] **Live data states**: Dashboard lists use the connected workspace's data, including real empty states while no drives or projects are tracked.
+
+### Regression checks
+
+Run `npm test` for classification, Windows file protection, non-overwriting file moves, cross-volume copy verification, and strict archive-inventory tests.
+
+Run `npm run test:local` against a disposable, auth-configured local Convex backend on ports 3210/3211. It creates an isolated QA workspace and synthetic media, then exercises scans, settings, bulk cleanup, restore, duplicate keep-copy protection, project setup, and archive generation/verification. The test refuses hosted backend URLs and leaves its fixture and logs for inspection. Override `DRIVEOS_TEST_URL`, `DRIVEOS_TEST_SITE_URL`, or `DRIVEOS_TEST_DIRECTORY` when needed. A configured local email sender is unnecessary.
+
+Dashboard file operations are queued for the connected machine. Run the local agent's `sync` or `run-jobs` command to process them. Manual duplicate/cleanup analysis has a five-minute cooldown and a default 250,000-file bound (`DRIVEOS_MANUAL_ANALYSIS_MAX_FILES`, maximum 1,000,000); automatic full-catalog analysis remains disabled unless explicitly configured. Cloud account linking, custom templates/classification, and notification delivery are shown as unavailable instead of simulating success.

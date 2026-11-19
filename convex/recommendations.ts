@@ -2,6 +2,7 @@ import { v } from "convex/values";
 import { internalAction, internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { requireMember, inTenant } from "./access";
+import { protectedFile } from "./jobUtils";
 
 // Cleanup screen recommendations. Only "open" recommendations belong here — once
 // a recommendation has been acted on (a cleanup job was created/approved/run) it
@@ -63,15 +64,19 @@ function addToAggregate(agg: FileAggregate, fileId: string, sizeBytes: number) {
 // Generation runs per tenant (internal): page that tenant's catalog, reduce to
 // per-category/per-project aggregates, then write through one small mutation.
 export const generateRecommendations = internalAction({
-  args: { tenantId: v.string() },
+  args: { tenantId: v.string(), maxFiles: v.optional(v.number()) },
   handler: async (ctx, args): Promise<{ success: boolean; count: number }> => {
     const timestamp = Date.now();
+    const settings = await ctx.runQuery(internal.settings.forAnalysis, { tenantId: args.tenantId });
+    const allProjects: any[] = await ctx.runQuery(internal.recommendations.listProjectsForAnalysis, { tenantId: args.tenantId });
+    const projectRules = new Map(allProjects.map(p => [String(p._id), p.cleanupRules]));
 
     const cache = newAggregate();
     const proxiesByProject = new Map<string, FileAggregate>();
     const filesByProject = new Map<string, FileAggregate>();
     const localFinalsByProject = new Map<string, FileAggregate>();
     const cloudFinalCountByProject = new Map<string, number>();
+    const liveFiles = new Map<string, any>();
 
     const byProject = (map: Map<string, FileAggregate>, projectId: string) => {
       let agg = map.get(projectId);
@@ -83,21 +88,26 @@ export const generateRecommendations = internalAction({
     };
 
     let cursor: string | null = null;
+    let filesRead = 0;
     while (true) {
       const page: any = await ctx.runQuery(internal.files.pageForAnalysis, {
         tenantId: args.tenantId,
         cursor,
         numItems: 1000,
       });
+      filesRead += page.files.length;
+      if (args.maxFiles !== undefined && filesRead > args.maxFiles) throw new Error(`Catalog exceeds the explicit analysis limit of ${args.maxFiles} files. No partial recommendations were published.`);
       for (const f of page.files) {
         if (f.deletedAt) continue;
+        liveFiles.set(String(f._id), f);
 
-        if (f.classification === "CACHE" || f.classification === "RENDER_PREVIEW") {
+        const rules = projectRules.get(String(f.projectId));
+        if (settings.cleanupRules.cacheDelete && rules?.cacheDelete !== false && !protectedFile(f) && (f.classification === "CACHE" || f.classification === "RENDER_PREVIEW")) {
           addToAggregate(cache, f._id, f.sizeBytes);
         }
         if (f.projectId) {
           addToAggregate(byProject(filesByProject, f.projectId), f._id, f.sizeBytes);
-          if (f.classification === "PROXY") {
+          if (settings.cleanupRules.proxyDelete && rules?.proxyDelete !== false && !protectedFile(f) && f.classification === "PROXY") {
             addToAggregate(byProject(proxiesByProject, f.projectId), f._id, f.sizeBytes);
           }
           if (f.classification === "EXPORT_FINAL") {
@@ -113,9 +123,6 @@ export const generateRecommendations = internalAction({
       cursor = page.continueCursor;
     }
 
-    const allProjects: any[] = await ctx.runQuery(internal.recommendations.listProjectsForAnalysis, {
-      tenantId: args.tenantId,
-    });
     const openExactClusters: any[] = await ctx.runQuery(internal.recommendations.listOpenExactClusters, {
       tenantId: args.tenantId,
     });
@@ -154,7 +161,7 @@ export const generateRecommendations = internalAction({
       recommendations.push({
         type: "delete_proxies",
         title: "Proxies of delivered projects",
-        explanation: `Generated proxy files for projects already completed and delivered. The camera RAW footage remains safely indexed and archived, so these temporary edit proxies are no longer needed. Clears ${(deliveredProxy.totalBytes / (1024 ** 3)).toFixed(1)} GB.`,
+        explanation: `Generated proxy files for delivered projects. Verify that originals remain available before removing proxies; no archive or cloud backup is implied. Selected catalog files total ${(deliveredProxy.totalBytes / (1024 ** 3)).toFixed(1)} GB.`,
         affectedFileIds: deliveredProxy.fileIds,
         affectedBytes: deliveredProxy.totalBytes,
         riskLevel: "green",
@@ -164,12 +171,20 @@ export const generateRecommendations = internalAction({
 
     // C) Recommendation: Remove Exact Duplicates (Safe/Review)
     if (openExactClusters.length > 0) {
-      const totalWastedBytes = openExactClusters.reduce((acc, c) => acc + c.wastedBytes, 0);
+      let totalWastedBytes = 0;
       const duplicateFileIds: string[] = [];
+      const selectedIds = new Set<string>();
       for (const cluster of openExactClusters) {
         const keepId = cluster.recommendedKeepFileId;
+        const keep = liveFiles.get(keepId);
+        if (!keep || !keep.fullHash || keep.fullHash !== cluster.hashKey) continue;
         for (const id of cluster.fileIds) {
-          if (id !== keepId && duplicateFileIds.length < MAX_REC_FILE_IDS) duplicateFileIds.push(id);
+          const file = liveFiles.get(id);
+          if (id !== keepId && file?.source === "local" && !protectedFile(file) && !selectedIds.has(id) && duplicateFileIds.length < MAX_REC_FILE_IDS) {
+            duplicateFileIds.push(id);
+            selectedIds.add(id);
+            totalWastedBytes += file.sizeBytes;
+          }
         }
       }
 
@@ -177,7 +192,7 @@ export const generateRecommendations = internalAction({
         recommendations.push({
           type: "remove_duplicate",
           title: "Remove exact duplicate media files",
-          explanation: `Identical video clips and raw files copied multiple times across projects and drives. Deleting redundant copies and keeping the reference master will safely recover ${(totalWastedBytes / (1024 ** 4)).toFixed(2)} TB.`,
+          explanation: `Selected non-protected files match separate catalog copies by full checksum. Keep the reference copies available; this does not verify an archive or cloud backup. Selected files total ${(totalWastedBytes / (1024 ** 4)).toFixed(2)} TB.`,
           affectedFileIds: duplicateFileIds,
           affectedBytes: totalWastedBytes,
           riskLevel: "green",

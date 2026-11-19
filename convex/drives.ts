@@ -1,7 +1,8 @@
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { internalMutation, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
-import { requireMember, inTenant } from "./access";
+import { requireMember, requireRole, inTenant } from "./access";
+import { insertApprovedJob } from "./jobUtils";
 
 // Max file rows deleted per transaction when removing a drive's catalog. Convex
 // caps reads/writes per mutation (~a few thousand); a drive can hold millions of
@@ -16,6 +17,33 @@ export const list = query({
       .query("drives")
       .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
       .collect();
+  },
+});
+
+export const requestScan = mutation({
+  args: { driveId: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const member = await requireRole(ctx, ["admin", "producer", "editor", "assistant_editor"]);
+    const all = await ctx.db.query("drives").withIndex("by_tenant", q => q.eq("tenantId", member.tenantId)).collect();
+    const drives = args.driveId ? all.filter(d => String(d._id) === args.driveId) : all;
+    if (args.driveId && !drives.length) throw new ConvexError("Unknown drive.");
+    const active = await ctx.db.query("cleanupJobs").withIndex("by_tenant", q => q.eq("tenantId", member.tenantId)).order("desc").take(200);
+    const jobIds = [];
+    for (const drive of drives) {
+      if (!drive.machineId || drive.tier === "cloud") continue;
+      const mid = ctx.db.normalizeId("machines", drive.machineId);
+      const machine = mid ? inTenant(await ctx.db.get(mid), member.tenantId) : null;
+      if (!machine) continue;
+      const existing = active.find(j => j.action === "scan" && j.result?.driveId === String(drive._id) && ["approved", "queued", "running"].includes(j.status));
+      if (existing) continue;
+      jobIds.push(await insertApprovedJob(ctx, {
+        tenantId: member.tenantId, machineId: String(machine._id), requestedBy: member.email,
+        action: "scan", result: { rootPath: drive.mountPath, driveId: String(drive._id) },
+      }));
+    }
+    if (!jobIds.length && !active.some(j => j.action === "scan" && ["approved", "queued", "running"].includes(j.status)))
+      throw new ConvexError("No connected local drive can receive a scan. Add a drive in the local agent first.");
+    return { queued: jobIds.length, jobIds };
   },
 });
 

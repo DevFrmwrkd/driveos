@@ -4,7 +4,7 @@ import React, { useState, useEffect, useRef, useCallback, Fragment } from "react
 import { DB } from "@/data";
 import { Icon } from "@/components/icons";
 import { Avatar, useToast } from "@/components/components";
-import { useQuery, Authenticated, Unauthenticated, AuthLoading } from "convex/react";
+import { useQuery, useMutation, Authenticated, Unauthenticated, AuthLoading } from "convex/react";
 import { useAuthActions } from "@convex-dev/auth/react";
 import { api } from "@/convexApi";
 import { LoginScreen } from "@/screens/screens-login";
@@ -27,14 +27,14 @@ const NAV = [
     { id: "dashboard", label: "Dashboard", icon: "dashboard" },
   ]},
   { group: "Storage", items: [
-    { id: "drives", label: "Drives", icon: "hdd", badge: { text: "1", kind: "warn" } },
+    { id: "drives", label: "Drives", icon: "hdd" },
     { id: "projects", label: "Projects", icon: "folder" },
     { id: "cloud", label: "Cloud", icon: "cloud" },
     { id: "archive", label: "Archive", icon: "archive" },
   ]},
   { group: "Maintenance", items: [
     { id: "duplicates", label: "Duplicates", icon: "copy" },
-    { id: "cleanup", label: "Cleanup", icon: "broom", badge: { text: "8.6 TB", kind: "" } },
+    { id: "cleanup", label: "Cleanup", icon: "broom" },
     { id: "quarantine", label: "Quarantine", icon: "shield" },
   ]},
   { group: "System", items: [
@@ -62,7 +62,7 @@ const SCREEN_IDS = new Set([
   "wizard",
   "download",
 ]);
-const DEFAULT_OWNER = "founder";
+const DEFAULT_OWNER = "";
 
 function routeFromHash(hash: string) {
   const raw = hash.replace(/^#/, "").trim();
@@ -110,6 +110,11 @@ function recommendationCategory(type?: string) {
     review_exports: "Review exports",
     archive_abandoned: "Abandoned copies",
     delete_duplicate_downloads: "Duplicate downloads",
+    delete_duplicates: "Duplicates",
+    remove_duplicate: "Duplicates",
+    move_to_warm: "Storage move",
+    archive_project: "Archive",
+    copy_to_cloud: "Backup",
   };
   return map[type || ""] || "Unknown";
 }
@@ -123,9 +128,11 @@ interface SidebarProps {
   route: { screen: string; params: any };
   go: (screen: string, params?: any) => void;
   tenantName?: string;
+  onlineAgents: number;
+  lastSync: string;
 }
 
-function Sidebar({ route, go, tenantName }: SidebarProps) {
+function Sidebar({ route, go, tenantName, onlineAgents, lastSync }: SidebarProps) {
   const active = ROUTE_NAV[route.screen] || route.screen;
   return (
     <div className="sidebar">
@@ -152,7 +159,8 @@ function Sidebar({ route, go, tenantName }: SidebarProps) {
               >
                 <Icon name={it.icon} size={17} />
                 <span>{it.label}</span>
-                {it.badge && <span className={`nav-badge ${it.badge.kind}`}>{it.badge.text}</span>}
+                {it.id === "drives" && DB.drives.some((d) => d.status === "offline") ? <span className="nav-badge warn">{DB.drives.filter((d) => d.status === "offline").length}</span> : null}
+                {it.id === "cleanup" && DB.cleanup.length > 0 ? <span className="nav-badge">{DB.cleanup.length}</span> : null}
               </div>
             ))}
           </div>
@@ -160,11 +168,11 @@ function Sidebar({ route, go, tenantName }: SidebarProps) {
       </div>
       <div className="sidebar-foot">
         <div className="agent-chip">
-          <span className="agent-dot pulse" />
+          <span className={"agent-dot" + (onlineAgents ? " pulse" : "")} style={{ background: onlineAgents ? "var(--ok)" : "var(--tx-dim)" }} />
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: 12, fontWeight: 600, color: "var(--tx-hi)" }}>5 agents online</div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: "var(--tx-hi)" }}>{onlineAgents} agent{onlineAgents === 1 ? "" : "s"} online</div>
             <div style={{ fontSize: 10.5, color: "var(--tx-dim)", fontFamily: "var(--font-mono)" }}>
-              Last sync · just now
+              Last sync · {lastSync}
             </div>
           </div>
           <Icon name="activity" size={14} style={{ color: "var(--ok)" }} />
@@ -177,9 +185,12 @@ function Sidebar({ route, go, tenantName }: SidebarProps) {
 interface TopBarProps {
   go: (screen: string, params?: any) => void;
   route: { screen: string; params: any };
+  requestScan: (driveId?: string) => Promise<void>;
+  busy: boolean;
+  memberId?: string;
 }
 
-function TopBar({ go, route }: TopBarProps) {
+function TopBar({ go, route, requestScan, busy, memberId }: TopBarProps) {
   const crumbs = useCrumbs(route);
   const { signOut } = useAuthActions();
   return (
@@ -209,14 +220,14 @@ function TopBar({ go, route }: TopBarProps) {
         <span className="kbd">⌘K</span>
       </div>
       <div className="topbar-actions">
-        <button className="btn ghost icon" title="Notifications">
+        <button className="btn ghost icon" title="Notifications" onClick={() => go("settings")}>
           <Icon name="bell" size={17} />
         </button>
-        <button className="btn ghost icon" title="Refresh all agents">
+        <button className="btn ghost icon" title="Request scans from all agents" disabled={busy || DB.drives.length === 0} onClick={() => void requestScan()}>
           <Icon name="refresh" size={16} />
         </button>
         <div style={{ width: 1, height: 22, background: "var(--line)" }} />
-        <Avatar id="founder" size={30} />
+        <Avatar id={memberId} size={30} />
         <button className="btn ghost icon" title="Sign out" onClick={() => void signOut()}>
           <Icon name="external" size={16} />
         </button>
@@ -317,178 +328,109 @@ function Workspace() {
   const convexContext = useQuery(api.tenants.currentContext);
   const tenantName = convexContext?.tenant?.name;
 
-  // Sync back to our local DB data layer reactively!
-  // Real team members from Convex replace the mock team list everywhere.
-  if (convexTeam && convexTeam.length > 0) {
-    const palette = ["#9aa9c8", "#8fb0a0", "#c8a98f", "#a98fc8", "#c88f9a", "#8fc8c0"];
-    (DB as any).team = convexTeam.map((m: any, i: number) => {
-      const name = m.name || m.email || "Member";
-      const initials = name.split(/\s+/).map((w: string) => w[0]).join("").slice(0, 2).toUpperCase();
-      return {
-        id: m.email,            // use email as the stable id (matches drive ownerId)
-        name,
-        email: m.email,
-        role: m.role || "editor",
-        initials,
-        color: palette[i % palette.length],
-        location: m.location || "",
-        usedTB: 0,
-        drives: 0,
-      };
-    });
-    (DB as any).teamById = Object.fromEntries((DB as any).team.map((m: any) => [m.id, m]));
-  }
-  if (convexDrives && convexDrives.length > 0) {
-    (DB as any).drives = convexDrives.map((d: any) => ({
-      ...d,
-      id: d._id,
-      name: d.label,
-      owner: resolveOwnerId(d),
-      // Drive location comes from the backend (inherited from its machine);
-      // only show "Unknown location" when nothing has been set yet.
-      location: d.location || "Unknown location",
-      status: d.status || "online",
-      tier: d.tier || "hot",
-      bus: d.bus || d.filesystem || "Local volume",
-      model: d.model || d.mountPath || "Tracked drive",
-      capTB: (d.capacityBytes || 0) / (1024 ** 4),
-      usedTB: (d.usedBytes || 0) / (1024 ** 4),
-      projects: Array.isArray(d.projects) ? d.projects : [],
-      dupTB: d.dupTB || 0,
-      cleanTB: d.cleanTB || 0,
-      scans: d.scans || 0,
-      lastSeen: "Just now",
-      risk: d.risk || resolveRisk(d.usedBytes, d.capacityBytes),
-    }));
-    (DB as any).driveById = Object.fromEntries((DB as any).drives.map((d: any) => [d.id, d]));
-  }
-  if (convexProjects && convexProjects.length > 0) {
-    (DB as any).projects = convexProjects.map((p: any) => ({
-      ...p,
-      id: p._id,
-      owner: resolveOwnerId(p),
-      status: resolveProjectStatus(p.status),
-      tier: p.tier || "hot",
-      show: p.showName || p.episode || p.template || "Tracked project",
-      template: p.template || "YouTube Show",
-      client: p.client || "Studio",
-      sizeTB: (p.totalBytes || 0) / (1024 ** 4),
-      dupTB: (p.duplicateBytes || 0) / (1024 ** 4),
-      cleanTB: (p.safeCleanupBytes || 0) / (1024 ** 4),
-      modified: "Just now",
-      structure: p.storageHealthScore || 100,
-      archiveReady: p.status === "archived" ? 100 : p.status === "ready_to_archive" || p.status === "ready" ? 80 : 30,
-      locations: Array.isArray(p.locations) && p.locations.length > 0 ? p.locations : [],
-    }));
-    (DB as any).projectById = Object.fromEntries((DB as any).projects.map((p: any) => [p.id, p]));
-  }
-  // Unlike the other sections, an empty live list is meaningful here (all
-  // clusters ignored/resolved/pruned) — never fall back to the mock demo data
-  // once Convex has answered, or "ghost" duplicates appear after cleanup.
-  if (convexDuplicates) {
-    (DB as any).duplicates = convexDuplicates.map((d: any) => ({
-      ...d,
-      id: d._id,
-      name: d.name || duplicateName(d),
-      type: d.fileType || "unknown",
-      // Per-copy size: the UI multiplies by copy count for totals (matches mock-data semantics).
-      sizeGB: (d.totalBytes || 0) / (d.fileCount || d.fileIds?.length || 1) / (1024 ** 3),
-      recoverGB: (d.wastedBytes || 0) / (1024 ** 3),
-      copies: d.fileCount || d.fileIds?.length || 0,
-      kind: d.type,
-      risk: resolveDuplicateRisk(d.riskLevel),
-      project: d.projectIds?.[0] || "—",
-      owner: DEFAULT_OWNER,
-      modified: "Just now",
-      fingerprint: d.hashKey || "",
-      locations: Array.isArray(d.locations) ? d.locations : [],
-      rec: d.explanation,
-    }));
-  }
-  // Once Convex has answered, its recommendations are authoritative — even when
-  // the answer is an empty list. Gating on length>0 (the old bug) let the mock
-  // demo cards (c1–c8 in data.ts, with NO real affectedFileIds) survive whenever
-  // there were no open recommendations, so a user would "delete" a demo card,
-  // the job would carry zero files, nothing happened on disk, and it reappeared.
-  // Mirror the duplicates block above: real data replaces mock the moment the
-  // query resolves, so the Cleanup page can never show undeletable demo cards.
-  if (convexRecommendations) {
-    // Defensive mirror of the backend filter: never show a recommendation whose
-    // cleanup job has already been created/approved/run, so a quarantined file
-    // doesn't reappear on the Cleanup page before the backend redeploys.
-    const HIDDEN_REC_STATUSES = ["approved", "completed", "dismissed", "ignored", "quarantined"];
-    (DB as any).cleanup = convexRecommendations
-      .filter((r: any) => !HIDDEN_REC_STATUSES.includes(r.status))
-      .map((r: any) => ({
-      ...r,
-      id: r._id,
-      cat: recommendationCategory(r.type),
-      risk: resolveRecommendationRisk(r.riskLevel),
-      approval: r.riskLevel === "yellow" || r.riskLevel === "red",
-      recoverTB: (r.affectedBytes || 0) / (1024 ** 4),
-      files: r.affectedFileIds?.length || 0,
-      // raw fields kept for mutations (createJob needs affectedFileIds/affectedBytes)
-      affectedFileIds: r.affectedFileIds || [],
-      affectedBytes: r.affectedBytes || 0,
-      projects: Array.isArray(r.affectedProjectIds) && r.affectedProjectIds.length > 0 ? r.affectedProjectIds : ["—"],
-      why: r.explanation,
-      action: r.title,
-    }));
-  }
-  if (convexQuarantine && convexQuarantine.length > 0) {
-    (DB as any).quarantine = convexQuarantine.map((q: any) => ({
-      ...q,
-      id: q._id,
-      name: q.originalPath.split('/').pop() || "",
-      origin: q.originalPath,
-      qpath: q.quarantinePath,
-      reason: "Quarantined via recommendation",
-      by: "DriveOS Agent",
-      date: "Just now",
-      deadline: "30 days",
-      sizeGB: q.sizeBytes / (1024 ** 3),
-      verified: true,
-    }));
-  }
-  if (convexAudit && convexAudit.length > 0) {
-    (DB as any).audit = convexAudit.map((a: any) => ({
-      time: new Date(a.createdAt).toLocaleTimeString(),
-      date: new Date(a.createdAt).toLocaleDateString(),
-      who: a.actorId || "System",
-      action: a.message,
-      kind: a.action,
-    }));
-  }
-  if (convexFiles) {
-    (DB as any).files = convexFiles.map((f: any) => ({
-      ...f,
-      id: f._id,
-      name: f.name,
-      path: f.path,
-      sizeGB: (f.sizeBytes || 0) / (1024 ** 3),
-      sizeBytes: f.sizeBytes || 0,
-      type: f.classification || "UNKNOWN",
-      risk: resolveDuplicateRisk(f.riskLevel),
-      driveId: f.driveId,
-      projectId: f.projectId,
-      modified: f.modifiedAtFile ? new Date(f.modifiedAtFile).toLocaleDateString() : "—",
-    }));
-  }
-  if (convexScans) {
-    (DB as any).scans = convexScans.map((s: any) => ({
-      ...s,
-      id: s._id,
-      rootPath: s.rootPath,
-      status: s.status,
-      files: s.filesScanned || 0,
-      bytes: s.bytesScanned || 0,
-      sizeTB: (s.bytesScanned || 0) / (1024 ** 4),
-      errors: s.errorsCount || 0,
-      startedAt: s.startedAt,
-      completedAt: s.completedAt,
-      when: s.startedAt ? new Date(s.startedAt).toLocaleString() : "—",
-    }));
-  }
+  const convexMachines = useQuery(api.drives.listMachines);
+  const convexCloud = useQuery(api.cloud.listConnections);
+  const convexJobs = useQuery(api.cleanup.listJobs);
+  const queueScan = useMutation(api.drives.requestScan);
+  const queueAnalysis = useMutation(api.scans.requestAnalysis);
+  const [actionBusy, setActionBusy] = useState(false);
+
+  // Always replace live collections, including while loading and on empty
+  // responses. A different account must never inherit the previous workspace.
+  const palette = ["#9aa9c8", "#8fb0a0", "#c8a98f", "#a98fc8", "#c88f9a", "#8fc8c0"];
+  DB.team = (convexTeam || []).map((m: any, i: number) => ({
+    ...m, id: m.email, name: m.name || m.email || "Member", role: m.role || "editor",
+    initials: (m.name || m.email || "?").split(/\s+/).map((w: string) => w[0]).join("").slice(0, 2).toUpperCase(),
+    color: palette[i % palette.length], location: m.location || "", usedTB: 0, drives: 0,
+  }));
+  DB.teamById = Object.fromEntries(DB.team.map((m) => [m.id, m]));
+  DB.files = (convexFiles || []).filter((f: any) => !f.deletedAt).map((f: any) => ({
+    ...f, id: f._id, sizeGB: (f.sizeBytes || 0) / 1024 ** 3,
+    type: f.classification || "UNKNOWN", risk: resolveDuplicateRisk(f.riskLevel),
+    modified: f.modifiedAtFile ? new Date(f.modifiedAtFile).toLocaleString() : "Unknown",
+  }));
+  DB.drives = (convexDrives || []).map((d: any) => ({
+    ...d, id: d._id, name: d.label, owner: resolveOwnerId(d),
+    location: d.location || "Unknown location", status: d.status || "unknown", tier: d.tier || "unknown",
+    bus: d.filesystem || "Local volume", model: d.mountPath || "Tracked drive",
+    capTB: (d.capacityBytes || 0) / 1024 ** 4, usedTB: (d.usedBytes || 0) / 1024 ** 4,
+    projects: [...new Set([...DB.files.filter((f) => f.driveId === d._id && f.projectId).map((f) => f.projectId), ...(convexProjects || []).filter((p: any) => p.driveId === d._id).map((p: any) => p._id)])],
+    dupTB: d.dupTB || 0, cleanTB: d.cleanTB || 0, scans: d.scans || 0,
+    lastSeen: d.lastSeenAt ? new Date(d.lastSeenAt).toLocaleString() : "Never",
+    risk: resolveRisk(d.usedBytes, d.capacityBytes),
+  }));
+  DB.driveById = Object.fromEntries(DB.drives.map((d) => [d.id, d]));
+  DB.projects = (convexProjects || []).map((p: any) => ({
+    ...p, id: p._id, owner: resolveOwnerId(p), status: resolveProjectStatus(p.status),
+    tier: p.tier || "unknown", show: p.showName || p.episode || "", template: p.template || "Standard studio",
+    client: p.client || "", sizeTB: (p.totalBytes || 0) / 1024 ** 4,
+    dupTB: (p.duplicateBytes || 0) / 1024 ** 4, cleanTB: (p.safeCleanupBytes || 0) / 1024 ** 4,
+    modified: p.createdAt ? new Date(p.createdAt).toLocaleString() : "Unknown",
+    structure: null, archiveReady: null,
+    locations: [...new Set([...(p.driveId ? [p.driveId] : []), ...DB.files.filter((f) => f.projectId === p._id && f.driveId).map((f) => f.driveId)])],
+  }));
+  DB.projectById = Object.fromEntries(DB.projects.map((p) => [p.id, p]));
+  DB.duplicates = (convexDuplicates || []).map((d: any) => ({
+    ...d, id: d._id, name: d.name || duplicateName(d), type: d.fileType || "unknown",
+    sizeGB: (d.totalBytes || 0) / (d.fileCount || d.fileIds?.length || 1) / 1024 ** 3,
+    recoverGB: (d.wastedBytes || 0) / 1024 ** 3, copies: d.fileCount || d.fileIds?.length || 0,
+    kind: d.type, risk: resolveDuplicateRisk(d.riskLevel), project: d.projectIds?.[0] || "—",
+    owner: "", modified: d.updatedAt ? new Date(d.updatedAt).toLocaleString() : "Unknown",
+    fingerprint: d.hashKey || "", locations: d.locations || [], rec: d.explanation,
+  }));
+  const hiddenStatuses = new Set(["approved", "completed", "dismissed", "ignored", "quarantined"]);
+  DB.cleanup = (convexRecommendations || []).filter((r: any) => !hiddenStatuses.has(r.status)).map((r: any) => ({
+    ...r, id: r._id, cat: recommendationCategory(r.type), risk: resolveRecommendationRisk(r.riskLevel),
+    approval: r.riskLevel === "yellow" || r.riskLevel === "red", recoverTB: (r.affectedBytes || 0) / 1024 ** 4,
+    files: r.affectedFileIds?.length || 0, affectedFileIds: r.affectedFileIds || [], affectedBytes: r.affectedBytes || 0,
+    projects: r.projectId ? [r.projectId] : ["—"], why: r.explanation, action: r.title,
+  }));
+  DB.quarantine = (convexQuarantine || []).filter((q: any) => ["quarantined", "pending_restore", "pending_purge"].includes(q.status)).map((q: any) => ({
+    ...q, id: q._id, name: q.originalPath.replace(/\\/g, "/").split("/").pop() || q.originalPath,
+    origin: q.originalPath, qpath: q.quarantinePath, reason: "Quarantined by approved job", by: "DriveOS Agent",
+    date: new Date(q.movedAt).toLocaleString(), deadline: new Date(q.rollbackUntil).toLocaleString(),
+    sizeGB: q.sizeBytes / 1024 ** 3, verified: false,
+  }));
+  DB.audit = (convexAudit || []).map((a: any) => ({
+    id: a._id, time: new Date(a.createdAt).toLocaleTimeString(), date: new Date(a.createdAt).toLocaleDateString(),
+    who: a.actorId || "System", action: a.message, kind: a.action,
+  }));
+  DB.scans = (convexScans || []).map((scan: any) => ({
+    ...scan, id: scan._id, files: scan.filesScanned || 0, bytes: scan.bytesScanned || 0,
+    sizeTB: (scan.bytesScanned || 0) / 1024 ** 4, errors: scan.errorsCount || 0,
+    when: scan.startedAt ? new Date(scan.startedAt).toLocaleString() : "Unknown",
+  }));
+  DB.machines = convexMachines || [];
+  DB.jobs = convexJobs || [];
+  DB.cloudConnections = (convexCloud || []).map((c: any) => ({
+    ...c, account: c.accountEmail, usedBytes: c.quotaBytesUsed, capacityBytes: c.quotaBytesTotal,
+  }));
+  DB.tiers = DB.tiers.map((tier) => ({ ...tier,
+    usedTB: DB.drives.filter((d) => d.tier === tier.key).reduce((sum, d) => sum + d.usedTB, 0),
+    capTB: DB.drives.filter((d) => d.tier === tier.key).reduce((sum, d) => sum + d.capTB, 0),
+  }));
+  const dataLoading = [convexDrives, convexProjects, convexDuplicates, convexRecommendations,
+    convexQuarantine, convexAudit, convexFiles, convexScans, convexTeam, convexMachines, convexCloud, convexJobs].some((value) => value === undefined);
+  const onlineAgents = DB.machines.filter((m) => m.status === "online").length;
+  const latestSync = DB.scans.reduce((latest, scan) => Math.max(latest, scan.completedAt || 0), 0);
+  const lastSync = latestSync ? new Date(latestSync).toLocaleString() : "Never";
+
+  const requestScan = useCallback(async (driveId?: string) => {
+    setActionBusy(true);
+    try {
+      const result = await queueScan(driveId ? { driveId } : {});
+      push(result.queued ? "Queued " + result.queued + " scan request(s). Connected agents run them on their next poll." : "No tracked drives are available for scanning.", "refresh", result.queued ? "ok" : "warn");
+    } catch (error: any) { push(error?.data || error?.message || "Could not request a scan", "alert", "risk"); }
+    finally { setActionBusy(false); }
+  }, [queueScan, push]);
+  const requestAnalysis = useCallback(async () => {
+    setActionBusy(true);
+    try {
+      const result = await queueAnalysis({});
+      push(result.message || (result.scheduled ? "Analysis queued" : "Analysis is already queued"), "cpu", "ok");
+    } catch (error: any) { push(error?.data || error?.message || "Could not request analysis", "alert", "risk"); }
+    finally { setActionBusy(false); }
+  }, [queueAnalysis, push]);
 
   const go = useCallback((screen: string, params = {}) => {
     setRoute({ screen, params });
@@ -539,16 +481,16 @@ function Workspace() {
   };
 
   const Screen = SCREENS[route.screen];
-  const props = { go, toast: push, route, params: route.params };
+  const props = { go, toast: push, route, params: route.params, requestScan, requestAnalysis, actionBusy };
 
   return (
     <div className={"app" + (dense ? " dense" : "")}>
-      <Sidebar route={route} go={go} tenantName={tenantName} />
+      <Sidebar route={route} go={go} tenantName={tenantName} onlineAgents={onlineAgents} lastSync={lastSync} />
       <div className="main">
-        <TopBar go={go} route={route} />
+        <TopBar go={go} route={route} requestScan={requestScan} busy={actionBusy} memberId={convexContext?.member?.email} />
         <div className="page" ref={pageRef}>
           <div key={route.screen + (route.params.id || "")} className="fade-up">
-            {Screen ? <Screen {...props} /> : <Placeholder title={route.screen} />}
+            {dataLoading ? <div className="page-inner"><div className="card card-pad muted" role="status">Loading workspace…</div></div> : Screen ? <Screen {...props} /> : <Placeholder title={route.screen} />}
           </div>
         </div>
       </div>
