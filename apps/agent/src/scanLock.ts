@@ -11,6 +11,8 @@ interface LockRecord {
   at?: number;
   host?: string;
   port?: number;
+  transport?: "pipe";
+  pipeName?: string;
 }
 
 interface ProcessLockOptions {
@@ -48,12 +50,12 @@ function closeServer(server: net.Server): Promise<void> {
 /**
  * An OS-held mutex shared by agent processes using the same absolute lock path.
  *
- * Exclusive loopback binding avoids the check/unlink race of reclaiming a dead
- * owner's filesystem lock. The OS releases the binding on process termination,
- * so neither age-based takeover nor a potentially reused PID is needed. Hash
- * collisions (or unrelated listeners on that port) fail closed: they can delay
- * work, but cannot permit two owners. The JSON file is diagnostic metadata and
- * a compatibility guard for older agents, rather than the mutex itself.
+ * Windows uses a named pipe, avoiding reserved/occupied ephemeral TCP ports.
+ * Node/libuv creates its first listening pipe with FILE_FLAG_FIRST_PIPE_INSTANCE
+ * (deps/uv/src/win/pipe.c: uv_pipe_bind2), so independent servers cannot own it
+ * concurrently. The OS removes the pipe on owner exit; no stale-path unlink or
+ * age/PID-based takeover is required. Other platforms keep the loopback mutex.
+ * JSON remains diagnostic metadata and a guard for older agent versions.
  */
 export class ProcessLock {
   readonly lockPath: string;
@@ -78,21 +80,31 @@ export class ProcessLock {
       if (process.platform === "win32") canonicalPath = canonicalPath.toLowerCase();
       const digest = crypto.createHash("sha256").update(canonicalPath).digest();
       const port = 49152 + digest.readUInt16BE(0) % 16384;
+      const pipeName = `\\\\.\\pipe\\driveos-lock-${digest.toString("hex")}`;
+      const usePipe = process.platform === "win32";
       server = net.createServer(socket => socket.destroy());
       const listening = await new Promise<boolean>((resolve, reject) => {
         server!.once("error", (error: NodeJS.ErrnoException) => {
           if (error.code === "EADDRINUSE" || error.code === "EACCES") {
-            this.lastFailure = `DriveOS lock port ${HOST}:${port} is unavailable. Another agent may be working; if it is not, check for another local listener using this port.`;
+            this.lastFailure = usePipe
+              ? `DriveOS lock pipe ${pipeName} is unavailable. Another agent may be working; wait for it to finish before retrying.`
+              : `DriveOS lock port ${HOST}:${port} is unavailable. Another agent may be working; if it is not, check for another local listener using this port.`;
             resolve(false);
           } else reject(error);
         });
-        server!.listen({ host: HOST, port, exclusive: true }, () => resolve(true));
+        if (usePipe) server!.listen({ path: pipeName, exclusive: true }, () => resolve(true));
+        else server!.listen({ host: HOST, port, exclusive: true }, () => resolve(true));
       });
       if (!listening) return false;
 
       const previous = readRecord(this.lockPath);
-      const socketRecord = previous?.kind === KIND && previous.version === 2 && previous.host === HOST && previous.port === port;
-      if (this.options.honorLegacyOwner !== false && !socketRecord) {
+      const currentRecord = previous?.kind === KIND && (usePipe
+        ? previous.version === 3 && previous.transport === "pipe" && previous.pipeName === pipeName
+        : previous.version === 2 && previous.host === HOST && previous.port === port);
+      // An already-running TCP-lock agent does not own our new pipe. Honor its
+      // live PID even for job locks that do not use the older v1 scan guard.
+      const olderTcpRecord = usePipe && previous?.kind === KIND && previous.version === 2 && previous.host === HOST;
+      if (!currentRecord && (this.options.honorLegacyOwner !== false || olderTcpRecord)) {
         if (previous && Number.isSafeInteger(previous.pid) && previous.pid! > 0 && processMayBeAlive(previous.pid!)) {
           this.lastFailure = `An older agent process (${previous.pid}) still holds this lock. Wait for it to finish or stop that agent before retrying.`;
           await closeServer(server);
@@ -107,7 +119,8 @@ export class ProcessLock {
       }
 
       const token = crypto.randomUUID();
-      const record: LockRecord = { kind: KIND, version: 2, pid: process.pid, token, at: Date.now(), host: HOST, port };
+      const record: LockRecord = { kind: KIND, pid: process.pid, token, at: Date.now(),
+        ...(usePipe ? { version: 3, transport: "pipe", pipeName } : { version: 2, host: HOST, port }) };
       fs.writeFileSync(this.lockPath, JSON.stringify(record), { encoding: "utf8", mode: 0o600 });
       this.held = { server, token };
       this.lastFailure = undefined;
