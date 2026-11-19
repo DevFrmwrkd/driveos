@@ -97,7 +97,7 @@ function fixture() {
   function items(count, status = "quarantined") {
     return Array.from({ length: count }, (_, number) => add("quarantineItems", {
       tenantId, machineId, fileId: `files:${sequence + number + 10_000}`, quarantinePath: `/synthetic/quarantine/${sequence}-${number}`,
-      originalPath: `/synthetic/original/${number}`, sizeBytes: number + 1, rollbackUntil: Date.now() - 1000,
+      originalPath: `/synthetic/Cache/${number}.tmp`, sizeBytes: number + 1, rollbackUntil: Date.now() - 1000,
       cleanupJobId: "cleanupJobs:original-quarantine", movedAt: Date.now() - 2000, status,
     }));
   }

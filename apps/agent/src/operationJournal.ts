@@ -122,7 +122,7 @@ export class OperationJournal {
     return actual.size === op.size && actual.checksum === op.checksum && (!checkTime || actual.modifiedAt === op.modifiedAt);
   }
 
-  move(key: string, source: string, destination: string): void {
+  move(key: string, source: string, destination: string, beforeMutation?: () => void): void {
     const op = this.prepare(key, "move", source, destination);
     if (op.state === "done") {
       if (fs.existsSync(source)) throw new Error(`The original path was recreated after this move; preserve both copies for reconciliation: ${source}`);
@@ -133,17 +133,19 @@ export class OperationJournal {
       if (!this.matches(destination, op)) throw new Error(`Interrupted destination does not match the original; preserve both paths: ${destination}`);
       if (fs.existsSync(source)) {
         if (!this.matches(source, op, true)) throw new Error(`Original changed during interrupted move: ${source}`);
+        beforeMutation?.();
         fs.unlinkSync(source);
       }
     } else {
       if (!fs.existsSync(source) || !this.matches(source, op, true)) throw new Error(`Original is missing or changed during recovery: ${source}`);
+      beforeMutation?.();
       moveFileSafely(source, destination);
     }
     op.state = "done";
     this.persist();
   }
 
-  purge(key: string, source: string): number {
+  purge(key: string, source: string, beforeMutation?: () => void): number {
     const op = this.prepare(key, "purge", source);
     const present = sourcePresent(source);
     const currentParent = directoryIdentity(source);
@@ -162,6 +164,7 @@ export class OperationJournal {
         this.persist();
       }
       sameDirectory(op.purgeParent, directoryIdentity(source));
+      beforeMutation?.();
       fs.unlinkSync(source);
     } else sameDirectory(op.purgeParent, currentParent);
     // Only infer a completed unlink with durable intent and the same available

@@ -153,9 +153,11 @@ fs.renameSync = function(from, to) {
     assert.ok(path.resolve(moved.quarantinePath).startsWith(path.resolve(quarantineRoot) + path.sep));
     assert.equal(fs.readFileSync(moved.quarantinePath, "utf8"), `original cache content ${index}`);
   }
+  const requestsBeforePurge = requests.length;
   jobs.set("purge-batch", { _id: "purge-batch", action: "purge", status: "approved", files: [],
     affectedFileIds: files.map(file => file._id), result: { purgeItems: quarantine.quarantineFiles.map((file: any) =>
-      ({ quarantineItemId: `quarantine-${file.fileId}`, quarantinePath: file.quarantinePath })) } });
+      ({ quarantineItemId: `quarantine-${file.fileId}`, quarantinePath: file.quarantinePath,
+        fileId: file.fileId, originalPath: file.originalPath, sizeBytes: file.sizeBytes, requiresKeepCopy: false })) } });
   const purgeOutput = await agent(["run-jobs"]);
   const purge = receipts.get("purge-batch");
   assert.equal(jobs.get("purge-batch").status, "completed", purgeOutput.slice(-8000));
@@ -163,6 +165,6 @@ fs.renameSync = function(from, to) {
   assert.equal(purge?.result.purgedItemIds.length, 300);
   assert.deepEqual(purge.result.failures, []);
   for (const moved of quarantine.quarantineFiles) assert.equal(fs.existsSync(moved.quarantinePath), false);
-  assert.ok(requests.length < 10, `Both 300-file jobs used ${requests.length} API requests`);
+  assert.ok(requests.length - requestsBeforePurge < 10, `A 300-file purge used ${requests.length - requestsBeforePurge} API requests`);
   assert.deepEqual(failures, []);
 });

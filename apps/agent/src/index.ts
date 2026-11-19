@@ -14,6 +14,7 @@ import { walkManifestFiles } from "./manifestFiles.js";
 import { createProcessLock } from "./scanLock.js";
 import { OperationJournal } from "./operationJournal.js";
 import { JobLeaseClient, JobLeaseLostError, RateLimitedError, withRateLimitBackoff } from "./jobLeaseClient.js";
+import { isRegenerablePath, verifyKeepCopy, type KeepCopyProof } from "./keepCopy.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), "apps/web/.env.local") });
 dotenv.config({ path: path.resolve(process.cwd(), ".env.local") });
@@ -79,7 +80,7 @@ interface FileMetadata {
   isProjectFile: boolean;
 }
 
-const AGENT_VERSION = "1.2.0";
+const AGENT_VERSION = "1.2.1";
 const ONE_MB = 1024 * 1024;
 // Metadata for sub-megabyte generic files costs more than the records are
 // worth and cache trees can contain millions of them. This floor is enforced
@@ -658,7 +659,7 @@ async function renewJobLease(job: any) {
 async function reportJob(job: any, payload: any) {
   await withRateLimitBackoff(async () => {
     await renewJobLease(job);
-    const result = await syncToConvex("updateJobStatus", { ...payload, jobId: job._id, claimToken: job.claimToken });
+    const result = await syncToConvex("updateJobStatus", { ...payload, jobId: job._id, claimToken: job.claimToken, keepCopyProtocol: 1 });
     if (!result.claimed) throw new Error(`Job result was not accepted: ${result.reason || result.status}`);
   });
 }
@@ -686,6 +687,7 @@ async function executeQuarantineJob(job: any, config: DriveOSConfig, journal: Op
 
     console.log(`[Quarantine Execute] ${file.path} -> ${destination}`);
     try {
+      let keepStillCurrent: (() => void) | undefined;
       await renewJobLease(job);
       if (!journal.has(file._id)) {
         const current = fs.statSync(file.path);
@@ -699,8 +701,15 @@ async function executeQuarantineJob(job: any, config: DriveOSConfig, journal: Op
           }
         }
       }
+      // A database duplicate can have been deleted or edited since the scan.
+      // Reconcile already-moved journal receipts without demanding a keep copy
+      // which may have disappeared after that earlier physical operation.
+      if (!isRegenerablePath(file.path) && !(journal.has(file._id) && !fs.existsSync(file.path))) {
+        const proof: KeepCopyProof | undefined = job.result?.keepCopyProofs?.find((entry: KeepCopyProof) => entry.fileId === file._id);
+        keepStillCurrent = await verifyKeepCopy({ fileId: file._id, path: file.path, sizeBytes: file.sizeBytes, fullHash: file.fullHash }, proof, job.machineId);
+      }
       await renewJobLease(job);
-      journal.move(file._id, file.path, destination);
+      journal.move(file._id, file.path, destination, keepStillCurrent);
     } catch (err: any) {
       if (err instanceof RateLimitedError || err instanceof JobLeaseLostError) throw err;
       // Preserve a running job when a physical move may have succeeded but its
@@ -732,15 +741,23 @@ async function executeQuarantineJob(job: any, config: DriveOSConfig, journal: Op
 // Reports back exactly which items were removed, so a file that's already gone or
 // fails to delete simply isn't marked deleted (it stays recoverable in the UI).
 async function executePurgeJob(job: any, journal: OperationJournal) {
-  const purgeItems: { quarantineItemId: string; quarantinePath: string }[] = job.result?.purgeItems || [];
+  const purgeItems: { quarantineItemId: string; quarantinePath: string; fileId?: string; originalPath?: string;
+    sizeBytes?: number; fullHash?: string; requiresKeepCopy?: boolean; keepCopyProof?: KeepCopyProof }[] = job.result?.purgeItems || [];
   const purgedItemIds: string[] = [];
   const failures: { quarantineItemId: string; error: string }[] = [];
   let freedBytes = 0;
 
   for (const item of purgeItems) {
     try {
+      let keepStillCurrent: (() => void) | undefined;
       await renewJobLease(job);
-      freedBytes += journal.purge(item.quarantineItemId, item.quarantinePath);
+      if ((item.requiresKeepCopy || !isRegenerablePath(item.originalPath)) &&
+          !(journal.has(item.quarantineItemId) && !fs.existsSync(item.quarantinePath))) {
+        keepStillCurrent = await verifyKeepCopy({ fileId: item.fileId || "", path: item.quarantinePath,
+          sizeBytes: item.sizeBytes ?? -1, fullHash: item.fullHash }, item.keepCopyProof, job.machineId);
+      }
+      await renewJobLease(job);
+      freedBytes += journal.purge(item.quarantineItemId, item.quarantinePath, keepStillCurrent);
       console.log(`[Purge] Permanently deleted ${item.quarantinePath}`);
       purgedItemIds.push(item.quarantineItemId);
     } catch (err: any) {
@@ -828,13 +845,13 @@ async function executeJob(job: any, config: DriveOSConfig): Promise<boolean> {
   try {
     console.log(`[Agent Queue] Executing job ${job._id}: ${job.action}`);
     job.claimToken = crypto.randomUUID();
-    const claim = await withRateLimitBackoff(() => syncToConvex("updateJobStatus", { jobId: job._id, status: "running", claimToken: job.claimToken }));
+    const claim = await withRateLimitBackoff(() => syncToConvex("updateJobStatus", { jobId: job._id, status: "running", claimToken: job.claimToken, keepCopyProtocol: 1 }));
     if (claim.claimed !== true) {
       console.log(`[Agent Queue] Job ${job._id} was already claimed or completed — skipped.`);
       return false;
     }
     claimed = true;
-    job.leaseClient = new JobLeaseClient(() => syncToConvex("updateJobStatus", { jobId: job._id, status: "running", claimToken: job.claimToken }));
+    job.leaseClient = new JobLeaseClient(() => syncToConvex("updateJobStatus", { jobId: job._id, status: "running", claimToken: job.claimToken, keepCopyProtocol: 1 }));
     const journal = new OperationJournal(journalPath, scope);
     let renewing = false;
     heartbeat = setInterval(() => {
@@ -1916,7 +1933,7 @@ program
 // pause flag and never throws: a failed job is marked failed and the rest run.
 async function runPendingJobs(config: DriveOSConfig): Promise<number> {
   if (loadState().paused) return 0;
-  const jobs = await syncToConvex("pollPendingJobs", { machineId: config.machineName, leaseProtocol: 1 });
+  const jobs = await syncToConvex("pollPendingJobs", { machineId: config.machineName, leaseProtocol: 1, keepCopyProtocol: 1 });
   if ((jobs as any).offline || !Array.isArray(jobs) || jobs.length === 0) return 0;
 
   let executed = 0;
@@ -1949,7 +1966,7 @@ program
   .action(async (options) => {
     const config = loadConfig();
     validateRuntimeConfig(config);
-    const res = await syncToConvex("getJob", { jobId: options.jobId });
+    const res = await syncToConvex("getJob", { jobId: options.jobId, keepCopyProtocol: 1 });
     if (!res.job || res.offline) {
       console.error(`[Error] Job not found or Convex is offline: ${options.jobId}`);
       process.exit(1);
@@ -1965,10 +1982,10 @@ program
     const config = loadConfig();
     validateRuntimeConfig(config);
     const request = await syncToConvex("requestRestore", { quarantineId: options.quarantineId });
-    const response = await syncToConvex("getJob", { jobId: request.jobId });
+    const response = await syncToConvex("getJob", { jobId: request.jobId, keepCopyProtocol: 1 });
     if (!response.job) throw new Error("The restore job is unavailable on this machine.");
     await executeJob(response.job, config);
-    const final = await syncToConvex("getJob", { jobId: request.jobId });
+    const final = await syncToConvex("getJob", { jobId: request.jobId, keepCopyProtocol: 1 });
     if (final.job?.status === "failed") throw new Error(final.job.result?.error || "Restore failed; inspect the quarantined file before retrying.");
     if (final.job?.status !== "completed") throw new Error("The restore is still running in another agent. Retry after it finishes.");
   });

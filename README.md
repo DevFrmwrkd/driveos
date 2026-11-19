@@ -184,6 +184,10 @@ DriveOS checks file protection before cleanup and uses a relocation pipeline for
 4.  **Rollback Buffer**: Files remain in quarantine for a configurable period (default: 14 days). Restore queues an agent job, and only a confirmed physical move marks the file restored. An existing destination is never overwritten.
 5.  **Permanent Purge**: Eligible quarantined files can be permanently deleted by a purge job. Purged files cannot be restored through DriveOS; retention is not a backup.
 
+Non-generated duplicate cleanup requires a separate copy on the same machine. Agent 1.2.1 re-reads both files' SHA-256 checksums before quarantine and again before permanent purge; stale catalog metadata alone cannot authorize either action. Missing, edited, remote-machine, same-path, and hard-linked keep copies are rejected. Keep copies are reserved against other queued cleanup while their dependent jobs are active. Older agents cannot receive or claim these protected jobs. Existing non-generated quarantine items without a keep-copy proof require manual review before purge; generated cache/proxy cleanup is unchanged.
+
+Catalog entries for files deleted outside DriveOS can remain stale until deletion reconciliation is added. The physical keep-copy checks above therefore remain necessary even after a recent scan.
+
 ### Interrupted agent jobs
 
 Updated agents claim jobs with a two-minute lease and renew it at most once per twenty seconds while working. File checks share the same renewal, and throttled requests respect the server's retry delay. After an agent stops, an expired leased job can be reclaimed by an updated agent for the same machine. Claim tokens prevent a previous attempt from reporting completion after losing ownership. Scan and job execution locks are held by the operating system, so a live operation is not taken over merely because it runs for a long time.
