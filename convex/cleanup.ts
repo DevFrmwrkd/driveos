@@ -1,16 +1,18 @@
 import { ConvexError, v } from "convex/values";
 import { internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import { requireMember, requireRole, inTenant } from "./access";
-import { CLEANUP_RECOMMENDATION_TYPES, fileMachine, insertApprovedJob, protectedFile, quarantineMachine } from "./jobUtils";
+import { CLEANUP_RECOMMENDATION_TYPES, fileMachine, insertApprovedJob, MAX_JOB_FILES, protectedFile, quarantineMachine } from "./jobUtils";
 import { workspaceSettings } from "./settings";
 import { classifyFile } from "../packages/shared/src/index";
+import { decideJobLease, jobAvailableToAgent, withoutClaimToken } from "./jobLease";
 
 const EDITORS = ["admin", "producer", "editor", "assistant_editor"];
 const ACTIVE_QUARANTINE = new Set(["quarantined", "pending_restore", "pending_purge"]);
 
 export const listJobs = query({ args: {}, handler: async ctx => {
   const { tenantId } = await requireMember(ctx);
-  return ctx.db.query("cleanupJobs").withIndex("by_tenant", q => q.eq("tenantId", tenantId)).order("desc").take(200);
+  const jobs = await ctx.db.query("cleanupJobs").withIndex("by_tenant", q => q.eq("tenantId", tenantId)).order("desc").take(200);
+  return jobs.map(withoutClaimToken);
 }});
 
 export const listQuarantine = query({ args: {}, handler: async ctx => {
@@ -267,21 +269,27 @@ export const approveJob = mutation({ args: { jobId: v.string(), approvedBy: v.st
   if (job.status === "approved" || job.status === "queued") return;
   if (job.status !== "pending_approval" || !job.machineId) throw new ConvexError("This job cannot be approved. Create a new machine-targeted request.");
   if (job.action === "quarantine") await validatedFiles(ctx, member.tenantId, job.affectedFileIds);
-  await ctx.db.patch(job._id, { status: "approved", approvedBy: member.email, updatedAt: Date.now() });
+  await ctx.db.patch(job._id, { status: "approved", approvedBy: member.email, leaseRequired: true, updatedAt: Date.now() });
 }});
 
 async function queuePurge(ctx: any, member: any, items: any[]) {
   const groups = new Map<string, any[]>();
   for (const item of items) {
     const machineId = await quarantineMachine(ctx, item, member.tenantId);
-    groups.set(machineId, [...(groups.get(machineId) ?? []), item]);
+    if (!groups.has(machineId)) groups.set(machineId, []);
+    groups.get(machineId)!.push(item);
   }
   const jobIds = [];
-  for (const [machineId, group] of groups) jobIds.push(await insertApprovedJob(ctx, {
-    tenantId: member.tenantId, machineId, requestedBy: member.email, action: "purge",
-    fileIds: group.map(i => i.fileId), bytes: group.reduce((s, i) => s + i.sizeBytes, 0),
-    result: { purgeItems: group.map(i => ({ quarantineItemId: String(i._id), quarantinePath: i.quarantinePath })) },
-  }));
+  for (const [machineId, group] of groups) {
+    for (let offset = 0; offset < group.length; offset += MAX_JOB_FILES) {
+      const chunk = group.slice(offset, offset + MAX_JOB_FILES);
+      jobIds.push(await insertApprovedJob(ctx, {
+        tenantId: member.tenantId, machineId, requestedBy: member.email, action: "purge",
+        fileIds: chunk.map(i => i.fileId), bytes: chunk.reduce((s, i) => s + i.sizeBytes, 0),
+        result: { purgeItems: chunk.map(i => ({ quarantineItemId: String(i._id), quarantinePath: i.quarantinePath })) },
+      }));
+    }
+  }
   for (const item of items) await ctx.db.patch(item._id, { status: "pending_purge" });
   return { queued: items.length, jobIds, jobId: jobIds[0] };
 }
@@ -300,22 +308,41 @@ export const purgeItem = mutation({ args: { quarantineId: v.string(), requestedB
   return queuePurge(ctx, member, [item]);
 }});
 
-async function requestRestoreJob(ctx: any, quarantineId: string) {
-  const member = await requireRole(ctx, EDITORS);
-  const id = ctx.db.normalizeId("quarantineItems", quarantineId);
-  const item = id ? inTenant(await ctx.db.get(id), member.tenantId) : null;
-  if (!item || item.status !== "quarantined") throw new ConvexError("This item is not available for restoration.");
-  const machineId = await quarantineMachine(ctx, item, member.tenantId);
+async function queueRestoreJob(ctx: any, item: any, tenantId: string, machineId: string, requestedBy: string) {
+  if (item.status === "pending_restore") {
+    for (const status of ["approved", "queued", "running"]) {
+      const existing = await ctx.db.query("cleanupJobs").withIndex("by_tenant_machine_status", (q: any) =>
+        q.eq("tenantId", tenantId).eq("machineId", machineId).eq("status", status))
+        .filter((q: any) => q.and(q.eq(q.field("action"), "restore"), q.eq(q.field("result.quarantineId"), String(item._id)))).first();
+      if (existing) return { jobId: existing._id };
+    }
+    throw new ConvexError("A restoration is pending but its job is unavailable. Contact your workspace administrator.");
+  }
+  if (item.status !== "quarantined") throw new ConvexError("This item is not available for restoration.");
   const jobId = await insertApprovedJob(ctx, {
-    tenantId: member.tenantId, machineId, requestedBy: member.email, action: "restore",
+    tenantId, machineId, requestedBy, action: "restore",
     fileIds: [item.fileId], bytes: item.sizeBytes,
     result: { quarantineId: String(item._id), originalPath: item.originalPath, quarantinePath: item.quarantinePath },
   });
   await ctx.db.patch(item._id, { status: "pending_restore", machineId });
   return { jobId };
 }
+async function requestRestoreJob(ctx: any, quarantineId: string) {
+  const member = await requireRole(ctx, EDITORS);
+  const id = ctx.db.normalizeId("quarantineItems", quarantineId);
+  const item = id ? inTenant(await ctx.db.get(id), member.tenantId) : null;
+  if (!item) throw new ConvexError("This item is not available for restoration.");
+  return queueRestoreJob(ctx, item, member.tenantId, await quarantineMachine(ctx, item, member.tenantId), member.email);
+}
 export const requestRestore = mutation({ args: { quarantineId: v.string() }, handler: (ctx, args) => requestRestoreJob(ctx, args.quarantineId) });
 export const markQuarantineRestored = mutation({ args: { quarantineId: v.string() }, handler: (ctx, args) => requestRestoreJob(ctx, args.quarantineId) });
+
+export const requestRestoreAgent = internalMutation({ args: { quarantineId: v.string(), tenantId: v.string(), machineId: v.string() }, handler: async (ctx, args) => {
+  const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
+  const item = id ? inTenant(await ctx.db.get(id), args.tenantId) : null;
+  if (!item || await quarantineMachine(ctx, item, args.tenantId) !== args.machineId) throw new ConvexError("Unknown machine quarantine item.");
+  return queueRestoreJob(ctx, item, args.tenantId, args.machineId, `machine:${args.machineId}`);
+}});
 
 export const getJob = internalQuery({ args: { jobId: v.string(), tenantId: v.optional(v.string()), machineId: v.optional(v.string()) }, handler: async (ctx, args) => {
   const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
@@ -327,7 +354,7 @@ export const getJob = internalQuery({ args: { jobId: v.string(), tenantId: v.opt
     const file = id ? inTenant(await ctx.db.get(id), args.tenantId || "") : null;
     if (file) files.push(file);
   }
-  return { ...job, files };
+  return { ...withoutClaimToken(job), files };
 }});
 
 export const getQuarantineItem = internalQuery({ args: { quarantineId: v.string(), tenantId: v.optional(v.string()), machineId: v.optional(v.string()) }, handler: async (ctx, args) => {
@@ -337,19 +364,126 @@ export const getQuarantineItem = internalQuery({ args: { quarantineId: v.string(
   return item;
 }});
 
-export const pollPendingJobs = internalQuery({ args: { machineId: v.string(), tenantId: v.optional(v.string()) }, handler: async (ctx, args) => {
+function jobFileCount(job: any) {
+  return Math.max(job.affectedFileIds.length, job.action === "purge" ? (job.result?.purgeItems?.length ?? 0) : 0);
+}
+
+async function blockOversizedJob(ctx: any, job: any, reason: string) {
+  await ctx.db.patch(job._id, { pollBlocked: true, pollBlockedReason: reason, updatedAt: Date.now() });
+  await ctx.db.insert("auditLogs", {
+    tenantId: job.tenantId, machineId: job.machineId, action: "job_recovery_required", entityType: "cleanupJob", entityId: String(job._id),
+    message: reason === "oversized_purge_waiting_split"
+      ? "Oversized pending purge will be split into bounded jobs by the next agent poll."
+      : "Oversized file operation requires manual review; existing physical-operation journals must be preserved.",
+    createdAt: Date.now(),
+  });
+}
+
+function canSplitOversizedPurge(job: any) {
+  return job.action === "purge" && ["approved", "queued"].includes(job.status) &&
+    !job.claimToken && !job.attempts && job.affectedFileIds.length === job.result?.purgeItems?.length;
+}
+
+// Only never-started purges can change job identity safely. A started job's
+// durable disk receipts belong to its original id and require manual recovery.
+async function splitOversizedPurge(ctx: any, job: any) {
+  const items = [];
+  for (let index = 0; index < job.result.purgeItems.length; index++) {
+    const entry = job.result.purgeItems[index];
+    const id = ctx.db.normalizeId("quarantineItems", entry.quarantineItemId);
+    const item = id ? inTenant(await ctx.db.get(id), job.tenantId) : null;
+    if (!item || item.status !== "pending_purge" || item.fileId !== job.affectedFileIds[index] ||
+        item.quarantinePath !== entry.quarantinePath || await quarantineMachine(ctx, item, job.tenantId) !== job.machineId) {
+      await blockOversizedJob(ctx, job, "oversized_purge_requires_review");
+      return false;
+    }
+    items.push(item);
+  }
+  // Cancelling the parent in this transaction also rejects a stale worker's
+  // later claim. No existing file is confirmed moved or deleted by this repair.
+  await ctx.db.patch(job._id, { status: "cancelled", pollBlocked: undefined, pollBlockedReason: undefined, updatedAt: Date.now() });
+  const jobIds = [];
+  for (let offset = 0; offset < items.length; offset += MAX_JOB_FILES) {
+    const chunk = items.slice(offset, offset + MAX_JOB_FILES);
+    jobIds.push(await insertApprovedJob(ctx, {
+      tenantId: job.tenantId, machineId: job.machineId, requestedBy: job.requestedBy, approvedBy: job.approvedBy, action: "purge",
+      fileIds: chunk.map(item => item.fileId), bytes: chunk.reduce((sum, item) => sum + item.sizeBytes, 0),
+      result: { purgeItems: chunk.map(item => ({ quarantineItemId: String(item._id), quarantinePath: item.quarantinePath })), splitFromJobId: String(job._id) },
+    }));
+  }
+  await ctx.db.patch(job._id, { result: { ...job.result, replacementJobIds: jobIds } });
+  return true;
+}
+
+async function pollCandidates(ctx: any, tenantId: string, machineId: string, leaseProtocol: number | undefined, now: number) {
+  const jobs = [];
+  const pendingJobs = [];
+  for (const status of ["approved", "queued"]) {
+    let pending = ctx.db.query("cleanupJobs").withIndex("by_tenant_machine_status_poll", (q: any) =>
+      q.eq("tenantId", tenantId).eq("machineId", machineId).eq("status", status).eq("pollBlockedReason", undefined));
+    if (leaseProtocol !== 1) pending = pending.filter((q: any) =>
+      q.and(q.neq(q.field("leaseRequired"), true), q.eq(q.field("claimToken"), undefined)));
+    pendingJobs.push(...await pending.take(4));
+  }
+  if (leaseProtocol === 1) {
+    // Range-scope before the limit: old tokenless jobs and active long jobs
+    // cannot hide an expired lease behind the first 200 running records.
+    jobs.push(...await ctx.db.query("cleanupJobs").withIndex("by_tenant_machine_status_poll", (q: any) =>
+      q.eq("tenantId", tenantId).eq("machineId", machineId).eq("status", "running").eq("pollBlockedReason", undefined)
+        .gt("leaseExpiresAt", 0).lte("leaseExpiresAt", now))
+      .filter((q: any) => q.neq(q.field("claimToken"), undefined)).take(4));
+  }
+  jobs.push(...pendingJobs.sort((a, b) => a.createdAt - b.createdAt));
+  return jobs;
+}
+
+export const pollPendingJobs = internalMutation({ args: { machineId: v.string(), tenantId: v.optional(v.string()), leaseProtocol: v.optional(v.number()) }, handler: async (ctx, args) => {
   const tenantId = args.tenantId || "";
-  const approved = await ctx.db.query("cleanupJobs").withIndex("by_tenant_status", q => q.eq("tenantId", tenantId).eq("status", "approved")).take(200);
-  const queued = await ctx.db.query("cleanupJobs").withIndex("by_tenant_status", q => q.eq("tenantId", tenantId).eq("status", "queued")).take(200);
+  const now = Date.now();
+  let repairAttempted = false;
+  // Bound repair writes to one parent per poll. Marking other oversized rows
+  // lets indexed candidates progress while their repair waits for later polls.
+  for (const status of ["approved", "queued"]) {
+    const blocked = await ctx.db.query("cleanupJobs").withIndex("by_tenant_machine_status_poll", q =>
+      q.eq("tenantId", tenantId).eq("machineId", args.machineId).eq("status", status)
+        .eq("pollBlockedReason", "oversized_purge_waiting_split")).first();
+    if (blocked) {
+      repairAttempted = true;
+      if (canSplitOversizedPurge(blocked)) await splitOversizedPurge(ctx, blocked);
+      else await blockOversizedJob(ctx, blocked, "oversized_purge_requires_review");
+      break;
+    }
+  }
+  let jobs = await pollCandidates(ctx, tenantId, args.machineId, args.leaseProtocol, now);
+  let inspected = 0;
+  while (inspected < 16) {
+    const oversized = jobs.filter(job => jobFileCount(job) > MAX_JOB_FILES);
+    if (!oversized.length) break;
+    for (const job of oversized) {
+      if (inspected++ >= 16) break;
+      if (!repairAttempted && canSplitOversizedPurge(job)) {
+        repairAttempted = true;
+        await splitOversizedPurge(ctx, job);
+      } else {
+        await blockOversizedJob(ctx, job, canSplitOversizedPurge(job)
+          ? "oversized_purge_waiting_split" : "oversized_operation_requires_review");
+      }
+    }
+    jobs = await pollCandidates(ctx, tenantId, args.machineId, args.leaseProtocol, now);
+  }
   const result = [];
-  for (const job of [...approved, ...queued].filter(j => j.machineId === args.machineId)) {
+  let hydratedFiles = 0;
+  for (const job of jobs.filter(j => jobAvailableToAgent(j, now, args.leaseProtocol))) {
+    if (result.length >= 4) break;
+    if (hydratedFiles + jobFileCount(job) > MAX_JOB_FILES) continue;
     const files = [];
     for (const fid of job.affectedFileIds) {
       const id = ctx.db.normalizeId("files", fid);
       const file = id ? inTenant(await ctx.db.get(id), tenantId) : null;
       if (file) files.push(file);
     }
-    result.push({ ...job, files });
+    hydratedFiles += job.affectedFileIds.length;
+    result.push({ ...withoutClaimToken(job), files });
   }
   return result;
 }});
@@ -366,25 +500,32 @@ async function finishRestore(ctx: any, item: any, tenantId: string) {
 }
 
 export const markQuarantineRestoredAgent = internalMutation({ args: { quarantineId: v.string(), tenantId: v.optional(v.string()), machineId: v.optional(v.string()) }, handler: async (ctx, args) => {
-  const tenantId = args.tenantId || "";
-  const id = ctx.db.normalizeId("quarantineItems", args.quarantineId);
-  const item = id ? inTenant(await ctx.db.get(id), tenantId) : null;
-  if (!item || (args.machineId && await quarantineMachine(ctx, item, tenantId) !== args.machineId)) throw new ConvexError("Unknown quarantine item.");
-  await finishRestore(ctx, item, tenantId);
+  // Metadata-only confirmations cannot prove which execution attempt moved the
+  // file. Updated agents request a restore and finish its fenced job instead.
+  throw new ConvexError("Upgrade the agent and request a leased restore job before confirming a restoration.");
 }});
 
 export const updateJobStatus = internalMutation({ args: {
   jobId: v.string(), status: v.string(), result: v.optional(v.any()), tenantId: v.optional(v.string()), machineId: v.optional(v.string()),
+  claimToken: v.optional(v.string()),
   quarantineFiles: v.optional(v.array(v.object({ fileId: v.string(), originalPath: v.string(), quarantinePath: v.string(), sizeBytes: v.number() }))),
 }, handler: async (ctx, args) => {
   const tenantId = args.tenantId || "";
   const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
   const job = id ? inTenant(await ctx.db.get(id), tenantId) : null;
   if (!job || !job.machineId || (args.machineId && job.machineId !== args.machineId)) throw new ConvexError("Unknown machine job.");
-  if (job.status === "completed") return { claimed: false };
   if (!["running", "completed", "failed"].includes(args.status)) throw new ConvexError("Invalid job status.");
-  if (args.status === "running" && !["approved", "queued"].includes(job.status)) return { claimed: false };
+  if (job.pollBlocked && args.status === "running" && (!job.claimToken || job.claimToken !== args.claimToken)) {
+    return { claimed: false, reason: job.pollBlockedReason || "job_requires_review", status: job.status };
+  }
   const now = Date.now();
+  const lease = decideJobLease(job, args.status, args.claimToken, now);
+  if (!lease.accepted) return { claimed: false, reason: lease.reason, status: job.status };
+  if (lease.renewing) {
+    // A heartbeat never changes the action's original inputs or writes audit spam.
+    await ctx.db.patch(job._id, { ...lease.patch, updatedAt: now });
+    return { claimed: true, claimToken: lease.patch.claimToken, leaseExpiresAt: lease.patch.leaseExpiresAt };
+  }
   const result = { ...(job.result || {}), ...(args.result || {}) };
   const terminal = args.status === "completed" || args.status === "failed";
   if (job.action === "quarantine" && terminal && args.quarantineFiles?.length) {
@@ -459,7 +600,7 @@ export const updateJobStatus = internalMutation({ args: {
         await ctx.db.patch(manifest._id, { status: "failed", verificationResult: { verified: false, error: result.error ?? "Agent checksum verification failed." } });
     }
   }
-  await ctx.db.patch(job._id, { status: args.status, result, updatedAt: now });
+  await ctx.db.patch(job._id, { ...lease.patch, status: args.status, result, updatedAt: now });
   if (terminal) {
     const related = job.result?.recommendationIds ?? (job.recommendationId ? [job.recommendationId] : []);
     const siblings = job.result?.batchJobIds ?? [String(job._id)];
@@ -486,5 +627,5 @@ export const updateJobStatus = internalMutation({ args: {
   }
   await ctx.db.insert("auditLogs", { tenantId, machineId: job.machineId, action: `job_${args.status}`, entityType: "cleanupJob", entityId: job._id,
     message: `Agent ${job.action} job ${args.status}.`, createdAt: now });
-  return { claimed: true };
+  return { claimed: true, claimToken: lease.patch.claimToken ?? job.claimToken, leaseExpiresAt: lease.patch.leaseExpiresAt };
 }});

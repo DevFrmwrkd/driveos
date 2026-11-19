@@ -8,6 +8,7 @@ import { useQuery, useMutation, Authenticated, Unauthenticated, AuthLoading } fr
 import { useAuthActions } from "@convex-dev/auth/react";
 import { api } from "@/convexApi";
 import { LoginScreen } from "@/screens/screens-login";
+import { WorkspaceAccess } from "@/screens/workspace-access";
 import { DownloadScreen } from "@/screens/screens-download";
 
 // Import all modularized screens
@@ -303,7 +304,7 @@ export default function App() {
         {showPublicDownload ? <DownloadScreen /> : <LoginScreen />}
       </Unauthenticated>
       <Authenticated>
-        <Workspace />
+        <WorkspaceAccess><Workspace /></WorkspaceAccess>
       </Authenticated>
     </>
   );

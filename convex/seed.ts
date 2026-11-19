@@ -1,8 +1,10 @@
-import { mutation } from "./_generated/server";
+import { internalMutation } from "./_generated/server";
+import { requireLocalDemoSeed } from "./demoSeedPolicy";
 
-export const seed = mutation({
+export const seed = internalMutation({
   args: {},
   handler: async (ctx) => {
+    requireLocalDemoSeed(process.env);
     const timestamp = Date.now();
 
     // 1) Clear any existing data in tables to ensure clean state

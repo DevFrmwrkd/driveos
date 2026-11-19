@@ -70,21 +70,31 @@ type ScreenProps = Record<string, any>;
       h("div", { className: "card-pad" }, children));
   }
 
-  // Live team management — add a member by email so they can log in (sign-up is
-  // allowlisted to team members, so adding them here grants dashboard access).
+  // Administrators issue private, single-use invitation links for new members.
   function TeamSettings({ toast }: ScreenProps) {
+    const context = useQuery(api.tenants.currentContext);
+    const canManage = context?.member.role === "admin";
     const members = useQuery(api.admin.listTeamMembers) || [];
     const addMember = useMutation(api.admin.addTeamMember);
     const [adding, setAdding] = React.useState(false);
     const [form, setForm] = React.useState({ name: "", email: "", role: "editor" });
+    const [invitation, setInvitation] = React.useState<{ url: string; email: string; expiresAt: number } | null>(null);
     const [busy, setBusy] = React.useState(false);
 
     const submit = async () => {
       if (busy || !form.email.trim() || !form.name.trim()) return;
       setBusy(true);
       try {
-        await addMember({ name: form.name.trim(), email: form.email.trim(), role: form.role });
-        toast(`${form.email.trim()} can now sign in`, "user", "ok");
+        const result = await addMember({ name: form.name.trim(), email: form.email.trim(), role: form.role });
+        if (result.invitationToken) {
+          const url = new URL(window.location.href);
+          url.search = "";
+          url.hash = `invite/${result.invitationToken}/${encodeURIComponent(form.email.trim().toLowerCase())}`;
+          setInvitation({ url: url.toString(), email: form.email.trim(), expiresAt: result.invitationExpiresAt });
+          toast("Invitation link created", "user", "ok");
+        } else {
+          toast("Member updated", "user", "ok");
+        }
         setAdding(false);
         setForm({ name: "", email: "", role: "editor" });
       } catch (err: any) {
@@ -94,9 +104,14 @@ type ScreenProps = Record<string, any>;
       }
     };
 
-    return h(Panel, { title: "Team Members", desc: "People allowed to sign in to DriveOS. Add someone here, then they set their own password on first login.",
-      action: h("button", { className: "btn sm primary", onClick: () => setAdding(!adding) }, h(Icon, { name: "plus", size: 14 }), "Add member") },
-      adding && h("div", { style: { padding: "14px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--accent-line)", marginBottom: 14, display: "grid", gridTemplateColumns: "1fr 1fr auto auto", gap: 9, alignItems: "end" } },
+    return h(Panel, { title: "Team Members", desc: "Create a private invitation link for a new member. Links expire after seven days; adding a pending member again replaces their previous link.",
+      action: canManage && h("button", { className: "btn sm primary", onClick: () => setAdding(!adding) }, h(Icon, { name: "plus", size: 14 }), "Add member") },
+      invitation && h("div", { style: { padding: 15, border: "1px solid var(--accent-line)", borderRadius: "var(--r)", marginBottom: 14 } },
+        h("div", { className: "hi", style: { fontWeight: 600 } }, `Invitation for ${invitation.email}`),
+        h("p", { className: "muted", style: { fontSize: 12 } }, `Share this link privately with the recipient. It can be used once and expires ${new Date(invitation.expiresAt).toLocaleString()}.`),
+        h("input", { className: "input mono", "aria-label": "Invitation link", readOnly: true, value: invitation.url, onFocus: (event: React.FocusEvent<HTMLInputElement>) => event.target.select() }),
+        h("button", { className: "btn sm ghost", style: { marginTop: 9 }, onClick: () => setInvitation(null) }, "Dismiss link")),
+      adding && canManage && h("div", { style: { padding: "14px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--accent-line)", marginBottom: 14, display: "grid", gridTemplateColumns: "1fr 1fr auto auto", gap: 9, alignItems: "end" } },
         h("div", null, h("label", { className: "field-label" }, "Name"), h("input", { className: "input", value: form.name, placeholder: "Jane Editor", onChange: (e: React.ChangeEvent<HTMLInputElement>) => setForm({ ...form, name: e.target.value }) })),
         h("div", null, h("label", { className: "field-label" }, "Email"), h("input", { className: "input", type: "email", value: form.email, placeholder: "jane@studio.com", onChange: (e: React.ChangeEvent<HTMLInputElement>) => setForm({ ...form, email: e.target.value }) })),
         h("select", { className: "select", value: form.role, onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setForm({ ...form, role: e.target.value }) },
@@ -109,7 +124,7 @@ type ScreenProps = Record<string, any>;
         h("tbody", null, members.map((m: any) => h("tr", { key: m._id, style: { cursor: "default" } },
           h("td", null, h("span", { className: "hi", style: { fontWeight: 600 } }, m.name)),
           h("td", { className: "muted mono", style: { fontSize: 12 } }, m.email),
-          h("td", null, h(Badge, { kind: m.role === "admin" ? "accent" : "" }, m.role)))))));
+          h("td", null, h(Badge, { kind: m.role === "admin" ? "accent" : "" }, m.role), m.invitationPending && h("span", { className: "dim", style: { marginLeft: 8, fontSize: 11 } }, m.invitationExpiresAt <= Date.now() ? "Invitation expired" : "Invitation pending")))))));
   }
 
   // Live tracked-drive management — stop tracking a drive (removes it from the
@@ -147,6 +162,8 @@ type ScreenProps = Record<string, any>;
   }
 
   function AgentSettings({ toast }: ScreenProps) {
+    const context = useQuery(api.tenants.currentContext);
+    const canManage = ["admin", "producer", "editor", "assistant_editor"].includes(context?.member.role || "");
     const machines = useQuery(api.drives.listMachines) || [];
     const issueToken = useMutation(api.agentAuth.issueMachineToken);
     const revokeToken = useMutation(api.agentAuth.revokeMachineToken);
@@ -184,10 +201,10 @@ type ScreenProps = Record<string, any>;
     return h(Panel, {
       title: "Machines / Agents",
       desc: "Local agents that scan and watch drives. Metadata only — no media is uploaded.",
-      action: h("button", { className: "btn sm primary", onClick: () => { setAdding(true); setNewName(""); } }, h(Icon, { name: "plus", size: 14 }), "Add machine"),
+      action: canManage && h("button", { className: "btn sm primary", onClick: () => { setAdding(true); setNewName(""); } }, h(Icon, { name: "plus", size: 14 }), "Add machine"),
     },
       // Add-machine inline form
-      adding && h("div", { style: { padding: "14px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--accent-line)", marginBottom: 12 } },
+      adding && canManage && h("div", { style: { padding: "14px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--accent-line)", marginBottom: 12 } },
         h("div", { className: "field-label", style: { marginBottom: 6 } }, "Machine name (e.g. Editing-Bay-1)"),
         h("div", { className: "row", style: { gap: 9 } },
           h("input", { className: "input", style: { flex: 1 }, value: newName, autoFocus: true, placeholder: "Editing-Bay-1",
@@ -198,7 +215,7 @@ type ScreenProps = Record<string, any>;
 
       // Machine list
       machines.length === 0 && !adding
-        ? h("div", { className: "empty", style: { padding: "30px 0" } }, h("div", { className: "empty-ico" }, h(Icon, { name: "cpu", size: 22 })), h("h3", null, "No machines yet"), h("div", { className: "muted" }, "Add a machine to generate a connect token for the desktop app."))
+        ? h("div", { className: "empty", style: { padding: "30px 0" } }, h("div", { className: "empty-ico" }, h(Icon, { name: "cpu", size: 22 })), h("h3", null, "No machines yet"), h("div", { className: "muted" }, canManage ? "Add a machine to generate a connect token for the desktop app." : "A workspace administrator or editor can connect machines."))
         : h("div", { style: { display: "flex", flexDirection: "column", gap: 10 } }, machines.map((a: any) => {
             const online = a.status === "online";
             return h("div", { key: a._id, className: "spread", style: { padding: "13px 15px", borderRadius: "var(--r)", background: "var(--bg-surface)", border: "1px solid var(--line)" } },
@@ -210,8 +227,8 @@ type ScreenProps = Record<string, any>;
               h("div", { className: "row", style: { gap: 8 } },
                 a.agentVersion && a.agentVersion !== "pending" && h("span", { className: "mono dim", style: { fontSize: 11 } }, "v" + a.agentVersion),
                 h(StatusBadge, { status: a.status }),
-                h("button", { className: "btn sm", title: "Re-issue a new connect token", onClick: () => onIssue(a.name) }, h(Icon, { name: "rotate", size: 13 }), "Token"),
-                a.authTokenHash && h("button", { className: "btn sm ghost icon", title: "Revoke token", onClick: () => onRevoke(a._id) }, h(Icon, { name: "lock", size: 14 }))));
+                canManage && h("button", { className: "btn sm", title: "Re-issue a new connect token", onClick: () => onIssue(a.name) }, h(Icon, { name: "rotate", size: 13 }), "Token"),
+                canManage && a.authTokenHash && h("button", { className: "btn sm ghost icon", title: "Revoke token", onClick: () => onRevoke(a._id) }, h(Icon, { name: "lock", size: 14 }))));
           })),
 
       // One-time token modal

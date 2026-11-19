@@ -9,6 +9,30 @@ export interface Member {
   tenantId: string;
 }
 
+// The stored member id is the authority for legacy accounts too. Early auth
+// users already had this link before tenantId was copied onto the users table.
+// Accept a missing copy, but never an explicit conflicting tenant or email.
+async function linkedMember(ctx: QueryCtx | MutationCtx, user: any) {
+  if (!user?.teamMemberId) return null;
+  const memberId = ctx.db.normalizeId("teamMembers", user.teamMemberId);
+  const member = memberId ? await ctx.db.get(memberId) : null;
+  if (!member?.tenantId ||
+      (user.tenantId !== undefined && member.tenantId !== user.tenantId) ||
+      member.email !== String(user.email ?? "").trim().toLowerCase()) return null;
+  return { ...member, tenantId: member.tenantId };
+}
+
+// Optional persistence repair for trusted auth callbacks and internal migration.
+// This never looks up a membership from a supplied email or changes an existing
+// tenant assignment; ordinary reads work while legacy rows await backfill.
+export async function backfillLinkedUserTenant(ctx: MutationCtx, user: any): Promise<boolean> {
+  if (!user || user.tenantId !== undefined) return false;
+  const member = await linkedMember(ctx, user);
+  if (!member) return false;
+  await ctx.db.patch(user._id, { tenantId: member.tenantId });
+  return true;
+}
+
 // Resolve the signed-in dashboard user to their team member record (scoped to
 // their tenant), or throw. Use in every query/mutation that should require an
 // authorized team member. The returned `tenantId` MUST be used to scope all
@@ -16,12 +40,12 @@ export interface Member {
 //
 // Convex Auth's Password provider does NOT put `email` in the JWT identity — the
 // identity's `subject` is the auth user's _id. We resolve the user row first
-// (the authoritative link to teamMember + tenant), and fall back to email.
+// (the authoritative link to teamMember + tenant). Email is not authorization.
 export async function requireMember(ctx: QueryCtx | MutationCtx): Promise<Member> {
   const member = await resolveMember(ctx);
   if (!member) {
     throw new ConvexError(
-      "Your account is not linked to a DriveOS workspace. Sign out and sign up again."
+      "Your account is not linked to a DriveOS workspace. Ask an administrator for an invitation link."
     );
   }
   return member;
@@ -39,29 +63,8 @@ export async function resolveMember(
   const userId = ctx.db.normalizeId("users", subjectId);
   if (userId) {
     const user: any = await ctx.db.get(userId);
-    if (user?.teamMemberId) {
-      const memberId = ctx.db.normalizeId("teamMembers", user.teamMemberId);
-      const member: any = memberId ? await ctx.db.get(memberId) : null;
-      if (member && member.tenantId) {
-        return {
-          _id: member._id,
-          name: member.name,
-          email: member.email,
-          role: member.role,
-          tenantId: member.tenantId,
-        };
-      }
-    }
-  }
-
-  // 2) Fallback: resolve by email (older accounts not yet linked via users row).
-  const email = await resolveIdentityEmail(ctx);
-  if (email) {
-    const member: any = await ctx.db
-      .query("teamMembers")
-      .withIndex("by_email", (q) => q.eq("email", email))
-      .first();
-    if (member && member.tenantId) {
+    const member = await linkedMember(ctx, user);
+    if (member) {
       return {
         _id: member._id,
         name: member.name,
