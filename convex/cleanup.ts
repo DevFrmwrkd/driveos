@@ -578,7 +578,7 @@ async function finishRestore(ctx: any, item: any, tenantId: string) {
   await ctx.db.patch(item._id, { status: "restored", restoredAt: now });
   const fid = ctx.db.normalizeId("files", item.fileId);
   const file = fid ? inTenant(await ctx.db.get(fid), tenantId) : null;
-  if (file) await ctx.db.patch(file._id, { deletedAt: undefined, lastSeenAt: now });
+  if (file) await ctx.db.patch(file._id, { deletedAt: undefined, lastSeenAt: now, observationRevision: (file.observationRevision ?? 0) + 1 });
   await ctx.db.insert("auditLogs", { tenantId, action: "quarantine_restore", entityType: "quarantineItem", entityId: item._id,
     message: `Restored quarantined file ${item.originalPath}`, createdAt: now });
 }

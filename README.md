@@ -122,10 +122,14 @@ node apps/agent/dist/index.js scan --path "./temp_test_drive"
 *   **Local Cache**: Quick hashes are saved in `./driveos-hash-cache.json` so that subsequent scans re-index unchanged files in milliseconds.
 
 ### 🕒 `watch` — Live Folder Watcher
-Run a persistent background watcher on a directory. It debounces file additions and edits and updates Convex:
+Run a persistent background watcher on a directory. It batches file additions, edits, and observed deletions into Convex updates:
 ```bash
 node apps/agent/dist/index.js watch --path "./temp_test_drive"
 ```
+
+Deleted files leave active catalog views after the next successful batch (normally one minute). The agent confirms physical absence and sends the server's last observation receipt; a changed observation or active quarantine/restore job prevents a stale deletion. Pause holds pending events, and an inaccessible or replaced drive root defers reconciliation. Catalog changes invalidate cached duplicate and cleanup results until analysis runs again, including when automatic analysis is disabled.
+
+Deletion reconciliation requires the matching backend and updated agent. It covers events observed by a running watcher; pending events are held in memory, and deletions while the watcher is stopped or before a crash are not inferred from a later scan.
 
 ### 🧷 `install-drive` — Add Drive-Level Hooks
 Install reusable scan/watch launch scripts on a mounted disk:
@@ -228,7 +232,7 @@ npm run test:local:watch
 
 `test:local:auth` runs `node scripts/test-local-auth.mjs`: it checks invitation recipient/workspace matching, token replacement and consumption, member validation, returning accounts, and viewer credential restrictions. `test:local:recovery` runs `node scripts/test-local-recovery.mjs`: it interrupts real agent operations and checks lease recovery against synthetic files. Build the shared library and agent before running the recovery script. Both scripts leave evidence outside the repository and refuse hosted backend URLs; the recovery suite waits for lease expiration unless an explicitly configured disposable local expiry fixture is provided.
 
-`test:local:watch` checks a watcher running alongside a manual scan. It waits for the normal one-minute upload interval, verifies that unrelated hash-cache entries survive, and ensures a changed file's obsolete full hash cannot return on the next scan. It also requires the disposable local backend.
+`test:local:watch` checks a real watcher running alongside a manual scan. It waits for normal one-minute batches and verifies cache preservation, deletion and legacy receipt reconciliation, pause/resume, identical-file recreation, disconnected-root protection, active query limits, and duplicate/cleanup analysis invalidation and refresh. It requires the disposable local backend and leaves its synthetic files, logs, and result summary outside the repository.
 
 Dashboard file operations are queued for the connected machine. Run the local agent's `sync` or `run-jobs` command to process them. Manual duplicate/cleanup analysis has a five-minute cooldown and a default 250,000-file bound (`DRIVEOS_MANUAL_ANALYSIS_MAX_FILES`, maximum 1,000,000); automatic full-catalog analysis remains disabled unless explicitly configured. Cloud account linking, custom templates/classification, and notification delivery are shown as unavailable instead of simulating success.
 

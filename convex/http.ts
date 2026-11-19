@@ -3,6 +3,7 @@ import { httpAction } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { auth } from "./auth";
 import { hashToken } from "./agentAuth";
+import { MAX_CATALOG_RECEIPTS } from "./catalogObservations";
 
 const http = httpRouter();
 
@@ -88,7 +89,7 @@ post("registerMachine", async (ctx, body, machine) => {
 });
 
 post("registerDrive", async (ctx, body, machine) => {
-  const result = await ctx.runMutation(internal.drives.register, scoped(body, machine));
+  const result = await ctx.runMutation(internal.drives.register, { ...scoped(body, machine), machineId: machine.machineId });
   return {
     success: true,
     driveId: result.driveId,
@@ -103,7 +104,7 @@ post("removeDrive", async (ctx, body, machine) => {
 });
 
 post("startScan", async (ctx, body, machine) => {
-  const sessionId = await ctx.runMutation(internal.scans.start, scoped(body, machine));
+  const sessionId = await ctx.runMutation(internal.scans.start, { ...scoped(body, machine), machineId: machine.machineId });
   return { success: true, sessionId };
 });
 
@@ -135,7 +136,19 @@ post("uploadBatch", async (ctx, body, machine) => {
       { status: 429, headers: { "Content-Type": "application/json", "Retry-After": String(Math.ceil((budget.retryAfter || 60_000) / 1000)) } }
     );
   }
-  return await ctx.runMutation(internal.files.uploadBatch, scoped(body, machine));
+  return await ctx.runMutation(internal.files.uploadBatch, { ...scoped(body, machine), machineId: machine.machineId });
+});
+
+post("getCatalogReceipts", async (ctx, body, machine) => {
+  if (!Array.isArray(body?.files) || body.files.length < 1 || body.files.length > MAX_CATALOG_RECEIPTS)
+    return json({ error: "getCatalogReceipts requires between 1 and 100 files." }, 400);
+  return await ctx.runQuery(internal.files.getCatalogReceipts, { ...scoped(body, machine), machineId: machine.machineId });
+});
+
+post("reportMissingFiles", async (ctx, body, machine) => {
+  if (!Array.isArray(body?.files) || body.files.length < 1 || body.files.length > MAX_CATALOG_RECEIPTS)
+    return json({ error: "reportMissingFiles requires between 1 and 100 files." }, 400);
+  return await ctx.runMutation(internal.files.reportMissingFiles, { ...scoped(body, machine), machineId: machine.machineId });
 });
 
 post("createManifest", async (ctx, body, machine) => {

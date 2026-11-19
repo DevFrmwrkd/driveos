@@ -87,12 +87,25 @@ try {
   client.setAuth(session.tokens.token);
   const machine = await client.mutation(anyApi.agentAuth.issueMachineToken, { machineName: `Watcher-QA-${stamp}` });
   const original = write("06_RENDERS_CACHE/preview.dat", 65, 120_000);
+  const recreated = write("06_RENDERS_CACHE/recreated.dat", 65, 120_000);
+  const legacy = write("06_RENDERS_CACHE/legacy-subtree/legacy.dat", 83, 120_000);
   const oldHash = checksum(original);
   await agent(["init", "--machine", machine.machineName, "--owner", email, "--convex", siteUrl,
     "--auth-token", machine.token, "--roots", media, "--central-quarantine", "--quarantine", path.join(fixture, "quarantine")], "init");
   await agent(["scan", "--path", media, "--full-hash"], "initial-full-scan");
   assert.equal((await queryFiles()).find(file => file.path === original)?.fullHash, oldHash);
   record("initial full scan stores the original file checksum");
+  const initialFiles = await queryFiles();
+  const originalId = initialFiles.find(file => file.path === original)._id;
+  const driveId = initialFiles.find(file => file.path === original).driveId;
+  const legacyCache = readCache();
+  delete legacyCache[cacheKey(legacy)].catalogReceipt;
+  delete legacyCache[cacheKey(legacy)].catalogParent;
+  fs.writeFileSync(cachePath, JSON.stringify(legacyCache));
+  const analysis = await client.mutation(anyApi.scans.requestAnalysis, {});
+  assert.equal(analysis.scheduled, true);
+  await waitFor(() => client.query(anyApi.duplicates.list, {}), clusters => clusters.length > 0, "initial duplicate analysis");
+  const oldRecommendations = await waitFor(() => client.query(anyApi.recommendations.list, {}), rows => rows.length > 0, "initial recommendations");
 
   watcher = spawn(process.execPath, [agentEntry, "watch", "--path", watched, "--interval-minutes", "1", "--debounce-seconds", "1"], {
     cwd: repository, env, stdio: ["ignore", "pipe", "pipe"],
@@ -114,6 +127,10 @@ try {
   await agent(["scan", "--path", media, "--full-hash"], "separate-full-scan");
   const siblingBefore = readCache()[cacheKey(sibling)];
   assert.ok(siblingBefore?.uploadedFp && siblingBefore.fullHash === checksum(sibling));
+  const legacyAfterScan = readCache();
+  delete legacyAfterScan[cacheKey(legacy)].catalogReceipt;
+  delete legacyAfterScan[cacheKey(legacy)].catalogParent;
+  fs.writeFileSync(cachePath, JSON.stringify(legacyAfterScan));
   record("a separate scanner adds an unrelated file after the watcher loads its cache");
 
   const oldModifiedAt = fs.statSync(original).mtimeMs;
@@ -125,7 +142,7 @@ try {
     const changed = files.find(file => file.path === original);
     return changed?.modifiedAtFile === fs.statSync(original).mtimeMs && changed.fullHash === undefined;
   }, "watcher upload and obsolete checksum invalidation", 85_000);
-  assert.equal(afterWatch.length, 2);
+  assert.equal(afterWatch.length, 4);
   record("watcher uploads changed metadata and invalidates the obsolete full checksum");
 
   await waitFor(async () => readCache(), cache => {
@@ -138,10 +155,102 @@ try {
   record("watcher cache persistence preserves another scanner's unrelated hash and upload stamp");
 
   const quick = await agent(["scan", "--path", media], "ordinary-quick-scan");
-  assert.match(quick, /0 uploaded, 2 unchanged/);
+  assert.match(quick, /0 uploaded, 4 unchanged/);
   assert.equal((await queryFiles()).find(file => file.path === original)?.fullHash, undefined);
   assert.equal(readCache()[cacheKey(original)].fullHash, undefined);
   record("an ordinary quick scan skips unchanged files without reviving the obsolete checksum");
+
+  // Queue real unlinks while paused, including a pre-upgrade cache entry which
+  // has no server receipt. Nothing is inferred from a missing volume/root.
+  const originalStat = fs.statSync(original);
+  const recreatedStat = fs.statSync(recreated);
+  await agent(["pause"], "pause-deletions");
+  fs.unlinkSync(original);
+  fs.unlinkSync(legacy);
+  fs.rmdirSync(path.dirname(legacy));
+  fs.unlinkSync(recreated);
+  fs.writeFileSync(recreated, Buffer.alloc(2 * 1024 * 1024 + 17, 65));
+  fs.utimesSync(recreated, recreatedStat.atime, recreatedStat.mtime);
+  await delay(65_000);
+  const pausedFiles = await queryFiles();
+  assert.ok(pausedFiles.some(file => file.path === original));
+  assert.ok(pausedFiles.some(file => file.path === legacy));
+  record("paused watcher holds deletion events through a normal batch interval");
+  await agent(["resume"], "resume-deletions");
+  await waitFor(queryFiles, files => !files.some(file => [original, legacy].includes(file.path)), "batched unlink and legacy receipt reconciliation", 85_000);
+  assert.ok((await queryFiles()).some(file => file.path === recreated));
+  const firstLive = await client.query(anyApi.files.list, { driveId, limit: 1 });
+  assert.equal(firstLive.length, 1);
+  assert.ok(![original, legacy].includes(firstLive[0].path));
+  for (const args of [{ classification: "CACHE", limit: 1 }, { riskLevel: "green", limit: 1 }]) {
+    const rows = await client.query(anyApi.files.list, args);
+    assert.equal(rows.length, 1);
+    assert.ok(![original, legacy].includes(rows[0].path));
+  }
+  record("batched deletions and legacy subtree cache entries disappear before catalog query limits");
+  assert.deepEqual(await client.query(anyApi.duplicates.list, {}), []);
+  assert.deepEqual(await client.query(anyApi.recommendations.list, {}), []);
+  for (const rec of oldRecommendations) assert.equal(await client.query(anyApi.recommendations.get, { recommendationId: rec._id }), null);
+  record("deletion invalidates cached duplicate and cleanup results without automatic analysis");
+  record("unlink and identical recreation before flush preserves the live file");
+
+  fs.writeFileSync(original, Buffer.alloc(2 * 1024 * 1024 + 17, 90));
+  fs.utimesSync(original, originalStat.atime, originalStat.mtime);
+  await waitFor(queryFiles, files => files.some(file => file.path === original), "identical metadata resurrection after tombstone", 85_000);
+  assert.equal((await queryFiles()).find(file => file.path === original)._id, originalId);
+  record("an identical metadata recreation resurrects the existing catalog row");
+
+  const parked = path.join(fixture, "disconnected-watch-root");
+  fs.renameSync(watched, parked);
+  await delay(75_000);
+  const disconnectedFiles = await queryFiles();
+  assert.ok(disconnectedFiles.some(file => file.path === original));
+  assert.ok(disconnectedFiles.some(file => file.path === recreated));
+  fs.renameSync(parked, watched);
+  await delay(2_000);
+  record("an unavailable watched root does not delete its last known catalog");
+
+  // Advance the server observation without replacing the watcher's receipt,
+  // as a restore does before its add event has been uploaded. The first CAS
+  // must conflict, then a fresh receipt and physical absence check can settle
+  // the actual later unlink. Use only normal authenticated loopback routes.
+  await agent(["pause"], "pause-stale-receipt");
+  const conflictOutputStart = watchOutput.length;
+  const beforeConflict = (await queryFiles()).find(file => file.path === recreated);
+  const staleVersion = readCache()[cacheKey(recreated)].catalogReceipt.catalogVersion;
+  const agentApi = async (operation, body) => {
+    const response = await fetch(`${siteUrl}/api/${operation}`, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${machine.token}` },
+      body: JSON.stringify(body),
+    });
+    assert.equal(response.status, 200, `${operation} must succeed against the disposable backend`);
+    const result = await response.json();
+    assert.equal(result.success, true);
+    return result;
+  };
+  const observationSession = await agentApi("startScan", { machineId: machine.machineId, driveId, rootPath: watched, agentVersion: "watcher-regression" });
+  const metadataKeys = ["path", "name", "extension", "sizeBytes", "createdAtFile", "modifiedAtFile", "quickHash", "fullHash", "classification", "riskLevel", "isGenerated", "isRaw", "isFinal", "isProjectFile", "projectId"];
+  const metadata = Object.fromEntries(metadataKeys.filter(key => beforeConflict[key] !== undefined).map(key => [key, beforeConflict[key]]));
+  const forced = await agentApi("uploadBatch", { machineId: machine.machineId, driveId, scanSessionId: observationSession.sessionId,
+    catalogReceiptProtocol: 1, files: [{ ...metadata, forceObservation: true }] });
+  assert.ok(forced.receipts[0].catalogVersion > staleVersion);
+  await agentApi("completeScan", { sessionId: observationSession.sessionId, status: "completed", errorsCount: 0 });
+  fs.unlinkSync(recreated);
+  await agent(["resume"], "resume-stale-receipt");
+  await waitFor(queryFiles, files => !files.some(file => file.path === recreated), "watcher deletion after drive recovery and receipt refresh", 150_000);
+  assert.match(watchOutput.slice(conflictOutputStart), /\[Watcher Conflict\] Refreshing catalog receipt after newer observation/);
+  record("a stale server observation receipt is refreshed without dropping the later deletion");
+  assert.ok((await queryFiles()).some(file => file.path === original));
+  assert.ok((await queryFiles()).some(file => file.path === sibling));
+  assert.equal(readCache()[cacheKey(sibling)].uploadedFp, siblingBefore.uploadedFp);
+  record("watching recovers after the same root returns and preserves unrelated scan cache entries");
+
+  const refreshed = await client.mutation(anyApi.scans.requestAnalysis, {});
+  assert.equal(refreshed.scheduled, true);
+  await waitFor(() => client.query(anyApi.recommendations.list, {}), rows => rows.some(rec => rec.type === "delete_cache"), "fresh analysis after catalog reconciliation");
+  const finalRecommendations = await client.query(anyApi.recommendations.list, {});
+  assert.ok(finalRecommendations.every(rec => !rec.affectedFileIds.some(id => initialFiles.filter(file => [legacy, recreated].includes(file.path)).some(file => file._id === id))));
+  record("explicit analysis publishes fresh recommendations after reconciliation");
 } catch (error) {
   process.exitCode = 1;
   results.push({ name: "watcher regression", status: "failed", error: String(error?.stack || error) });

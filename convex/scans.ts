@@ -1,7 +1,8 @@
 import { ConvexError, v } from "convex/values";
-import { internalAction, internalMutation, mutation, query } from "./_generated/server";
+import { internalAction, internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { requireMember, requireRole } from "./access";
+import { analysisStateForTenant, canPublishAnalysis, catalogGeneration } from "./catalogAnalysis";
 
 const configuredManualLimit = Number(process.env.DRIVEOS_MANUAL_ANALYSIS_MAX_FILES || 250000);
 const MANUAL_ANALYSIS_MAX_FILES = Math.min(1000000, Math.max(1000,
@@ -30,27 +31,38 @@ export const requestAnalysis = mutation({
   },
 });
 
+export const captureAnalysisGeneration = internalQuery({
+  args: { tenantId: v.string() },
+  handler: async (ctx, args) => catalogGeneration(await analysisStateForTenant(ctx, args.tenantId)),
+});
+
 export const runManualAnalysis = internalAction({
   args: { tenantId: v.string() },
   handler: async (ctx, args) => {
+    let generation: number | undefined;
     try {
+      generation = await ctx.runQuery(internal.scans.captureAnalysisGeneration, args);
       await ctx.runAction(internal.duplicates.runDuplicateDetection, { ...args, maxFiles: MANUAL_ANALYSIS_MAX_FILES });
       await ctx.runAction(internal.recommendations.generateRecommendations, { ...args, maxFiles: MANUAL_ANALYSIS_MAX_FILES });
-      await ctx.runMutation(internal.scans.finishManualAnalysis, { ...args, success: true });
+      await ctx.runMutation(internal.scans.finishManualAnalysis, { ...args, success: true, catalogGeneration: generation });
     } catch (error) {
-      await ctx.runMutation(internal.scans.finishManualAnalysis, { ...args, success: false, error: String(error) });
+      await ctx.runMutation(internal.scans.finishManualAnalysis, { ...args, success: false, error: String(error), catalogGeneration: generation });
       throw error;
     }
   },
 });
 
 export const finishManualAnalysis = internalMutation({
-  args: { tenantId: v.string(), success: v.boolean(), error: v.optional(v.string()) },
+  args: { tenantId: v.string(), success: v.boolean(), error: v.optional(v.string()), catalogGeneration: v.optional(v.number()) },
   handler: async (ctx, args) => {
-    const state = await ctx.db.query("analysisState").withIndex("by_tenant", q => q.eq("tenantId", args.tenantId)).first();
-    if (state) await ctx.db.patch(state._id, { scheduled: false, dirtyCount: args.success ? 0 : state.dirtyCount });
+    const state = await analysisStateForTenant(ctx, args.tenantId);
+    const current = args.success && canPublishAnalysis(state, args.catalogGeneration);
+    if (state) await ctx.db.patch(state._id, { scheduled: false,
+      ...(current ? { dirtyCount: 0, analyzedGeneration: args.catalogGeneration } : {}) });
     await ctx.db.insert("auditLogs", { tenantId: args.tenantId, action: args.success ? "analysis_complete" : "analysis_failed",
-      entityType: "analysis", message: args.success ? "Duplicate detection and cleanup analysis completed." : `Analysis failed: ${args.error}`, createdAt: Date.now() });
+      entityType: "analysis", message: args.success
+        ? current ? "Duplicate detection and cleanup analysis completed." : "Analysis finished after the catalog changed; cached results remain hidden. Run analysis again."
+        : `Analysis failed: ${args.error}`, createdAt: Date.now() });
   },
 });
 
@@ -223,11 +235,13 @@ export const claimAnalysisRun = internalMutation({
 
     const claimedDirtyCount = state.dirtyCount;
     await ctx.db.patch(state._id, {
-      scheduled: false,
+      // Keep manual requests out until this action finishes publishing both
+      // datasets. Concurrent analyzers could overwrite a newer generation.
+      scheduled: true,
       dirtyCount: 0,
       lastRunAt: now,
     });
-    return { shouldRun: true, claimedDirtyCount };
+    return { shouldRun: true, claimedDirtyCount, catalogGeneration: catalogGeneration(state) };
   },
 });
 
@@ -243,16 +257,14 @@ export const restoreAnalysisAfterFailure = internalMutation({
     const patch: { dirtyCount: number; scheduled?: boolean } = {
       dirtyCount: state.dirtyCount + args.claimedDirtyCount,
     };
-    if (!state.scheduled) {
-      patch.scheduled = true;
-      const delay = Math.max(
-        ANALYSIS_DEBOUNCE_MS,
-        state.lastRunAt + ANALYSIS_MIN_INTERVAL_MS - Date.now()
-      );
-      await ctx.scheduler.runAfter(delay, internal.scans.runPostScanAnalysis, {
-        tenantId: args.tenantId,
-      });
-    }
+    patch.scheduled = true;
+    const delay = Math.max(
+      ANALYSIS_DEBOUNCE_MS,
+      state.lastRunAt + ANALYSIS_MIN_INTERVAL_MS - Date.now()
+    );
+    await ctx.scheduler.runAfter(delay, internal.scans.runPostScanAnalysis, {
+      tenantId: args.tenantId,
+    });
     await ctx.db.patch(state._id, patch);
   },
 });
@@ -279,6 +291,7 @@ export const runPostScanAnalysis = internalAction({
         tenantId: args.tenantId,
         scanSessionId: args.scanSessionId,
         machineId: args.machineId,
+        catalogGeneration: claim.catalogGeneration,
       });
     } catch (err) {
       await ctx.runMutation(internal.scans.restoreAnalysisAfterFailure, {
@@ -296,15 +309,21 @@ export const recordAnalysisComplete = internalMutation({
     tenantId: v.optional(v.string()),
     scanSessionId: v.optional(v.string()),
     machineId: v.optional(v.string()),
+    catalogGeneration: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    const state = await analysisStateForTenant(ctx, args.tenantId || "");
+    const current = canPublishAnalysis(state, args.catalogGeneration);
+    if (state) await ctx.db.patch(state._id, { scheduled: false,
+      ...(current ? { analyzedGeneration: args.catalogGeneration } : {}) });
     await ctx.db.insert("auditLogs", {
       tenantId: args.tenantId || "",
       machineId: args.machineId,
       action: "analysis_complete",
       entityType: "scanSession",
       entityId: args.scanSessionId,
-      message: "Auto-ran duplicate detection and recommendations after scan.",
+      message: current ? "Auto-ran duplicate detection and recommendations after scan."
+        : "Catalog changed during automatic analysis; cached results remain hidden until analysis runs again.",
       createdAt: Date.now(),
     });
   },
