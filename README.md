@@ -58,11 +58,8 @@ npx convex dev
 ```
 *(Once Convex initializes, it will automatically overwrite our compile-time stubs at `/convex/_generated/` with the live client hooks).*
 
-### 4️⃣ Seed the Database (Optional but Recommended)
-To populate DriveOS with realistic studio drives, active/archived projects, duplicates, and warning feeds:
-```bash
-npx convex dev --run seed:seed
-```
+### 4️⃣ Demo Data (Disposable Local Backends Only)
+The optional `seed:seed` reset is an internal function. It deletes existing application data and is disabled by default. It can run only on a disposable loopback Convex backend whose environment explicitly sets `DRIVEOS_ENABLE_DEMO_SEED=1`; hosted deployments are refused even with that flag. Clear the flag after loading a local demo. Normal workspaces do not need seeding.
 
 ### 5️⃣ Run Web Dashboard (Next.js)
 Start the Next.js development server:
@@ -189,9 +186,13 @@ DriveOS checks file protection before cleanup and uses a relocation pipeline for
 
 ### Interrupted agent jobs
 
-Updated agents claim jobs with a two-minute lease and renew it while working. After an agent stops, an expired leased job can be reclaimed by an updated agent for the same machine. Claim tokens prevent a previous attempt from reporting completion after losing ownership. Scan and job execution locks are held by the operating system, so a live operation is not taken over merely because it runs for a long time.
+Updated agents claim jobs with a two-minute lease and renew it at most once per twenty seconds while working. File checks share the same renewal, and throttled requests respect the server's retry delay. After an agent stops, an expired leased job can be reclaimed by an updated agent for the same machine. Claim tokens prevent a previous attempt from reporting completion after losing ownership. Scan and job execution locks are held by the operating system, so a live operation is not taken over merely because it runs for a long time.
 
 File operations record durable journals under the original agent home before reporting their results. Restart with that same agent home and configuration so the agent can reconcile completed moves, restores, or purges and finish reporting them without repeating destructive work. Preserve this directory when upgrading or troubleshooting; changing or deleting it removes the recovery evidence.
+
+Purge recovery verifies the original readable quarantine directory's identity before treating a missing file as deleted. Reconnect an unavailable drive/share before retrying. Older purge journals without directory evidence require manual reconciliation when their source is already missing.
+
+Bulk purges split into jobs of at most 4,000 files. Polling safely splits older oversized purges that have never started, cancels their parent job, and records replacement jobs. Already-started oversized jobs require manual recovery so their original disk journals stay associated with the same job ID; they do not block normal queue work.
 
 ---
 
@@ -209,7 +210,7 @@ Use this checklist to verify full operational readiness:
 
 ### Regression checks
 
-Run `npm test` for classification, Windows file protection, non-overwriting moves, cross-volume copy verification, archive inventories, process locks, invitations, workspace access, and job lease policies.
+Run `npm test` for classification, Windows file protection, non-overwriting moves, cross-volume copy verification, archive inventories, process locks, invitations, legacy workspace access, lease throttling, purge queue bounds, disconnected-drive recovery, and developer-only seed guards.
 
 Run `npm run test:local` against a disposable, auth-configured local Convex backend on ports 3210/3211. It creates an isolated QA workspace and synthetic media, then exercises scans, settings, bulk cleanup, restore, duplicate keep-copy protection, project setup, and archive generation/verification. The test refuses hosted backend URLs and leaves its fixture and logs for inspection. Override `DRIVEOS_TEST_URL`, `DRIVEOS_TEST_SITE_URL`, or `DRIVEOS_TEST_DIRECTORY` when needed. A configured local email sender is unnecessary.
 
@@ -232,3 +233,5 @@ Dashboard file operations are queued for the connected machine. Run the local ag
 Deploy the matching web dashboard, Convex backend, and updated agents together. Newly queued jobs require the lease protocol (`leaseRequired`); old agents cannot claim them. A web-only deployment does not provide the backend or agent changes.
 
 Older jobs already marked running without a claim token require manual review. Stop the old agent and inspect the physical files and existing job state before deciding how to recover them; age alone does not prove the old process has stopped. Preserve the original agent home and journals during the upgrade. This change has been tested locally; no production backend or agent deployment was performed as part of the fixes.
+
+Legacy accounts with an existing matching `teamMemberId` keep workspace access even when their user row lacks `tenantId`. The optional internal `tenants:backfillLinkedUserTenants` migration persists that tenant from the stored member ID. An explicit tenant or email conflict remains denied; email lookup never grants membership.

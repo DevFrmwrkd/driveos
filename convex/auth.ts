@@ -5,6 +5,7 @@ import type { MutationCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { ResendOTPPasswordReset } from "./ResendOTP";
 import { consumeInvitation, invitationMember, normalizedEmail } from "./invitations";
+import { backfillLinkedUserTenant } from "./access";
 
 // Open signup creates an isolated workspace. Joining an existing workspace
 // requires an administrator's single-use invitation; email alone never grants
@@ -29,6 +30,8 @@ export const { auth, signIn, signOut, store, isAuthenticated } = convexAuth({
       const email = normalizedEmail(String(args.profile.email ?? ""));
 
       if (args.existingUserId) {
+        const existingUser = await ctx.db.get(args.existingUserId);
+        await backfillLinkedUserTenant(ctx, existingUser);
         // Reset-code verification may update the existing account, but must
         // never backfill workspace membership from a user-supplied address.
         if (args.type === "verification" && args.profile.emailVerified === true) {

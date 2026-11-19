@@ -3,6 +3,7 @@ import { classifyFile } from "../packages/shared/src/index";
 
 export const PROTECTED_CLASSES = new Set(["RAW", "EXPORT_FINAL", "PROJECT_FILE", "ADMIN", "ARCHIVE_MANIFEST"]);
 export const CLEANUP_RECOMMENDATION_TYPES = new Set(["delete_cache", "delete_proxies", "remove_duplicate"]);
+export const MAX_JOB_FILES = 4000;
 
 export function protectedFile(file: any) {
   return file.isRaw || file.isFinal || file.isProjectFile || file.riskLevel === "red" ||
@@ -33,14 +34,18 @@ export async function quarantineMachine(ctx: any, item: any, tenantId: string) {
 }
 
 export async function insertApprovedJob(ctx: any, input: {
-  tenantId: string; machineId: string; requestedBy: string; action: string;
+  tenantId: string; machineId: string; requestedBy: string; approvedBy?: string; action: string;
   fileIds?: string[]; bytes?: number; result?: any; recommendationId?: string;
   rollbackUntil?: number; purgeAfter?: boolean;
 }) {
+  if ((input.fileIds?.length ?? 0) > MAX_JOB_FILES ||
+      (input.action === "purge" && (input.result?.purgeItems?.length ?? 0) > MAX_JOB_FILES)) {
+    throw new ConvexError("Split file operations into jobs of at most 4,000 files.");
+  }
   const now = Date.now();
   const jobId = await ctx.db.insert("cleanupJobs", {
     tenantId: input.tenantId, machineId: input.machineId, requestedBy: input.requestedBy,
-    approvedBy: input.requestedBy, action: input.action, status: "approved",
+    approvedBy: input.approvedBy ?? input.requestedBy, action: input.action, status: "approved",
     leaseRequired: true,
     affectedFileIds: input.fileIds ?? [], affectedBytes: input.bytes ?? 0,
     result: input.result, recommendationId: input.recommendationId,

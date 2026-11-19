@@ -10,9 +10,53 @@ interface Operation {
   size: number;
   modifiedAt: number;
   checksum: string;
+  purgeParent?: DirectoryIdentity;
   state: "prepared" | "done";
 }
 interface JournalData { version: 1; scope: string; operations: Record<string, Operation> }
+
+interface DirectoryIdentity {
+  realPath: string;
+  device: string;
+  inode: string;
+  birthtime: string;
+}
+
+// A missing file is not evidence of deletion when its external drive/share is
+// disconnected. Pin the actual parent directory before deleting, and require
+// that same readable directory when reconciling a missing file later.
+function directoryIdentity(source: string): DirectoryIdentity {
+  const parent = path.dirname(source);
+  try {
+    const realPath = fs.realpathSync.native(parent);
+    const before = fs.statSync(parent, { bigint: true });
+    if (!before.isDirectory()) throw new Error("The quarantine parent is not a directory.");
+    const directory = fs.opendirSync(parent);
+    try { directory.readSync(); } finally { directory.closeSync(); }
+    const after = fs.statSync(parent, { bigint: true });
+    if (realPath !== fs.realpathSync.native(parent) || before.dev !== after.dev ||
+        before.ino !== after.ino || before.birthtimeNs !== after.birthtimeNs)
+      throw new Error("The quarantine directory changed while checking it.");
+    return { realPath, device: before.dev.toString(), inode: before.ino.toString(), birthtime: before.birthtimeNs.toString() };
+  } catch (error) {
+    throw new Error(`Cannot verify the quarantine directory; reconnect its original drive/share and check permissions: ${parent}`, { cause: error });
+  }
+}
+
+function sourcePresent(source: string): boolean {
+  try { fs.lstatSync(source); return true; }
+  catch (error: any) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function sameDirectory(expected: DirectoryIdentity | undefined, current: DirectoryIdentity): void {
+  if (!expected) throw new Error("This older purge journal has no directory identity. Preserve it for manual recovery.");
+  if (expected.realPath !== current.realPath || expected.device !== current.device ||
+      expected.inode !== current.inode || expected.birthtime !== current.birthtime)
+    throw new Error("The quarantine directory or volume changed. Reconnect the original drive/share before recovery.");
+}
 
 function fingerprint(filename: string) {
   const before = fs.lstatSync(filename);
@@ -66,7 +110,8 @@ export class OperationJournal {
     }
     // An unrelated pre-existing destination is never adopted as our own copy.
     if (destination && fs.existsSync(destination)) throw new Error(`Destination already exists: ${destination}`);
-    const op: Operation = { kind, source, destination, ...fingerprint(source), state: "prepared" };
+    const op: Operation = { kind, source, destination, ...fingerprint(source),
+      ...(kind === "purge" ? { purgeParent: directoryIdentity(source) } : {}), state: "prepared" };
     this.data.operations[key] = op;
     this.persist();
     return op;
@@ -100,15 +145,27 @@ export class OperationJournal {
 
   purge(key: string, source: string): number {
     const op = this.prepare(key, "purge", source);
+    const present = sourcePresent(source);
+    const currentParent = directoryIdentity(source);
     if (op.state === "done") {
-      if (fs.existsSync(source)) throw new Error(`A new file appeared at a completed deletion path: ${source}`);
+      if (present) throw new Error(`A new file appeared at a completed deletion path: ${source}`);
+      sameDirectory(op.purgeParent, currentParent);
       return op.size;
     }
-    if (fs.existsSync(source)) {
+    if (present) {
       if (!this.matches(source, op, true)) throw new Error(`Quarantined content changed before deletion: ${source}`);
+      if (op.purgeParent) sameDirectory(op.purgeParent, currentParent);
+      else {
+        // Old prepared journals can be upgraded only while the verified file
+        // is still present. Persist the new evidence before touching it.
+        op.purgeParent = currentParent;
+        this.persist();
+      }
+      sameDirectory(op.purgeParent, directoryIdentity(source));
       fs.unlinkSync(source);
-    }
-    // Absence is evidence only when durable intent was recorded before deletion.
+    } else sameDirectory(op.purgeParent, currentParent);
+    // Only infer a completed unlink with durable intent and the same available
+    // parent directory; otherwise leave the operation pending for recovery.
     op.state = "done";
     this.persist();
     return op.size;

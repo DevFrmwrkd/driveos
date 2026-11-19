@@ -10,7 +10,30 @@ function setup(t: test.TestContext) {
   t.after(() => { assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir())); fs.rmSync(root, { recursive: true, force: true }); });
   const source = path.join(root, "source.dat"), destination = path.join(root, "quarantine", "source.dat"), filename = path.join(root, "journal.json");
   fs.writeFileSync(source, "irreplaceable bytes");
-  return { source, destination, filename, open: () => new OperationJournal(filename, "local:job-1") };
+  return { root, source, destination, filename, open: () => new OperationJournal(filename, "local:job-1") };
+}
+
+function mountedFixture(t: test.TestContext) {
+  const f = setup(t);
+  const mount = path.join(f.root, "mounted-drive");
+  const detached = path.join(f.root, "detached-drive");
+  fs.mkdirSync(mount);
+  const source = path.join(mount, "quarantined.dat");
+  fs.renameSync(f.source, source);
+  return { ...f, source, mount, detached };
+}
+
+function interruptPurgeBeforeUnlink(t: test.TestContext, f: ReturnType<typeof mountedFixture>) {
+  t.mock.method(fs, "unlinkSync", () => { throw new Error("interrupted before unlink"); });
+  assert.throws(() => f.open().purge("item-1", f.source), /interrupted before unlink/);
+  t.mock.restoreAll();
+  assert.equal(JSON.parse(fs.readFileSync(f.filename, "utf8")).operations["item-1"].state, "prepared");
+}
+
+function detach(f: ReturnType<typeof mountedFixture>) {
+  assert.equal(path.dirname(path.resolve(f.mount)), path.resolve(f.root));
+  assert.equal(path.dirname(path.resolve(f.detached)), path.resolve(f.root));
+  fs.renameSync(f.mount, f.detached);
 }
 
 test("a new process reconciles a move interrupted after unlink and before its receipt", t => {
@@ -94,4 +117,74 @@ test("a replacement at an already-moved original path is preserved for reconcili
   assert.throws(() => f.open().move("file-1", f.source, f.destination), /original path was recreated/);
   assert.equal(fs.readFileSync(f.source, "utf8"), "new original");
   assert.equal(fs.readFileSync(f.destination, "utf8"), "irreplaceable bytes");
+});
+
+test("a disconnected purge volume remains pending and its detached file is preserved", t => {
+  const f = mountedFixture(t);
+  interruptPurgeBeforeUnlink(t, f);
+  detach(f);
+  assert.throws(() => f.open().purge("item-1", f.source), /Cannot verify the quarantine directory/);
+  assert.equal(fs.readFileSync(path.join(f.detached, "quarantined.dat"), "utf8"), "irreplaceable bytes");
+  assert.equal(JSON.parse(fs.readFileSync(f.filename, "utf8")).operations["item-1"].state, "prepared");
+});
+
+test("a replacement mount at the same path is not evidence that the old file was deleted", t => {
+  const f = mountedFixture(t);
+  interruptPurgeBeforeUnlink(t, f);
+  detach(f);
+  fs.mkdirSync(f.mount);
+  assert.throws(() => f.open().purge("item-1", f.source), /directory or volume changed/);
+  assert.equal(fs.readFileSync(path.join(f.detached, "quarantined.dat"), "utf8"), "irreplaceable bytes");
+  assert.equal(JSON.parse(fs.readFileSync(f.filename, "utf8")).operations["item-1"].state, "prepared");
+});
+
+test("unreadable purge parents and permission-denied file probes cannot confirm a deletion", t => {
+  const f = mountedFixture(t);
+  interruptPurgeBeforeUnlink(t, f);
+  fs.unlinkSync(f.source);
+  t.mock.method(fs, "opendirSync", () => { throw Object.assign(new Error("access denied"), { code: "EACCES" }); });
+  assert.throws(() => f.open().purge("item-1", f.source), /Cannot verify the quarantine directory/);
+  t.mock.restoreAll();
+  const lstat = fs.lstatSync;
+  t.mock.method(fs, "lstatSync", ((filename: fs.PathLike, ...args: any[]) => {
+    if (String(filename) === f.source) throw Object.assign(new Error("file access denied"), { code: "EACCES" });
+    return (lstat as any)(filename, ...args);
+  }) as typeof fs.lstatSync);
+  assert.throws(() => f.open().purge("item-1", f.source), /file access denied/);
+  t.mock.restoreAll();
+  assert.equal(JSON.parse(fs.readFileSync(f.filename, "utf8")).operations["item-1"].state, "prepared");
+  assert.equal(f.open().purge("item-1", f.source), 19);
+});
+
+test("completed purge receipts require the original directory to remain available", t => {
+  const f = mountedFixture(t);
+  assert.equal(f.open().purge("item-1", f.source), 19);
+  detach(f);
+  assert.throws(() => f.open().purge("item-1", f.source), /Cannot verify the quarantine directory/);
+  fs.mkdirSync(f.mount);
+  assert.throws(() => f.open().purge("item-1", f.source), /directory or volume changed/);
+});
+
+test("old purge journals upgrade only while the verified source is still present", t => {
+  const f = mountedFixture(t);
+  interruptPurgeBeforeUnlink(t, f);
+  const data = JSON.parse(fs.readFileSync(f.filename, "utf8"));
+  delete data.operations["item-1"].purgeParent;
+  fs.writeFileSync(f.filename, JSON.stringify(data));
+  assert.equal(f.open().purge("item-1", f.source), 19);
+  assert.ok(JSON.parse(fs.readFileSync(f.filename, "utf8")).operations["item-1"].purgeParent);
+});
+
+test("old purge journals without directory evidence fail closed when the source is absent", t => {
+  for (const state of ["prepared", "done"]) {
+    const f = mountedFixture(t);
+    interruptPurgeBeforeUnlink(t, f);
+    fs.unlinkSync(f.source);
+    const data = JSON.parse(fs.readFileSync(f.filename, "utf8"));
+    delete data.operations["item-1"].purgeParent;
+    data.operations["item-1"].state = state;
+    fs.writeFileSync(f.filename, JSON.stringify(data));
+    assert.throws(() => f.open().purge("item-1", f.source), /older purge journal has no directory identity/);
+    assert.equal(JSON.parse(fs.readFileSync(f.filename, "utf8")).operations["item-1"].state, state);
+  }
 });

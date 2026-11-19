@@ -4,10 +4,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { ConvexHttpClient } from "convex/browser";
 import { anyApi } from "convex/server";
 
 const backendUrl = process.env.DRIVEOS_TEST_URL || "http://127.0.0.1:3210";
+const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 assert.ok(["127.0.0.1", "localhost", "[::1]"].includes(new URL(backendUrl).hostname), "Auth regression checks require a loopback backend.");
 const fixture = fs.mkdtempSync(path.join(process.env.DRIVEOS_TEST_DIRECTORY || os.tmpdir(), "driveos-auth-e2e-"));
 const results = [];
@@ -23,6 +26,25 @@ async function signup(email, extra = {}, passwordValue = password) {
   return instance;
 }
 const invite = (instance, email, role = "viewer") => instance.mutation(anyApi.admin.addTeamMember, { name: "Invited Editor", email, role });
+
+function localFixtureFunction(name, args = {}) {
+  const localApp = process.env.DRIVEOS_TEST_LEGACY_FIXTURE;
+  assert.ok(localApp, "Legacy fixture checks need an explicitly configured disposable app.");
+  const config = fs.readFileSync(path.join(localApp, ".env.local"), "utf8");
+  assert.match(config, /^CONVEX_DEPLOYMENT=anonymous:/m, "Legacy fixtures require an anonymous local app.");
+  assert.ok(config.split(/\r?\n/).includes(`CONVEX_URL=${backendUrl}`), "Legacy fixture must point at this loopback backend.");
+  const result = spawnSync(process.execPath, [path.join(repository, "node_modules/convex/bin/main.js"), "run", name, JSON.stringify(args)], {
+    cwd: localApp, env: { ...process.env, CONVEX_AGENT_MODE: "anonymous" }, encoding: "utf8", timeout: 30000, windowsHide: true,
+  });
+  fs.writeFileSync(path.join(fixture, `${name.replace(/:/g, "-")}-${args.mode || "run"}.log`), `${result.stdout || ""}\n${result.stderr || ""}`);
+  // Some Windows CLI versions fail during shutdown after completing the call.
+  // The caller always asserts the resulting real account state.
+  if (result.error) throw result.error;
+  const start = result.stdout.indexOf("{");
+  const end = result.stdout.lastIndexOf("}");
+  assert.ok(start >= 0 && end > start, `Fixture function did not return a result: ${result.stderr}`);
+  return JSON.parse(result.stdout.slice(start, end + 1));
+}
 try {
   const adminEmail = `qa-invite-admin-${stamp}@driveos.test`;
   const admin = await signup(adminEmail);
@@ -31,6 +53,25 @@ try {
   const otherContext = await otherAdmin.query(anyApi.tenants.currentContext, {});
   assert.notEqual(adminContext.tenant.id, otherContext.tenant.id);
   record("ordinary signup creates an isolated admin workspace");
+
+  if (process.env.DRIVEOS_TEST_LEGACY_FIXTURE) {
+    localFixtureFunction("qaLegacyMembership:setAccountShape", { email: adminEmail, mode: "legacy" });
+    const returningAdmin = client();
+    const session = await returningAdmin.action(anyApi.auth.signIn, { provider: "password", params: { flow: "signIn", email: adminEmail, password } });
+    returningAdmin.setAuth(session.tokens.token);
+    assert.equal((await returningAdmin.query(anyApi.tenants.currentContext, {})).tenant.id, adminContext.tenant.id);
+    assert.ok((await invite(returningAdmin, `qa-legacy-invite-${stamp}@driveos.test`)).invitationToken);
+    record("a legacy administrator missing only tenantId can sign in and create invitations without another administrator");
+
+    assert.ok(Number.isInteger(localFixtureFunction("tenants:backfillLinkedUserTenants").patched));
+    assert.equal(localFixtureFunction("qaLegacyMembership:assertRepaired", { email: adminEmail }).verified, true);
+    localFixtureFunction("qaLegacyMembership:setAccountShape", { email: adminEmail, mode: "conflict" });
+    assert.equal(await returningAdmin.query(anyApi.tenants.currentContext, {}), null);
+    await assert.rejects(invite(returningAdmin, `qa-conflicting-admin-${stamp}@driveos.test`), /not linked/);
+    localFixtureFunction("qaLegacyMembership:setAccountShape", { email: adminEmail, mode: "restore" });
+    assert.equal((await returningAdmin.query(anyApi.tenants.currentContext, {})).tenant.id, adminContext.tenant.id);
+    record("id-based legacy backfill persists the member tenant while explicit conflicting assignments remain denied");
+  }
 
   await assert.rejects(invite(admin, "", "viewer"), /valid email/);
   await assert.rejects(invite(admin, `qa-invalid-role-${stamp}@driveos.test`, "unexpected-role"), /valid team role/);

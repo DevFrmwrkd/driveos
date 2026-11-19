@@ -31,9 +31,9 @@ const hash = file => crypto.createHash("sha256").update(fs.readFileSync(file)).d
 const query = (module, name, args = {}) => client.query(anyApi[module][name], args);
 const mutation = (module, name, args = {}) => client.mutation(anyApi[module][name], args);
 const agentEnv = { ...process.env, DRIVEOS_AGENT_HOME: agentHome, DRIVEOS_CONVEX_URL: siteUrl };
-function agent(args, label = args[0]) {
+function agent(args, label = args[0], options = {}) {
   const result = spawnSync(process.execPath, [path.join(repository, "apps/agent/dist/index.js"), ...args], {
-    cwd: repository, env: agentEnv, encoding: "utf8", timeout: 120000, maxBuffer: 8 * 1024 * 1024,
+    cwd: options.cwd || repository, env: agentEnv, encoding: "utf8", timeout: 120000, maxBuffer: 8 * 1024 * 1024,
   });
   fs.writeFileSync(path.join(fixture, `${label}.log`), `${result.stdout || ""}\n${result.stderr || ""}`);
   assert.equal(result.status, 0, `${label} exited ${result.status}: ${result.stderr}`);
@@ -187,6 +187,11 @@ try {
   assert.equal((await query("projects", "get", { projectId })).cleanupRules.proxyDelete, false);
   record("wizard targets its drive, persists rules, and creates folders without manual approval");
   fs.writeFileSync(path.join(projectRoot, "00_ADMIN", "project-notes.txt"), "Manifest QA inventory");
+  agent(["manifest", "--projectId", projectId, "--root", path.basename(projectRoot)], "relative-cli-manifest", { cwd: media });
+  const relativeManifest = JSON.parse(fs.readFileSync(path.join(projectRoot, "09_ARCHIVE_MANIFEST", "archive_manifest.json"), "utf8"));
+  assert.equal(relativeManifest.files.length, 1);
+  assert.equal(relativeManifest.files[0].fullHash, hash(path.join(projectRoot, "00_ADMIN", "project-notes.txt")));
+  record("CLI manifest resolves a relative project root and includes small files with full checksums");
   await mutation("archive", "requestManifest", { projectId, verify: false });
   agent(["run-jobs"], "archive-generate");
   const archivePath = path.join(projectRoot, "09_ARCHIVE_MANIFEST", "archive_manifest.json");

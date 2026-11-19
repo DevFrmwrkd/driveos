@@ -1,7 +1,7 @@
 import { v } from "convex/values";
 import { mutation, query, internalAction, internalMutation } from "./_generated/server";
 import { internal } from "./_generated/api";
-import { resolveMember, requireRole } from "./access";
+import { resolveMember, requireRole, backfillLinkedUserTenant } from "./access";
 
 // Who am I + which workspace am I in. Non-throwing: returns null when signed out.
 export const currentContext = query({
@@ -95,6 +95,37 @@ export const backfillTablePage = internalMutation({
   },
 });
 
+// Older users already carry a member id. Copy only that member's tenant, after
+// checking the stored email and rejecting conflicting explicit assignments.
+// Missing links are never guessed from email addresses.
+export const backfillLinkedUserTenantsPage = internalMutation({
+  args: { cursor: v.union(v.string(), v.null()) },
+  handler: async (ctx, args) => {
+    const page = await ctx.db.query("users").paginate({ cursor: args.cursor, numItems: 500 });
+    let patched = 0;
+    for (const user of page.page) if (await backfillLinkedUserTenant(ctx, user)) patched++;
+    return { patched, done: page.isDone, cursor: page.continueCursor };
+  },
+});
+
+// Optional eager persistence repair. Legacy sign-ins already work through the
+// authoritative member link, including when every workspace admin is legacy.
+export const backfillLinkedUserTenants = internalAction({
+  args: {},
+  handler: async (ctx): Promise<{ patched: number }> => {
+    let cursor: string | null = null;
+    let patched = 0;
+    for (;;) {
+      const page: { patched: number; done: boolean; cursor: string } = await ctx.runMutation(
+        internal.tenants.backfillLinkedUserTenantsPage, { cursor }
+      );
+      patched += page.patched;
+      if (page.done) return { patched };
+      cursor = page.cursor;
+    }
+  },
+});
+
 // Driver: ensures the default tenant, then pages each table to stamp it.
 export const backfillExistingData = internalAction({
   args: {},
@@ -114,6 +145,8 @@ export const backfillExistingData = internalAction({
       }
       perTable[table] = total;
     }
+    const users = await ctx.runAction(internal.tenants.backfillLinkedUserTenants, {});
+    perTable.users = users.patched;
     return { tenantId, perTable };
   },
 });

@@ -276,6 +276,9 @@ export default defineSchema({
     claimToken: v.optional(v.string()),
     leaseExpiresAt: v.optional(v.number()),
     attempts: v.optional(v.number()),
+    // Oversized legacy jobs must be repaired or reviewed before another claim.
+    pollBlocked: v.optional(v.boolean()),
+    pollBlockedReason: v.optional(v.string()),
     result: v.optional(v.any()),
     createdAt: v.number(),
     updatedAt: v.number(),
@@ -284,7 +287,8 @@ export default defineSchema({
     .index("by_tenant", ["tenantId"])
     .index("by_tenant_status", ["tenantId", "status"])
     .index("by_tenant_machine_status", ["tenantId", "machineId", "status"])
-    .index("by_tenant_machine_status_lease", ["tenantId", "machineId", "status", "leaseExpiresAt"]),
+    .index("by_tenant_machine_status_lease", ["tenantId", "machineId", "status", "leaseExpiresAt"])
+    .index("by_tenant_machine_status_poll", ["tenantId", "machineId", "status", "pollBlockedReason", "leaseExpiresAt"]),
 
   quarantineItems: defineTable({
     tenantId: v.optional(v.string()),

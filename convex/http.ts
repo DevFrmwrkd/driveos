@@ -144,7 +144,7 @@ post("createManifest", async (ctx, body, machine) => {
 });
 
 post("pollPendingJobs", async (ctx, body, machine) => {
-  return await ctx.runQuery(internal.cleanup.pollPendingJobs, { ...scoped(body, machine), machineId: machine.machineId });
+  return await ctx.runMutation(internal.cleanup.pollPendingJobs, { ...scoped(body, machine), machineId: machine.machineId });
 });
 
 post("getJob", async (ctx, body, machine) => {

@@ -34,7 +34,7 @@ documented in §6 below so they can be regenerated.
 
 ⚠️ **Never point these at someone else's deployment.** `determined-anaconda-827`
 is the one tied to the Google account on this machine. If you ever switch
-deployments, update **all three** places above + re-seed.
+deployments, update **all three** places above. Do not reset existing workspace data.
 
 ---
 
@@ -108,14 +108,11 @@ CONVEX_SITE_URL=https://determined-anaconda-827.convex.site
 
 ## 7. Seeding (optional)
 
-The deployment already holds prior precheck/seed data. To load the full demo
-dataset (⚠️ may overwrite existing rows):
-
-```powershell
-npx convex run seed:seed
-```
-
-Decide before running — skip if you want to keep current data.
+Demo seeding deletes application tables. `seed:seed` is internal and disabled by
+default; it can run only on a disposable loopback backend with
+`DRIVEOS_ENABLE_DEMO_SEED=1` set in that backend's environment. Hosted deployments
+are refused. Clear the flag after loading a local demo, and skip seeding for any
+workspace whose data should be preserved.
 
 ---
 

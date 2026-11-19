@@ -1,7 +1,7 @@
 import { ConvexError, v } from "convex/values";
 import { internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import { requireMember, requireRole, inTenant } from "./access";
-import { CLEANUP_RECOMMENDATION_TYPES, fileMachine, insertApprovedJob, protectedFile, quarantineMachine } from "./jobUtils";
+import { CLEANUP_RECOMMENDATION_TYPES, fileMachine, insertApprovedJob, MAX_JOB_FILES, protectedFile, quarantineMachine } from "./jobUtils";
 import { workspaceSettings } from "./settings";
 import { classifyFile } from "../packages/shared/src/index";
 import { decideJobLease, jobAvailableToAgent, withoutClaimToken } from "./jobLease";
@@ -276,14 +276,20 @@ async function queuePurge(ctx: any, member: any, items: any[]) {
   const groups = new Map<string, any[]>();
   for (const item of items) {
     const machineId = await quarantineMachine(ctx, item, member.tenantId);
-    groups.set(machineId, [...(groups.get(machineId) ?? []), item]);
+    if (!groups.has(machineId)) groups.set(machineId, []);
+    groups.get(machineId)!.push(item);
   }
   const jobIds = [];
-  for (const [machineId, group] of groups) jobIds.push(await insertApprovedJob(ctx, {
-    tenantId: member.tenantId, machineId, requestedBy: member.email, action: "purge",
-    fileIds: group.map(i => i.fileId), bytes: group.reduce((s, i) => s + i.sizeBytes, 0),
-    result: { purgeItems: group.map(i => ({ quarantineItemId: String(i._id), quarantinePath: i.quarantinePath })) },
-  }));
+  for (const [machineId, group] of groups) {
+    for (let offset = 0; offset < group.length; offset += MAX_JOB_FILES) {
+      const chunk = group.slice(offset, offset + MAX_JOB_FILES);
+      jobIds.push(await insertApprovedJob(ctx, {
+        tenantId: member.tenantId, machineId, requestedBy: member.email, action: "purge",
+        fileIds: chunk.map(i => i.fileId), bytes: chunk.reduce((s, i) => s + i.sizeBytes, 0),
+        result: { purgeItems: chunk.map(i => ({ quarantineItemId: String(i._id), quarantinePath: i.quarantinePath })) },
+      }));
+    }
+  }
   for (const item of items) await ctx.db.patch(item._id, { status: "pending_purge" });
   return { queued: items.length, jobIds, jobId: jobIds[0] };
 }
@@ -358,34 +364,118 @@ export const getQuarantineItem = internalQuery({ args: { quarantineId: v.string(
   return item;
 }});
 
-export const pollPendingJobs = internalQuery({ args: { machineId: v.string(), tenantId: v.optional(v.string()), leaseProtocol: v.optional(v.number()) }, handler: async (ctx, args) => {
-  const tenantId = args.tenantId || "";
-  const maximumJobs = 4;
-  const maximumFiles = 4000;
+function jobFileCount(job: any) {
+  return Math.max(job.affectedFileIds.length, job.action === "purge" ? (job.result?.purgeItems?.length ?? 0) : 0);
+}
+
+async function blockOversizedJob(ctx: any, job: any, reason: string) {
+  await ctx.db.patch(job._id, { pollBlocked: true, pollBlockedReason: reason, updatedAt: Date.now() });
+  await ctx.db.insert("auditLogs", {
+    tenantId: job.tenantId, machineId: job.machineId, action: "job_recovery_required", entityType: "cleanupJob", entityId: String(job._id),
+    message: reason === "oversized_purge_waiting_split"
+      ? "Oversized pending purge will be split into bounded jobs by the next agent poll."
+      : "Oversized file operation requires manual review; existing physical-operation journals must be preserved.",
+    createdAt: Date.now(),
+  });
+}
+
+function canSplitOversizedPurge(job: any) {
+  return job.action === "purge" && ["approved", "queued"].includes(job.status) &&
+    !job.claimToken && !job.attempts && job.affectedFileIds.length === job.result?.purgeItems?.length;
+}
+
+// Only never-started purges can change job identity safely. A started job's
+// durable disk receipts belong to its original id and require manual recovery.
+async function splitOversizedPurge(ctx: any, job: any) {
+  const items = [];
+  for (let index = 0; index < job.result.purgeItems.length; index++) {
+    const entry = job.result.purgeItems[index];
+    const id = ctx.db.normalizeId("quarantineItems", entry.quarantineItemId);
+    const item = id ? inTenant(await ctx.db.get(id), job.tenantId) : null;
+    if (!item || item.status !== "pending_purge" || item.fileId !== job.affectedFileIds[index] ||
+        item.quarantinePath !== entry.quarantinePath || await quarantineMachine(ctx, item, job.tenantId) !== job.machineId) {
+      await blockOversizedJob(ctx, job, "oversized_purge_requires_review");
+      return false;
+    }
+    items.push(item);
+  }
+  // Cancelling the parent in this transaction also rejects a stale worker's
+  // later claim. No existing file is confirmed moved or deleted by this repair.
+  await ctx.db.patch(job._id, { status: "cancelled", pollBlocked: undefined, pollBlockedReason: undefined, updatedAt: Date.now() });
+  const jobIds = [];
+  for (let offset = 0; offset < items.length; offset += MAX_JOB_FILES) {
+    const chunk = items.slice(offset, offset + MAX_JOB_FILES);
+    jobIds.push(await insertApprovedJob(ctx, {
+      tenantId: job.tenantId, machineId: job.machineId, requestedBy: job.requestedBy, approvedBy: job.approvedBy, action: "purge",
+      fileIds: chunk.map(item => item.fileId), bytes: chunk.reduce((sum, item) => sum + item.sizeBytes, 0),
+      result: { purgeItems: chunk.map(item => ({ quarantineItemId: String(item._id), quarantinePath: item.quarantinePath })), splitFromJobId: String(job._id) },
+    }));
+  }
+  await ctx.db.patch(job._id, { result: { ...job.result, replacementJobIds: jobIds } });
+  return true;
+}
+
+async function pollCandidates(ctx: any, tenantId: string, machineId: string, leaseProtocol: number | undefined, now: number) {
   const jobs = [];
   const pendingJobs = [];
-  const now = Date.now();
   for (const status of ["approved", "queued"]) {
-    let pending = ctx.db.query("cleanupJobs").withIndex("by_tenant_machine_status", q =>
-      q.eq("tenantId", tenantId).eq("machineId", args.machineId).eq("status", status));
-    if (args.leaseProtocol !== 1) pending = pending.filter(q =>
+    let pending = ctx.db.query("cleanupJobs").withIndex("by_tenant_machine_status_poll", (q: any) =>
+      q.eq("tenantId", tenantId).eq("machineId", machineId).eq("status", status).eq("pollBlockedReason", undefined));
+    if (leaseProtocol !== 1) pending = pending.filter((q: any) =>
       q.and(q.neq(q.field("leaseRequired"), true), q.eq(q.field("claimToken"), undefined)));
-    pendingJobs.push(...await pending.take(maximumJobs));
+    pendingJobs.push(...await pending.take(4));
   }
-  if (args.leaseProtocol === 1) {
+  if (leaseProtocol === 1) {
     // Range-scope before the limit: old tokenless jobs and active long jobs
     // cannot hide an expired lease behind the first 200 running records.
-    jobs.push(...await ctx.db.query("cleanupJobs").withIndex("by_tenant_machine_status_lease", q =>
-      q.eq("tenantId", tenantId).eq("machineId", args.machineId).eq("status", "running")
+    jobs.push(...await ctx.db.query("cleanupJobs").withIndex("by_tenant_machine_status_poll", (q: any) =>
+      q.eq("tenantId", tenantId).eq("machineId", machineId).eq("status", "running").eq("pollBlockedReason", undefined)
         .gt("leaseExpiresAt", 0).lte("leaseExpiresAt", now))
-      .filter(q => q.neq(q.field("claimToken"), undefined)).take(maximumJobs));
+      .filter((q: any) => q.neq(q.field("claimToken"), undefined)).take(4));
   }
   jobs.push(...pendingJobs.sort((a, b) => a.createdAt - b.createdAt));
+  return jobs;
+}
+
+export const pollPendingJobs = internalMutation({ args: { machineId: v.string(), tenantId: v.optional(v.string()), leaseProtocol: v.optional(v.number()) }, handler: async (ctx, args) => {
+  const tenantId = args.tenantId || "";
+  const now = Date.now();
+  let repairAttempted = false;
+  // Bound repair writes to one parent per poll. Marking other oversized rows
+  // lets indexed candidates progress while their repair waits for later polls.
+  for (const status of ["approved", "queued"]) {
+    const blocked = await ctx.db.query("cleanupJobs").withIndex("by_tenant_machine_status_poll", q =>
+      q.eq("tenantId", tenantId).eq("machineId", args.machineId).eq("status", status)
+        .eq("pollBlockedReason", "oversized_purge_waiting_split")).first();
+    if (blocked) {
+      repairAttempted = true;
+      if (canSplitOversizedPurge(blocked)) await splitOversizedPurge(ctx, blocked);
+      else await blockOversizedJob(ctx, blocked, "oversized_purge_requires_review");
+      break;
+    }
+  }
+  let jobs = await pollCandidates(ctx, tenantId, args.machineId, args.leaseProtocol, now);
+  let inspected = 0;
+  while (inspected < 16) {
+    const oversized = jobs.filter(job => jobFileCount(job) > MAX_JOB_FILES);
+    if (!oversized.length) break;
+    for (const job of oversized) {
+      if (inspected++ >= 16) break;
+      if (!repairAttempted && canSplitOversizedPurge(job)) {
+        repairAttempted = true;
+        await splitOversizedPurge(ctx, job);
+      } else {
+        await blockOversizedJob(ctx, job, canSplitOversizedPurge(job)
+          ? "oversized_purge_waiting_split" : "oversized_operation_requires_review");
+      }
+    }
+    jobs = await pollCandidates(ctx, tenantId, args.machineId, args.leaseProtocol, now);
+  }
   const result = [];
   let hydratedFiles = 0;
   for (const job of jobs.filter(j => jobAvailableToAgent(j, now, args.leaseProtocol))) {
-    if (result.length >= maximumJobs) break;
-    if (hydratedFiles + job.affectedFileIds.length > maximumFiles) continue;
+    if (result.length >= 4) break;
+    if (hydratedFiles + jobFileCount(job) > MAX_JOB_FILES) continue;
     const files = [];
     for (const fid of job.affectedFileIds) {
       const id = ctx.db.normalizeId("files", fid);
@@ -425,6 +515,9 @@ export const updateJobStatus = internalMutation({ args: {
   const job = id ? inTenant(await ctx.db.get(id), tenantId) : null;
   if (!job || !job.machineId || (args.machineId && job.machineId !== args.machineId)) throw new ConvexError("Unknown machine job.");
   if (!["running", "completed", "failed"].includes(args.status)) throw new ConvexError("Invalid job status.");
+  if (job.pollBlocked && args.status === "running" && (!job.claimToken || job.claimToken !== args.claimToken)) {
+    return { claimed: false, reason: job.pollBlockedReason || "job_requires_review", status: job.status };
+  }
   const now = Date.now();
   const lease = decideJobLease(job, args.status, args.claimToken, now);
   if (!lease.accepted) return { claimed: false, reason: lease.reason, status: job.status };

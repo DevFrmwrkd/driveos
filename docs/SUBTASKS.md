@@ -11,7 +11,7 @@ Do:
 Decide the single source-of-truth Convex deployment for driveos.
 Point web (NEXT_PUBLIC_CONVEX_URL), agent (convexUrl + CONVEX_SITE_URL for the HTTP API), and root env at that one deployment.
 Add driveos-config.json + local state files to .gitignore (machine-specific; currently committed).
-Re-seed if needed: npx convex dev --run seed:seed.
+Demo resets are restricted to explicitly enabled disposable local backends; see README.md before using the internal `seed:seed` function.
 Smoke test: agent scan → metadata shows in the same dashboard the web app reads.
 
 

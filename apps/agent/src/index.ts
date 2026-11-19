@@ -8,10 +8,11 @@ import { Command } from "commander";
 import chokidar from "chokidar";
 import dotenv from "dotenv";
 import { classifyFile, calculateFileRisk } from "@driveos/shared";
-import { isProtectedSourceFile, moveFileSafely, quarantineDestination, QUARANTINE_FOLDER_NAME } from "./fileOperations.js";
+import { isProtectedSourceFile, quarantineDestination, QUARANTINE_FOLDER_NAME } from "./fileOperations.js";
 import { walkManifestFiles } from "./manifestFiles.js";
 import { createProcessLock } from "./scanLock.js";
 import { OperationJournal } from "./operationJournal.js";
+import { JobLeaseClient, JobLeaseLostError, RateLimitedError, withRateLimitBackoff } from "./jobLeaseClient.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), "apps/web/.env.local") });
 dotenv.config({ path: path.resolve(process.cwd(), ".env.local") });
@@ -322,17 +323,7 @@ function resolveConvexHttpUrl(convexUrl: string) {
   return trimmed.replace(".convex.cloud", ".convex.site");
 }
 
-// The backend answered 429: this machine or workspace hit its safety budget.
-// The caller must stop sending, not log-and-continue.
-class RateLimitedError extends Error {
-  retryAfterSeconds: number;
-  constructor(message: string, retryAfterSeconds: number) {
-    super(message);
-    this.name = "RateLimitedError";
-    this.retryAfterSeconds = retryAfterSeconds;
-  }
-}
-
+// Transport failures remain distinct from server-requested rate-limit delays.
 class BackendSyncError extends Error {
   constructor(message: string) {
     super(message);
@@ -656,14 +647,16 @@ function writeProjectStructure(root: string, project: any, projectId: string, al
 }
 
 async function renewJobLease(job: any) {
-  const lease = await syncToConvex("updateJobStatus", { jobId: job._id, status: "running", claimToken: job.claimToken });
-  if (!lease.claimed) throw new Error(`Job lease lost: ${lease.reason || "another agent owns this attempt"}`);
+  if (!(job.leaseClient instanceof JobLeaseClient)) throw new Error("The job has no active lease.");
+  await job.leaseClient.ensureValid();
 }
 
 async function reportJob(job: any, payload: any) {
-  await renewJobLease(job);
-  const result = await syncToConvex("updateJobStatus", { ...payload, jobId: job._id, claimToken: job.claimToken });
-  if (!result.claimed) throw new Error(`Job result was not accepted: ${result.reason || result.status}`);
+  await withRateLimitBackoff(async () => {
+    await renewJobLease(job);
+    const result = await syncToConvex("updateJobStatus", { ...payload, jobId: job._id, claimToken: job.claimToken });
+    if (!result.claimed) throw new Error(`Job result was not accepted: ${result.reason || result.status}`);
+  });
 }
 
 async function executeQuarantineJob(job: any, config: DriveOSConfig, journal: OperationJournal) {
@@ -702,8 +695,10 @@ async function executeQuarantineJob(job: any, config: DriveOSConfig, journal: Op
           }
         }
       }
+      await renewJobLease(job);
       journal.move(file._id, file.path, destination);
     } catch (err: any) {
+      if (err instanceof RateLimitedError || err instanceof JobLeaseLostError) throw err;
       // Preserve a running job when a physical move may have succeeded but its
       // receipt could not be persisted. The next attempt reconciles the journal.
       if (journal.completed(file._id) || (journal.has(file._id) && !fs.existsSync(file.path))) throw err;
@@ -745,6 +740,7 @@ async function executePurgeJob(job: any, journal: OperationJournal) {
       console.log(`[Purge] Permanently deleted ${item.quarantinePath}`);
       purgedItemIds.push(item.quarantineItemId);
     } catch (err: any) {
+      if (err instanceof RateLimitedError || err instanceof JobLeaseLostError) throw err;
       if (journal.has(item.quarantineItemId) && !fs.existsSync(item.quarantinePath)) throw err;
       console.error(`[Purge Error] Could not delete ${item.quarantinePath}: ${err.message}`);
       failures.push({ quarantineItemId: item.quarantineItemId, error: err.message });
@@ -758,7 +754,7 @@ async function executePurgeJob(job: any, journal: OperationJournal) {
   console.log(`[Success] Purged ${purgedItemIds.length} item(s), freed ${(freedBytes / (1024 ** 3)).toFixed(2)} GB.`);
 }
 
-async function generateArchiveManifest(projectId: string, rootOverride?: string, verify = false, expectedManifestChecksum?: string) {
+async function generateArchiveManifest(projectId: string, rootOverride?: string, verify = false, expectedManifestChecksum?: string, allowCloudRoot = false) {
   const projectRes = await syncToConvex("getProject", { projectId });
   const project = projectRes.project;
   const configuredRoot = rootOverride || project?.rootPath;
@@ -766,7 +762,9 @@ async function generateArchiveManifest(projectId: string, rootOverride?: string,
     throw new Error("The project must have an existing absolute local root before a manifest can be generated.");
   }
   const root = path.resolve(configuredRoot);
-  if (cloudSyncProvider(root)) throw new Error("Archive manifests must be generated on a local project drive.");
+  const provider = cloudSyncProvider(root);
+  if (provider && !allowCloudRoot) throw new Error("Archive manifests must be generated on a local project drive. Use --allow-cloud-root for an explicit CLI override.");
+  if (provider) console.warn(`[Cloud Folder Warning] Generating a full-checksum manifest inside ${provider}: ${root}`);
   const manifestPath = path.join(root, "09_ARCHIVE_MANIFEST", "archive_manifest.json");
   let baseline: any = null;
   if (verify) {
@@ -826,12 +824,13 @@ async function executeJob(job: any, config: DriveOSConfig): Promise<boolean> {
   try {
     console.log(`[Agent Queue] Executing job ${job._id}: ${job.action}`);
     job.claimToken = crypto.randomUUID();
-    const claim = await syncToConvex("updateJobStatus", { jobId: job._id, status: "running", claimToken: job.claimToken });
+    const claim = await withRateLimitBackoff(() => syncToConvex("updateJobStatus", { jobId: job._id, status: "running", claimToken: job.claimToken }));
     if (claim.claimed !== true) {
       console.log(`[Agent Queue] Job ${job._id} was already claimed or completed — skipped.`);
       return false;
     }
     claimed = true;
+    job.leaseClient = new JobLeaseClient(() => syncToConvex("updateJobStatus", { jobId: job._id, status: "running", claimToken: job.claimToken }));
     const journal = new OperationJournal(journalPath, scope);
     let renewing = false;
     heartbeat = setInterval(() => {
@@ -1975,12 +1974,13 @@ program
   .description("Generate an archive manifest for a project root")
   .requiredOption("-i, --projectId <id>", "Project ID from backend")
   .option("-r, --root <dir>", "Project root path; defaults to backend project.rootPath")
-  .option("--full-hash", "Calculate streaming SHA-256 full hashes for manifest entries")
+  .option("--full-hash", "Compatibility option: archive manifests always include full SHA-256 checksums")
   .option("--allow-cloud-root", "Allow writing manifest inside a cloud-synced project root")
   .action(async (options) => {
     const config = loadConfig();
     validateRuntimeConfig(config);
-    const result = await generateArchiveManifest(options.projectId, options.root);
+    const root = options.root ? path.resolve(options.root) : undefined;
+    const result = await generateArchiveManifest(options.projectId, root, false, undefined, Boolean(options.allowCloudRoot));
     console.log(`[Manifest Success] ${result.manifestPath}`);
     console.log(`[Manifest Success] ${result.fileCount} file(s), checksum ${result.checksum}`);
   });
