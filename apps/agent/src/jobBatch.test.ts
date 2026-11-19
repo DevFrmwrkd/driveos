@@ -118,9 +118,9 @@ test("real CLI batches 300 quarantine/purge files within the API budget and retr
   }
   await agent(["init", "--machine", "Batch-QA", "--owner", "batch@driveos.test", "--convex", baseUrl,
     "--auth-token", token, "--roots", path.dirname(media), "--central-quarantine", "--quarantine", quarantineRoot]);
-  await agent(["run-jobs"]);
+  const quarantineOutput = await agent(["run-jobs"]);
   const quarantine = receipts.get("quarantine-batch");
-  assert.equal(jobs.get("quarantine-batch").status, "completed");
+  assert.equal(jobs.get("quarantine-batch").status, "completed", quarantineOutput);
   assert.equal(quarantine?.quarantineFiles.length, 300);
   assert.deepEqual(quarantine.result.failures, []);
   assert.equal(quarantine.result.moved, 300);
@@ -136,9 +136,9 @@ test("real CLI batches 300 quarantine/purge files within the API budget and retr
   jobs.set("purge-batch", { _id: "purge-batch", action: "purge", status: "approved", files: [],
     affectedFileIds: files.map(file => file._id), result: { purgeItems: quarantine.quarantineFiles.map((file: any) =>
       ({ quarantineItemId: `quarantine-${file.fileId}`, quarantinePath: file.quarantinePath })) } });
-  await agent(["run-jobs"]);
+  const purgeOutput = await agent(["run-jobs"]);
   const purge = receipts.get("purge-batch");
-  assert.equal(jobs.get("purge-batch").status, "completed");
+  assert.equal(jobs.get("purge-batch").status, "completed", purgeOutput);
   assert.equal(purge?.result.purgedItemIds.length, 300);
   assert.deepEqual(purge.result.failures, []);
   for (const moved of quarantine.quarantineFiles) assert.equal(fs.existsSync(moved.quarantinePath), false);
