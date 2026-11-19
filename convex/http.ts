@@ -84,7 +84,7 @@ function post(path: string, handler: (ctx: any, body: any, machine?: any) => Pro
 const scoped = (body: any, machine: any) => ({ ...body, tenantId: machine.tenantId });
 
 post("registerMachine", async (ctx, body, machine) => {
-  const machineId = await ctx.runMutation(internal.drives.registerMachine, scoped(body, machine));
+  const machineId = await ctx.runMutation(internal.drives.registerMachine, { ...scoped(body, machine), machineId: machine.machineId });
   return { success: true, machineId };
 });
 
@@ -99,7 +99,7 @@ post("registerDrive", async (ctx, body, machine) => {
 });
 
 post("removeDrive", async (ctx, body, machine) => {
-  const result = await ctx.runMutation(internal.drives.removeByVolumeId, scoped(body, machine));
+  const result = await ctx.runMutation(internal.drives.removeByVolumeId, { ...scoped(body, machine), machineId: machine.machineId });
   return { success: true, ...result };
 });
 

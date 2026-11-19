@@ -15,7 +15,7 @@ import { createProcessLock } from "./scanLock.js";
 import { OperationJournal } from "./operationJournal.js";
 import { JobLeaseClient, JobLeaseLostError, RateLimitedError, withRateLimitBackoff } from "./jobLeaseClient.js";
 import { isRegenerablePath, verifyKeepCopy, type KeepCopyProof } from "./keepCopy.js";
-import { WatchQueue, WatchRootGuard, catalogReceipts, cachedParentIdentities, directoryIdentity, fingerprintFromUploaded, type CatalogReceipt, type CatalogFingerprint, type DirectoryIdentity } from "./watchQueue.js";
+import { WatchQueue, WatchRootGuard, UnresolvedRemovals, catalogReceipts, catalogSnapshotFromCache, cachedParentIdentities, directoryIdentity, receiptMatchesScope, selectCatalogSnapshot, type CatalogReceipt, type CatalogSnapshot, type DirectoryIdentity } from "./watchQueue.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), "apps/web/.env.local") });
 dotenv.config({ path: path.resolve(process.cwd(), ".env.local") });
@@ -1735,7 +1735,6 @@ program
     const config = loadConfig();
     validateRuntimeConfig(config);
     const hashCache = loadHashCache();
-    const queue = new WatchQueue<FileMetadata>();
     const pending = new Map<string, NodeJS.Timeout>();
     const intervalMs = Math.max(1, Number(options.intervalMinutes) || 60) * 60 * 1000;
     const debounceMs = Math.max(1, Number(options.debounceSeconds) || 8) * 1000;
@@ -1758,22 +1757,9 @@ program
       .sort((a, b) => b.length - a.length);
     const catalogRoot = containingRoots[0] || watchDir;
     const rootGuard = new WatchRootGuard([watchDir, catalogRoot]);
-    const uploaded = new Map<string, { receipt?: CatalogReceipt; fingerprint?: CatalogFingerprint; parent?: DirectoryIdentity }>();
+    const uploaded = new Map<string, CatalogSnapshot>();
     const cacheKeys = new Map<string, Set<string>>();
     const parentIdentityFor = cachedParentIdentities();
-    for (const [key, entry] of Object.entries(hashCache)) {
-      const filePath = key.slice(0, -(String(entry.sizeBytes).length + 1));
-      const relative = path.relative(watchDir, filePath);
-      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) continue;
-      if (!cacheKeys.has(filePath)) cacheKeys.set(filePath, new Set());
-      cacheKeys.get(filePath)!.add(key);
-      const fingerprint = entry.catalogReceipt || fingerprintFromUploaded(filePath, entry.uploadedFp);
-      if (!fingerprint) continue;
-      const previous = uploaded.get(filePath);
-      if (!previous || (entry.catalogReceipt?.catalogVersion ?? -1) >= (previous.receipt?.catalogVersion ?? -1)) {
-        uploaded.set(filePath, { receipt: entry.catalogReceipt, fingerprint, parent: parentIdentityFor(filePath, entry.catalogParent) });
-      }
-    }
     const cloudProvider = cloudSyncProvider(catalogRoot);
     const machineRes = await syncToConvex("registerMachine", {
       name: config.machineName,
@@ -1795,6 +1781,27 @@ program
       tier: cloudProvider ? "cloud" : "hot",
     });
     const driveId = driveRes.driveId;
+    const catalogScope = { driveId, machineId };
+    const queue = new WatchQueue<FileMetadata>(catalogScope);
+    const unresolved = new UnresolvedRemovals();
+
+    function indexCatalogCache(cache: Record<string, HashCacheEntry>, selected?: Set<string>) {
+      for (const [key, entry] of Object.entries(cache)) {
+        const filePath = key.slice(0, -(String(entry.sizeBytes).length + 1));
+        if (selected && !selected.has(filePath)) continue;
+        const relative = path.relative(watchDir, filePath);
+        if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) continue;
+        if (!cacheKeys.has(filePath)) cacheKeys.set(filePath, new Set());
+        cacheKeys.get(filePath)!.add(key);
+        const cached = catalogSnapshotFromCache(filePath, entry);
+        if (!cached) continue;
+        const snapshot = selectCatalogSnapshot(uploaded.get(filePath), {
+          ...cached, parent: parentIdentityFor(filePath, cached.parent),
+        }, catalogScope);
+        uploaded.set(filePath, snapshot);
+      }
+    }
+    indexCatalogCache(hashCache);
 
     if (driveRes.isNew) {
       const rootPrefix = catalogRoot.endsWith(path.sep) ? catalogRoot : catalogRoot + path.sep;
@@ -1829,15 +1836,11 @@ program
       // an identical recreation upload again instead of trusting that stamp.
       clearPathUploadStamp(filePath);
       if (!queued) {
-        for (const key of cacheKeys.get(filePath) || []) {
-          if (!hashCache[key]?.catalogReceipt && !hashCache[key]?.uploadedFp) delete hashCache[key];
-        }
-        cacheKeys.delete(filePath);
-        if (++ignoredRemovals === 1 || ignoredRemovals % 100 === 0) {
-          console.log(`[Watcher Removed] Ignored ${ignoredRemovals} removal(s) with no uploaded catalog fingerprint.`);
-        }
+        unresolved.removed(filePath);
+        if (unresolved.size >= 500) void processQueue();
         return;
       }
+      unresolved.cancel(filePath);
       console.log(`[Watcher File Removed] Queued catalog reconciliation: ${filePath}`);
     }
 
@@ -1852,7 +1855,7 @@ program
     }
 
     async function flushQueue() {
-      if (!queue.size || Date.now() < retryAfter) return;
+      if ((!queue.size && !unresolved.size) || Date.now() < retryAfter) return;
       if (loadState().paused) {
         console.log(`[Watcher Paused] Holding ${queue.size} queued change(s) until resume.`);
         return;
@@ -1869,15 +1872,36 @@ program
       let persistedCache: Record<string, HashCacheEntry> | undefined;
       try {
         persistedCache = loadHashCache();
+        const unknown = unresolved.snapshot();
+        const relevant = new Set([...unknown.map(entry => entry.path), ...queue.deletions().map(entry => entry.path)]);
+        indexCatalogCache(persistedCache, relevant);
+        for (let start = 0; start < unknown.length; start += 500) {
+          for (const entry of unknown.slice(start, start + 500)) {
+            if (!unresolved.consume(entry)) continue;
+            const snapshot = uploaded.get(entry.path);
+            if (snapshot && queue.deleted(entry.path, snapshot.receipt, snapshot.parent, snapshot.fingerprint)) {
+              clearPathUploadStamp(entry.path);
+            } else {
+              for (const key of cacheKeys.get(entry.path) || []) {
+                if (!hashCache[key]?.catalogReceipt && !hashCache[key]?.uploadedFp) delete hashCache[key];
+              }
+              cacheKeys.delete(entry.path);
+              ignoredRemovals++;
+            }
+          }
+          await yieldToIO();
+        }
+        if (ignoredRemovals) console.log(`[Watcher Removed] ${ignoredRemovals} removal(s) had no uploaded catalog fingerprint after refreshing the scan cache.`);
+        // Unknown tiny-file churn drains locally and never opens scan sessions
+        // or sends receipt requests when the fresh cache proves nothing uploaded.
+        if (!queue.size) { persistedCache = undefined; return; }
         clearUploadStamps(hashCache);
         clearUploadStamps(persistedCache);
         const batch = queue.changes();
         const deletions = queue.deletions();
-        const deletedByPath = new Map(deletions.map(entry => [entry.path, entry]));
-        for (const entry of Object.values(persistedCache)) {
-          const receipt = entry.catalogReceipt;
-          const deletion = receipt && deletedByPath.get(receipt.path);
-          if (deletion) queue.refreshFromCache(deletion, receipt, entry.catalogParent);
+        for (const deletion of deletions) {
+          const snapshot = uploaded.get(deletion.path);
+          if (snapshot) queue.refreshFromSnapshot(deletion, snapshot);
         }
         function assertCanSync() {
           if (loadState().paused) throw new Error("Watcher paused; queued changes remain held.");
@@ -1910,7 +1934,7 @@ program
               files: slice.map(change => ({ ...change.metadata!, ...(change.forceObservation ? { forceObservation: true } : {}) })),
             });
           } finally { for (const change of slice) queue.endUpload(change); }
-          const receipts = new Map(catalogReceipts(result.receipts).map(receipt => [receipt.path, receipt]));
+          const receipts = new Map(catalogReceipts(result.receipts).filter(receipt => receiptMatchesScope(receipt, catalogScope)).map(receipt => [receipt.path, receipt]));
           for (const change of slice) {
             const meta = change.metadata!, receipt = receipts.get(change.path);
             if (!receipt || receipt.sizeBytes !== meta.sizeBytes || receipt.modifiedAtFile !== meta.modifiedAtFile ||
@@ -2032,6 +2056,7 @@ program
     }
 
     function schedule(filePath: string, forceObservation = false) {
+      unresolved.cancel(filePath);
       const generation = queue.changed(filePath, forceObservation);
       if (forceObservation) clearPathUploadStamp(filePath);
       const existing = pending.get(filePath);

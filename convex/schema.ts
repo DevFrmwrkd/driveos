@@ -78,6 +78,9 @@ export default defineSchema({
     label: v.string(),
     volumeId: v.string(),
     machineId: v.optional(v.string()),
+    // Versioned identities are scoped to an authenticated machine. Legacy
+    // rows are adopted only after an indexed catalog-ownership check.
+    identityVersion: v.optional(v.number()),
     ownerId: v.string(), // matches teamMember ID
     capacityBytes: v.number(),
     freeBytes: v.number(),
@@ -96,7 +99,8 @@ export default defineSchema({
   })
     .index("by_owner", ["ownerId"])
     .index("by_tenant", ["tenantId"])
-    .index("by_tenant_volume", ["tenantId", "volumeId"]),
+    .index("by_tenant_volume", ["tenantId", "volumeId"])
+    .index("by_tenant_machine_volume_identity", ["tenantId", "machineId", "volumeId", "identityVersion"]),
 
   scanSessions: defineTable({
     tenantId: v.optional(v.string()),
@@ -120,6 +124,9 @@ export default defineSchema({
     tenantId: v.string(),
     catalogGeneration: v.optional(v.number()),
     analyzedGeneration: v.optional(v.number()),
+    analysisRunId: v.optional(v.number()),
+    analysisFunctionId: v.optional(v.id("_scheduled_functions")),
+    analysisClaimed: v.optional(v.boolean()),
     dirtyCount: v.number(), // files inserted/materially changed since last run
     scheduled: v.boolean(), // an analysis run is already queued
     lastRunAt: v.number(), // when analysis last STARTED (0 = never)
@@ -171,6 +178,7 @@ export default defineSchema({
     .index("by_project", ["projectId"])
     .index("by_project_active", ["projectId", "deletedAt"])
     .index("by_drive_path", ["driveId", "path"])
+    .index("by_drive_catalog_owner", ["driveId", "tenantId", "machineId"])
     .index("by_drive_active", ["driveId", "deletedAt"])
     .index("by_tenant", ["tenantId"])
     .index("by_tenant_active", ["tenantId", "deletedAt"]),

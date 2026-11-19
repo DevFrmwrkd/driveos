@@ -12,16 +12,16 @@ const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".
 const nodeRequire = createRequire(import.meta.url);
 const modules = new Map();
 const internal = {
-  scans: Object.fromEntries(["captureAnalysisGeneration", "finishManualAnalysis", "claimAnalysisRun", "recordAnalysisComplete", "restoreAnalysisAfterFailure", "runPostScanAnalysis"]
+  scans: Object.fromEntries(["captureAnalysisGeneration", "claimManualAnalysisRun", "runManualAnalysis", "finishManualAnalysis", "claimAnalysisRun", "recordAnalysisComplete", "restoreAnalysisAfterFailure", "runPostScanAnalysis"]
     .map(name => [name, name])),
   duplicates: { runDuplicateDetection: "runDuplicateDetection" },
   recommendations: { generateRecommendations: "generateRecommendations" },
 };
-function load(filename) {
+function load(filename, cache = modules) {
   filename = path.resolve(filename);
-  if (modules.has(filename)) return modules.get(filename);
+  if (cache.has(filename)) return cache.get(filename);
   const exports = {};
-  modules.set(filename, exports);
+  cache.set(filename, exports);
   const code = ts.transpileModule(fs.readFileSync(filename, "utf8"), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
@@ -34,36 +34,44 @@ function load(filename) {
       inTenant: (doc, tenantId) => doc?.tenantId === tenantId ? doc : null,
     };
     if (name === "./jobUtils") return { protectedFile: () => false };
-    if (name.startsWith(".")) return load(path.resolve(path.dirname(filename), `${name}.ts`));
+    if (name.startsWith(".")) return load(path.resolve(path.dirname(filename), `${name}.ts`), cache);
     return nodeRequire(name);
   };
   new Function("require", "exports", code)(require, exports);
   return exports;
 }
-const previousAuto = process.env.DRIVEOS_AUTO_ANALYSIS;
-process.env.DRIVEOS_AUTO_ANALYSIS = "true";
-const scans = load(path.join(repository, "convex/scans.ts"));
-if (previousAuto === undefined) delete process.env.DRIVEOS_AUTO_ANALYSIS;
-else process.env.DRIVEOS_AUTO_ANALYSIS = previousAuto;
+function loadScans(enabled) {
+  const previousAuto = process.env.DRIVEOS_AUTO_ANALYSIS;
+  process.env.DRIVEOS_AUTO_ANALYSIS = String(enabled);
+  try { return load(path.join(repository, "convex/scans.ts"), new Map()); }
+  finally {
+    if (previousAuto === undefined) delete process.env.DRIVEOS_AUTO_ANALYSIS;
+    else process.env.DRIVEOS_AUTO_ANALYSIS = previousAuto;
+  }
+}
+const scans = loadScans(true), scansOff = loadScans(false);
 const duplicates = load(path.join(repository, "convex/duplicates.ts"));
 const recommendations = load(path.join(repository, "convex/recommendations.ts"));
 const { catalogAnalysisIsCurrent } = load(path.join(repository, "convex/catalogAnalysis.ts"));
 
-function fixture(generation = 1, analyzedGeneration = 0) {
+function fixture(generation = 1, analyzedGeneration = 0, handlers = scans) {
   const tenantId = "tenant-a";
   const state = { _id: "analysisState:1", tenantId, catalogGeneration: generation, analyzedGeneration, dirtyCount: 1, scheduled: true, lastRunAt: 0 };
   const live = { _id: "files:1", tenantId, name: "live.mov", path: "/review/live.mov", sizeBytes: 10, source: "local" };
   const deleted = { ...live, _id: "files:2", path: "/review/removed.mov", deletedAt: 123 };
   const cluster = { _id: "duplicateClusters:1", tenantId, status: "open", fileIds: [live._id, deleted._id], recommendedKeepFileId: live._id, wastedBytes: 10 };
   const rec = { _id: "recommendations:1", tenantId, status: "open", affectedFileIds: [deleted._id], affectedBytes: 10 };
-  const tables = { analysisState: [state], files: [live, deleted], duplicateClusters: [cluster], recommendations: [rec], auditLogs: [] };
+  const session = { _id: "scanSessions:1", tenantId, machineId: "machines:1", rootPath: "/review", status: "running", filesScanned: 0, bytesScanned: 0 };
+  const tables = { analysisState: [state], files: [live, deleted], duplicateClusters: [cluster], recommendations: [rec], auditLogs: [], scanSessions: [session] };
   const documents = new Map(Object.values(tables).flat().map(row => [row._id, row]));
   const reads = [], scheduled = [];
+  const jobs = new Map();
   const db = {
     normalizeId: (table, id) => id.startsWith(`${table}:`) ? id : null,
     get: async id => structuredClone(documents.get(id) ?? null),
     patch: async (id, patch) => Object.assign(documents.get(id), structuredClone(patch)),
-    insert: async (table, row) => { tables[table].push(row); return `${table}:${tables[table].length}`; },
+    insert: async (table, row) => { const id = `${table}:${tables[table].length + 1}`; const doc = { ...structuredClone(row), _id: id }; tables[table].push(doc); documents.set(id, doc); return id; },
+    system: { get: async id => structuredClone(jobs.get(id) ?? null) },
     query(table) {
       reads.push(table);
       const filters = [];
@@ -80,11 +88,27 @@ function fixture(generation = 1, analyzedGeneration = 0) {
       return chain;
     },
   };
-  const ctx = { tenantId, db, scheduler: { runAfter: async (...args) => scheduled.push(args) } };
-  ctx.runQuery = async (reference, args) => scans[reference].handler(ctx, args);
-  ctx.runMutation = async (reference, args) => scans[reference].handler(ctx, args);
+  const ctx = { tenantId, db, scheduler: {
+    runAfter: async (delay, reference, args) => {
+      const id = `_scheduled_functions:${scheduled.length + 1}`;
+      scheduled.push([delay, reference, structuredClone(args), id]);
+      jobs.set(id, { _id: id, name: `scans:${reference}`, args: [structuredClone(args)], scheduledTime: Date.now() + delay, state: { kind: "pending" } });
+      return id;
+    },
+    cancel: async id => { jobs.get(id).state = { kind: "canceled" }; },
+  } };
+  ctx.runQuery = async (reference, args) => handlers[reference].handler(ctx, args);
+  ctx.runMutation = async (reference, args) => handlers[reference].handler(ctx, args);
   ctx.runAction = async () => {};
-  return { ctx, state, cluster, rec, live, deleted, reads, scheduled };
+  return { ctx, state, cluster, rec, live, deleted, session, reads, scheduled, jobs,
+    setHandlers: next => { handlers = next; },
+    async runScheduled(index) {
+      const [, reference, args, id] = scheduled[index], job = jobs.get(id);
+      job.state = { kind: "inProgress" };
+      try { await handlers[reference].handler(ctx, args); if (job.state.kind !== "canceled") job.state = { kind: "success" }; }
+      catch (error) { job.state = { kind: "failed" }; throw error; }
+    },
+  };
 }
 
 test("legacy analysis remains readable until a catalog generation invalidates it", () => {
@@ -122,7 +146,7 @@ test("manual analysis publishes only the generation captured before its asynchro
       }
     };
     await scans.runManualAnalysis.handler(f.ctx, { tenantId: f.ctx.tenantId });
-    assert.equal(f.state.scheduled, false);
+    assert.equal(f.state.scheduled, changeDuringAnalysis);
     assert.equal(f.state.analyzedGeneration, changeDuringAnalysis ? 0 : 1);
     assert.equal(f.state.dirtyCount, changeDuringAnalysis ? 2 : 0);
     assert.equal(catalogAnalysisIsCurrent(f.state), !changeDuringAnalysis);
@@ -155,7 +179,7 @@ test("automatic analysis captures its claimed generation and blocks overlapping 
       }
     };
     await scans.runPostScanAnalysis.handler(f.ctx, { tenantId: f.ctx.tenantId });
-    assert.equal(f.state.scheduled, false);
+    assert.equal(f.state.scheduled, changeDuringAnalysis);
     assert.equal(f.state.analyzedGeneration, changeDuringAnalysis ? 0 : 3);
     assert.equal(f.state.dirtyCount, changeDuringAnalysis ? 1 : 0);
     assert.equal(catalogAnalysisIsCurrent(f.state), !changeDuringAnalysis);
@@ -170,4 +194,169 @@ test("automatic failure restores claimed dirty work and schedules one bounded re
   assert.equal(f.state.scheduled, true);
   assert.equal(f.scheduled.length, 1);
   assert.equal(catalogAnalysisIsCurrent(f.state), false);
+});
+
+const MINUTE = 60_000, DAY = 24 * 60 * MINUTE;
+function clock(t) {
+  let now = 2_000_000_000_000;
+  t.mock.method(Date, "now", () => now);
+  return { get now() { return now; }, set(value) { now = value; } };
+}
+async function completeScan(f, handlers = scans) {
+  await handlers.complete.handler(f.ctx, { sessionId: f.session._id, status: "completed", errorsCount: 0, tenantId: f.ctx.tenantId });
+}
+
+test("a scan completing during analysis gets one follow-up that publishes without another scan", async t => {
+  const time = clock(t), f = fixture(3, 0);
+  f.state.scheduled = false;
+  await completeScan(f);
+  assert.equal(f.scheduled.length, 1);
+  assert.equal(f.scheduled[0][0], 5 * MINUTE);
+  time.set(time.now + f.scheduled[0][0]);
+  const firstStartedAt = time.now;
+  f.ctx.runAction = async reference => {
+    if (reference !== "runDuplicateDetection") return;
+    f.state.catalogGeneration++;
+    f.state.dirtyCount++;
+    await completeScan(f);
+    await completeScan(f);
+    assert.equal(f.scheduled.length, 1);
+  };
+  await f.runScheduled(0);
+  assert.equal(f.state.scheduled, true);
+  assert.equal(f.state.analysisClaimed, false);
+  assert.equal(f.state.dirtyCount, 1);
+  assert.equal(catalogAnalysisIsCurrent(f.state), false);
+  assert.equal(f.scheduled.length, 2);
+  const followUp = f.jobs.get(f.state.analysisFunctionId);
+  assert.equal(followUp.scheduledTime, firstStartedAt + DAY);
+  assert.equal([...f.jobs.values()].filter(job => job.state.kind === "pending").length, 1);
+  time.set(followUp.scheduledTime);
+  f.ctx.runAction = async () => {};
+  await f.runScheduled(1);
+  assert.equal(f.state.analyzedGeneration, 4);
+  assert.equal(f.state.dirtyCount, 0);
+  assert.equal(f.state.scheduled, false);
+  assert.equal(f.scheduled.length, 2);
+  assert.equal(catalogAnalysisIsCurrent(f.state), true);
+  assert.equal((await recommendations.list.handler(f.ctx, {})).length, 1);
+});
+
+test("an early automatic worker preserves the daily floor with one replacement timer", async t => {
+  const time = clock(t), f = fixture();
+  f.state.scheduled = false;
+  f.state.lastRunAt = time.now;
+  await completeScan(f);
+  let actions = 0;
+  f.ctx.runAction = async () => { actions++; };
+  await f.runScheduled(0); // Simulate an older timer firing before the floor.
+  assert.equal(actions, 0);
+  assert.equal(f.scheduled.length, 2);
+  assert.equal(f.jobs.get(f.state.analysisFunctionId).scheduledTime, time.now + DAY);
+  assert.equal([...f.jobs.values()].filter(job => job.state.kind === "pending").length, 1);
+  time.set(time.now + DAY);
+  await f.runScheduled(1);
+  assert.equal(actions, 2);
+  assert.equal(f.state.scheduled, false);
+});
+
+test("manual failures retain dirty work and only opt-in workspaces queue automatic retry", async t => {
+  const time = clock(t);
+  for (const [handlers, automatic] of [[scans, true], [scansOff, false]]) {
+    const f = fixture(2, 0, handlers);
+    f.state.scheduled = false;
+    await handlers.requestAnalysis.handler(f.ctx, {});
+    f.ctx.runAction = async () => { throw new Error("manual retry fixture"); };
+    await assert.rejects(f.runScheduled(0), /manual retry fixture/);
+    assert.equal(f.state.dirtyCount, 1);
+    assert.equal(f.state.scheduled, automatic);
+    assert.equal(f.state.analysisClaimed, false);
+    assert.equal(f.scheduled.length, automatic ? 2 : 1);
+    if (automatic) assert.equal(f.jobs.get(f.state.analysisFunctionId).scheduledTime, time.now + DAY);
+    else {
+      time.set(time.now + 5 * MINUTE);
+      assert.equal((await handlers.requestAnalysis.handler(f.ctx, {})).scheduled, true);
+    }
+  }
+});
+
+test("disabling automatic analysis cancels pending work and permits a fenced manual request", async t => {
+  clock(t);
+  const f = fixture();
+  f.state.scheduled = false;
+  await completeScan(f);
+  const old = f.scheduled[0], oldFunction = f.state.analysisFunctionId;
+  f.setHandlers(scansOff);
+  assert.equal((await scansOff.requestAnalysis.handler(f.ctx, {})).scheduled, true);
+  assert.equal(f.jobs.get(oldFunction).state.kind, "canceled");
+  const current = f.state.analysisRunId;
+  await scansOff.runPostScanAnalysis.handler(f.ctx, old[2]);
+  await scansOff.runManualAnalysis.handler(f.ctx, { tenantId: f.ctx.tenantId });
+  await scansOff.finishManualAnalysis.handler(f.ctx, { tenantId: f.ctx.tenantId, success: true, catalogGeneration: 1 });
+  await scansOff.recordAnalysisComplete.handler(f.ctx, { tenantId: f.ctx.tenantId, catalogGeneration: 1, analysisRunId: old[2].analysisRunId });
+  assert.equal(f.state.analysisRunId, current);
+  assert.equal(f.state.scheduled, true);
+  await f.runScheduled(1);
+  assert.equal(f.state.scheduled, false);
+  assert.equal(f.state.dirtyCount, 0);
+});
+
+test("an automatic worker disabled before claim releases its flag without discarding dirty work", async t => {
+  clock(t);
+  const f = fixture();
+  f.state.scheduled = false;
+  await completeScan(f);
+  f.setHandlers(scansOff);
+  await f.runScheduled(0);
+  assert.equal(f.state.scheduled, false);
+  assert.equal(f.state.analysisFunctionId, undefined);
+  assert.equal(f.state.dirtyCount, 1);
+  assert.equal(f.scheduled.length, 1);
+  assert.equal((await scansOff.requestAnalysis.handler(f.ctx, {})).scheduled, true);
+});
+
+test("canceled pending manual work can be replaced and its stale completion cannot release the replacement", async t => {
+  clock(t);
+  const f = fixture();
+  f.state.scheduled = false;
+  await scans.requestAnalysis.handler(f.ctx, {});
+  const old = f.scheduled[0];
+  await f.ctx.scheduler.cancel(old[3]);
+  assert.equal((await scans.requestAnalysis.handler(f.ctx, {})).scheduled, true);
+  assert.notEqual(f.state.analysisRunId, old[2].analysisRunId);
+  const current = structuredClone(f.state);
+  await scans.finishManualAnalysis.handler(f.ctx, { ...old[2], success: true, catalogGeneration: 1 });
+  await scans.restoreAnalysisAfterFailure.handler(f.ctx, { ...old[2], claimedDirtyCount: 100 });
+  assert.deepEqual(f.state, current);
+  assert.equal(await scans.captureAnalysisGeneration.handler(f.ctx, { tenantId: f.ctx.tenantId }), null);
+});
+
+test("a hard-failed claimed worker is recovered even after it consumed its dirty count", async t => {
+  const time = clock(t), f = fixture(2, 1);
+  f.state.scheduled = false;
+  await completeScan(f);
+  const job = f.jobs.get(f.state.analysisFunctionId);
+  Object.assign(f.state, { analysisClaimed: true, dirtyCount: 0, lastRunAt: time.now });
+  job.state = { kind: "failed" };
+  await completeScan(f);
+  assert.equal(f.state.dirtyCount, 1);
+  assert.equal(f.state.scheduled, true);
+  assert.equal(f.state.analysisClaimed, false);
+  assert.equal(f.scheduled.length, 2);
+  assert.equal(f.jobs.get(f.state.analysisFunctionId).scheduledTime, time.now + DAY);
+});
+
+test("canceling an active owner cannot overlap another run, and an orphan remains repairable", async t => {
+  const time = clock(t), f = fixture();
+  f.state.scheduled = false;
+  await scans.requestAnalysis.handler(f.ctx, {});
+  const old = f.scheduled[0];
+  await scans.claimManualAnalysisRun.handler(f.ctx, old[2]);
+  await f.ctx.scheduler.cancel(old[3]);
+  assert.equal((await scans.requestAnalysis.handler(f.ctx, {})).scheduled, false);
+  time.set(time.now + 61 * MINUTE);
+  assert.equal((await scans.requestAnalysis.handler(f.ctx, {})).scheduled, true);
+  const current = structuredClone(f.state);
+  await scans.finishManualAnalysis.handler(f.ctx, { ...old[2], success: true, catalogGeneration: 1 });
+  assert.deepEqual(f.state, current);
 });

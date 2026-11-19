@@ -371,7 +371,8 @@ export const getCatalogReceipts = internalQuery({
 // authority for its own drive and active watched scan root.
 export const reportMissingFiles = internalMutation({
   args: { scanSessionId: v.string(), machineId: v.string(), driveId: v.string(), tenantId: v.optional(v.string()),
-    files: v.array(v.object({ ...fingerprintFields, fileId: v.string(), catalogVersion: v.number() })) },
+    files: v.array(v.object({ ...fingerprintFields, fileId: v.string(), catalogVersion: v.number(),
+      driveId: v.optional(v.string()), machineId: v.optional(v.string()) })) },
   handler: async (ctx, args) => {
     if (args.files.length < 1 || args.files.length > MAX_CATALOG_RECEIPTS) throw new ConvexError("Deletion receipts require 1 to 100 files.");
     const { tenantId, session } = await catalogScope(ctx, args);
@@ -379,7 +380,9 @@ export const reportMissingFiles = internalMutation({
     const receipts = [];
     let deleted = 0;
     for (const expected of args.files) {
-      if (!Number.isSafeInteger(expected.catalogVersion) || expected.catalogVersion < 0 || !catalogPathWithin(expected.path, session.rootPath)) {
+      if (!Number.isSafeInteger(expected.catalogVersion) || expected.catalogVersion < 0 || !catalogPathWithin(expected.path, session.rootPath) ||
+        (expected.driveId !== undefined && expected.driveId !== args.driveId) ||
+        (expected.machineId !== undefined && expected.machineId !== args.machineId)) {
         receipts.push({ path: expected.path, status: "conflict" }); continue;
       }
       const id = ctx.db.normalizeId("files", expected.fileId);

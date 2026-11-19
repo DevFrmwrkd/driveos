@@ -2,12 +2,55 @@ import { ConvexError, v } from "convex/values";
 import { internalAction, internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { requireMember, requireRole } from "./access";
-import { analysisStateForTenant, canPublishAnalysis, catalogGeneration } from "./catalogAnalysis";
+import { analysisStateForTenant, canPublishAnalysis, catalogGeneration, catalogAnalysisIsCurrent,
+  analysisFollowUpDelay, ownsAnalysisRun, ANALYSIS_MIN_INTERVAL_MS } from "./catalogAnalysis";
 
 const configuredManualLimit = Number(process.env.DRIVEOS_MANUAL_ANALYSIS_MAX_FILES || 250000);
 const MANUAL_ANALYSIS_MAX_FILES = Math.min(1000000, Math.max(1000,
   Number.isFinite(configuredManualLimit) ? Math.floor(configuredManualLimit) : 250000));
 const MANUAL_ANALYSIS_COOLDOWN_MS = 5 * 60 * 1000;
+const AUTO_ANALYSIS_ENABLED = process.env.DRIVEOS_AUTO_ANALYSIS === "true";
+// A canceled action can still finish its running code. Keep that owner fenced
+// longer than Convex's maximum action duration before repairing an orphan.
+const ANALYSIS_OWNER_GRACE_MS = 60 * 60 * 1000;
+
+async function enqueueAnalysis(ctx: any, state: any, manual = false, context: any = {}) {
+  const analysisRunId = (state.analysisRunId ?? 0) + 1;
+  const analysisFunctionId = await ctx.scheduler.runAfter(manual ? 0 : analysisFollowUpDelay(state.lastRunAt, Date.now()),
+    manual ? internal.scans.runManualAnalysis : internal.scans.runPostScanAnalysis,
+    { tenantId: state.tenantId, ...context, analysisRunId });
+  await ctx.db.patch(state._id, { scheduled: true, analysisRunId, analysisFunctionId, analysisClaimed: false });
+}
+
+async function releaseAnalysis(ctx: any, state: any, patch: any = {}) {
+  if (state.analysisFunctionId) {
+    const job = await ctx.db.system.get(state.analysisFunctionId);
+    if (job?.state.kind === "pending") await ctx.scheduler.cancel(state.analysisFunctionId);
+  }
+  const next = { ...state, ...patch, scheduled: false, analysisFunctionId: undefined, analysisClaimed: false };
+  await ctx.db.patch(state._id, { ...patch, scheduled: false, analysisFunctionId: undefined, analysisClaimed: false });
+  if (AUTO_ANALYSIS_ENABLED && next.dirtyCount > 0) await enqueueAnalysis(ctx, next);
+}
+
+// A pending canceled/failed job must not leave the public manual action locked
+// forever. Claimed owners remain fenced while their code can still be active.
+async function recoverAnalysisOwner(ctx: any, state: any): Promise<{ state: any; active: boolean }> {
+  if (!state?.scheduled) return { state, active: false };
+  const job = state.analysisFunctionId ? await ctx.db.system.get(state.analysisFunctionId) : null;
+  if (job?.state.kind === "pending" || job?.state.kind === "inProgress") {
+    if (job.state.kind !== "pending" || AUTO_ANALYSIS_ENABLED || !job.name.endsWith(":runPostScanAnalysis"))
+      return { state, active: true };
+    await ctx.scheduler.cancel(state.analysisFunctionId);
+  } else if (((job?.state.kind === "canceled" && state.analysisClaimed) ||
+    (!job && (state.analysisClaimed || !state.analysisFunctionId))) &&
+    state.lastRunAt + ANALYSIS_OWNER_GRACE_MS > Date.now()) {
+    return { state, active: true };
+  }
+  const patch = { scheduled: false, analysisFunctionId: undefined, analysisClaimed: false,
+    dirtyCount: !catalogAnalysisIsCurrent(state) ? Math.max(1, state.dirtyCount) : state.dirtyCount };
+  await ctx.db.patch(state._id, patch);
+  return { state: { ...state, ...patch }, active: false };
+}
 
 // Explicit dashboard requests never enable the expensive automatic scanner.
 // Bound the current in-memory analyzer while an incremental catalog analyzer
@@ -17,33 +60,50 @@ export const requestAnalysis = mutation({
   args: {},
   handler: async (ctx) => {
     const { tenantId } = await requireRole(ctx, ["admin", "producer", "editor", "assistant_editor"]);
-    const state = await ctx.db.query("analysisState").withIndex("by_tenant", q => q.eq("tenantId", tenantId)).first();
-    if (state?.scheduled) return { scheduled: false, message: "Analysis is already queued or running." };
+    const owner = await recoverAnalysisOwner(ctx, await analysisStateForTenant(ctx, tenantId));
+    let state = owner.state;
+    if (owner.active) return { scheduled: false, message: "Analysis is already queued or running." };
     if (state && state.lastRunAt + MANUAL_ANALYSIS_COOLDOWN_MS > Date.now())
       return { scheduled: false, message: "Analysis was run recently. Try again in five minutes." };
     const file = await ctx.db.query("files").withIndex("by_tenant", q => q.eq("tenantId", tenantId)).first();
     if (!file) return { scheduled: false, message: "Scan a drive before running analysis." };
-    const now = Date.now();
-    if (state) await ctx.db.patch(state._id, { scheduled: true, lastRunAt: now });
-    else await ctx.db.insert("analysisState", { tenantId, dirtyCount: 0, scheduled: true, lastRunAt: now });
-    await ctx.scheduler.runAfter(0, internal.scans.runManualAnalysis, { tenantId });
+    if (!state) {
+      const value = { tenantId, dirtyCount: 0, scheduled: false, lastRunAt: 0 };
+      state = { ...value, _id: await ctx.db.insert("analysisState", value) };
+    }
+    await enqueueAnalysis(ctx, state, true);
     return { scheduled: true, message: `Duplicate and cleanup analysis queued (up to ${MANUAL_ANALYSIS_MAX_FILES.toLocaleString()} catalog files).` };
   },
 });
 
 export const captureAnalysisGeneration = internalQuery({
-  args: { tenantId: v.string() },
-  handler: async (ctx, args) => catalogGeneration(await analysisStateForTenant(ctx, args.tenantId)),
+  args: { tenantId: v.string(), analysisRunId: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const state = await analysisStateForTenant(ctx, args.tenantId);
+    return ownsAnalysisRun(state, args.analysisRunId) ? catalogGeneration(state) : null;
+  },
+});
+
+export const claimManualAnalysisRun = internalMutation({
+  args: { tenantId: v.string(), analysisRunId: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const state = await analysisStateForTenant(ctx, args.tenantId);
+    if (!ownsAnalysisRun(state, args.analysisRunId) || state.analysisClaimed) return null;
+    await ctx.db.patch(state._id, { analysisClaimed: true, lastRunAt: Date.now() });
+    return catalogGeneration(state);
+  },
 });
 
 export const runManualAnalysis = internalAction({
-  args: { tenantId: v.string() },
+  args: { tenantId: v.string(), analysisRunId: v.optional(v.number()) },
   handler: async (ctx, args) => {
     let generation: number | undefined;
     try {
-      generation = await ctx.runQuery(internal.scans.captureAnalysisGeneration, args);
-      await ctx.runAction(internal.duplicates.runDuplicateDetection, { ...args, maxFiles: MANUAL_ANALYSIS_MAX_FILES });
-      await ctx.runAction(internal.recommendations.generateRecommendations, { ...args, maxFiles: MANUAL_ANALYSIS_MAX_FILES });
+      const captured = await ctx.runMutation(internal.scans.claimManualAnalysisRun, args);
+      if (captured === null) return;
+      generation = captured;
+      await ctx.runAction(internal.duplicates.runDuplicateDetection, { tenantId: args.tenantId, maxFiles: MANUAL_ANALYSIS_MAX_FILES });
+      await ctx.runAction(internal.recommendations.generateRecommendations, { tenantId: args.tenantId, maxFiles: MANUAL_ANALYSIS_MAX_FILES });
       await ctx.runMutation(internal.scans.finishManualAnalysis, { ...args, success: true, catalogGeneration: generation });
     } catch (error) {
       await ctx.runMutation(internal.scans.finishManualAnalysis, { ...args, success: false, error: String(error), catalogGeneration: generation });
@@ -53,12 +113,12 @@ export const runManualAnalysis = internalAction({
 });
 
 export const finishManualAnalysis = internalMutation({
-  args: { tenantId: v.string(), success: v.boolean(), error: v.optional(v.string()), catalogGeneration: v.optional(v.number()) },
+  args: { tenantId: v.string(), success: v.boolean(), error: v.optional(v.string()), catalogGeneration: v.optional(v.number()), analysisRunId: v.optional(v.number()) },
   handler: async (ctx, args) => {
     const state = await analysisStateForTenant(ctx, args.tenantId);
+    if (!ownsAnalysisRun(state, args.analysisRunId)) return;
     const current = args.success && canPublishAnalysis(state, args.catalogGeneration);
-    if (state) await ctx.db.patch(state._id, { scheduled: false,
-      ...(current ? { dirtyCount: 0, analyzedGeneration: args.catalogGeneration } : {}) });
+    await releaseAnalysis(ctx, state, current ? { dirtyCount: 0, analyzedGeneration: args.catalogGeneration } : {});
     await ctx.db.insert("auditLogs", { tenantId: args.tenantId, action: args.success ? "analysis_complete" : "analysis_failed",
       entityType: "analysis", message: args.success
         ? current ? "Duplicate detection and cleanup analysis completed." : "Analysis finished after the catalog changed; cached results remain hidden. Run analysis again."
@@ -116,18 +176,6 @@ export const start = internalMutation({
     return sessionId;
   },
 });
-
-// How long after a scan completes before analysis fires. Long enough that all
-// roots/passes of one agent sync cycle coalesce into a single run.
-const ANALYSIS_DEBOUNCE_MS = 5 * 60 * 1000;
-// Floor between analysis runs per tenant. Analysis pages the entire catalog,
-// so its cost scales with catalog size, not with what changed — running it per
-// scan session (10×/hour) was the single biggest bandwidth burner.
-const ANALYSIS_MIN_INTERVAL_MS = 24 * 60 * 60 * 1000;
-// Emergency kill switch: the current analyzer cannot safely rebuild a
-// 10-million-row catalog. It is off by default; explicitly set
-// DRIVEOS_AUTO_ANALYSIS=true only after replacing it with incremental analysis.
-const AUTO_ANALYSIS_ENABLED = process.env.DRIVEOS_AUTO_ANALYSIS === "true";
 
 // Agent-only (internal): close a scan session and trigger per-tenant analysis.
 export const complete = internalMutation({
@@ -192,19 +240,9 @@ export const complete = internalMutation({
     // at a time (scheduled flag), and runs are at least a day apart. A cycle
     // of unchanged scans therefore schedules NOTHING.
     if (AUTO_ANALYSIS_ENABLED && (args.status === "completed" || args.status === "partial")) {
-      const state = await ctx.db
-        .query("analysisState")
-        .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
-        .first();
-      if (state && state.dirtyCount > 0 && !state.scheduled) {
-        const earliestNextRun = state.lastRunAt + ANALYSIS_MIN_INTERVAL_MS;
-        const delay = Math.max(ANALYSIS_DEBOUNCE_MS, earliestNextRun - timestamp);
-        await ctx.db.patch(state._id, { scheduled: true });
-        await ctx.scheduler.runAfter(delay, internal.scans.runPostScanAnalysis, {
-          tenantId,
-          scanSessionId: id,
-          machineId: session.machineId,
-        });
+      const owner = await recoverAnalysisOwner(ctx, await analysisStateForTenant(ctx, tenantId));
+      if (owner.state?.dirtyCount > 0 && !owner.active) {
+        await enqueueAnalysis(ctx, owner.state, false, { scanSessionId: id, machineId: session.machineId });
       }
     }
   },
@@ -214,22 +252,28 @@ export const complete = internalMutation({
 // only scheduling time) so hundreds of jobs queued by an older deployment
 // self-cancel after the first claimant instead of all scanning the catalog.
 export const claimAnalysisRun = internalMutation({
-  args: { tenantId: v.string() },
+  args: { tenantId: v.string(), analysisRunId: v.optional(v.number()) },
   handler: async (ctx, args) => {
+    const state = await analysisStateForTenant(ctx, args.tenantId);
+    if (!state || state.analysisClaimed || (args.analysisRunId !== undefined
+      ? !ownsAnalysisRun(state, args.analysisRunId)
+      : state.analysisRunId !== undefined)) return { shouldRun: false, claimedDirtyCount: 0 };
     if (!AUTO_ANALYSIS_ENABLED) {
+      if (state.scheduled) await releaseAnalysis(ctx, state);
       return { shouldRun: false, claimedDirtyCount: 0 };
     }
-
-    const state = await ctx.db
-      .query("analysisState")
-      .withIndex("by_tenant", (q) => q.eq("tenantId", args.tenantId))
-      .first();
-    if (!state || state.dirtyCount <= 0) {
+    if (state.dirtyCount <= 0) {
+      if (state.scheduled) await releaseAnalysis(ctx, state);
       return { shouldRun: false, claimedDirtyCount: 0 };
     }
 
     const now = Date.now();
     if (state.lastRunAt + ANALYSIS_MIN_INTERVAL_MS > now) {
+      // A legacy anonymous worker may be a duplicate of an action already in
+      // progress. Wait out that owner before replacing its unknown schedule.
+      if (args.analysisRunId === undefined && state.scheduled && state.lastRunAt + ANALYSIS_OWNER_GRACE_MS > now)
+        return { shouldRun: false, claimedDirtyCount: 0 };
+      await releaseAnalysis(ctx, state);
       return { shouldRun: false, claimedDirtyCount: 0 };
     }
 
@@ -238,34 +282,24 @@ export const claimAnalysisRun = internalMutation({
       // Keep manual requests out until this action finishes publishing both
       // datasets. Concurrent analyzers could overwrite a newer generation.
       scheduled: true,
+      analysisRunId: state.analysisRunId ?? 1,
+      analysisClaimed: true,
       dirtyCount: 0,
       lastRunAt: now,
     });
-    return { shouldRun: true, claimedDirtyCount, catalogGeneration: catalogGeneration(state) };
+    return { shouldRun: true, claimedDirtyCount, catalogGeneration: catalogGeneration(state), analysisRunId: state.analysisRunId ?? 1 };
   },
 });
 
 export const restoreAnalysisAfterFailure = internalMutation({
-  args: { tenantId: v.string(), claimedDirtyCount: v.number() },
+  args: { tenantId: v.string(), claimedDirtyCount: v.number(), analysisRunId: v.optional(v.number()) },
   handler: async (ctx, args) => {
     const state = await ctx.db
       .query("analysisState")
       .withIndex("by_tenant", (q) => q.eq("tenantId", args.tenantId))
       .first();
-    if (!state) return;
-
-    const patch: { dirtyCount: number; scheduled?: boolean } = {
-      dirtyCount: state.dirtyCount + args.claimedDirtyCount,
-    };
-    patch.scheduled = true;
-    const delay = Math.max(
-      ANALYSIS_DEBOUNCE_MS,
-      state.lastRunAt + ANALYSIS_MIN_INTERVAL_MS - Date.now()
-    );
-    await ctx.scheduler.runAfter(delay, internal.scans.runPostScanAnalysis, {
-      tenantId: args.tenantId,
-    });
-    await ctx.db.patch(state._id, patch);
+    if (!state || !ownsAnalysisRun(state, args.analysisRunId)) return;
+    await releaseAnalysis(ctx, state, { dirtyCount: state.dirtyCount + args.claimedDirtyCount });
   },
 });
 
@@ -277,10 +311,12 @@ export const runPostScanAnalysis = internalAction({
     tenantId: v.string(),
     scanSessionId: v.optional(v.string()),
     machineId: v.optional(v.string()),
+    analysisRunId: v.optional(v.number()),
   },
   handler: async (ctx, args): Promise<{ success: boolean }> => {
     const claim = await ctx.runMutation(internal.scans.claimAnalysisRun, {
       tenantId: args.tenantId,
+      analysisRunId: args.analysisRunId,
     });
     if (!claim.shouldRun) return { success: true };
 
@@ -292,11 +328,13 @@ export const runPostScanAnalysis = internalAction({
         scanSessionId: args.scanSessionId,
         machineId: args.machineId,
         catalogGeneration: claim.catalogGeneration,
+        analysisRunId: claim.analysisRunId,
       });
     } catch (err) {
       await ctx.runMutation(internal.scans.restoreAnalysisAfterFailure, {
         tenantId: args.tenantId,
         claimedDirtyCount: claim.claimedDirtyCount,
+        analysisRunId: claim.analysisRunId,
       });
       throw err;
     }
@@ -310,12 +348,13 @@ export const recordAnalysisComplete = internalMutation({
     scanSessionId: v.optional(v.string()),
     machineId: v.optional(v.string()),
     catalogGeneration: v.optional(v.number()),
+    analysisRunId: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     const state = await analysisStateForTenant(ctx, args.tenantId || "");
+    if (!ownsAnalysisRun(state, args.analysisRunId)) return;
     const current = canPublishAnalysis(state, args.catalogGeneration);
-    if (state) await ctx.db.patch(state._id, { scheduled: false,
-      ...(current ? { analyzedGeneration: args.catalogGeneration } : {}) });
+    await releaseAnalysis(ctx, state, current ? { analyzedGeneration: args.catalogGeneration } : {});
     await ctx.db.insert("auditLogs", {
       tenantId: args.tenantId || "",
       machineId: args.machineId,

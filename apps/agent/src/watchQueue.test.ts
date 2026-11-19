@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { WatchQueue, WatchRootGuard, catalogReceipts, cachedParentIdentities, directoryIdentity, fingerprintFromUploaded, type CatalogReceipt } from "./watchQueue.js";
+import { WatchQueue, WatchRootGuard, UnresolvedRemovals, catalogReceipts, catalogSnapshotFromCache, cachedParentIdentities, directoryIdentity, fingerprintFromUploaded, selectCatalogSnapshot, type CatalogReceipt } from "./watchQueue.js";
 
 function fixture(t: test.TestContext) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "driveos-watch-queue-"));
@@ -270,4 +270,139 @@ test("an existing file's newer accepted-but-lost upload survives its older cache
   assert.equal(queue.deletions()[0].receipt?.catalogVersion, 2);
   assert.equal(queue.deletionReceipts([deletion], [{ path: "clip", status: "deleted" }]), 1);
   assert.equal(queue.size, 0);
+});
+
+test("overlapping scan roots bootstrap a receipt for the watcher drive instead of sending the other drive's file id", () => {
+  const scope = { driveId: "parent-drive", machineId: "machine-a" };
+  const foreign = { ...receipt("clip", 99), fileId: "subfolder-file", driveId: "subfolder-drive", machineId: scope.machineId };
+  const actual = { ...receipt("clip", 1), fileId: "parent-file", ...scope };
+  const snapshot = selectCatalogSnapshot(undefined, { receipt: foreign, fingerprint: foreign }, scope);
+  assert.equal(snapshot.receipt, undefined);
+  const queue = new WatchQueue<{ path: string }>(scope);
+  queue.deleted("clip", foreign, undefined, snapshot.fingerprint);
+  const deletion = queue.deletions()[0];
+  assert.equal(deletion.receipt, undefined);
+  queue.refreshFromCache(deletion, foreign);
+  assert.equal(deletion.receipt, undefined);
+  queue.bootstrapReceipts([deletion], [actual], []);
+  assert.equal(queue.deletions()[0].receipt?.fileId, actual.fileId);
+  assert.equal(queue.deletionReceipts([deletion], [{ path: "clip", status: "deleted" }]), 1);
+  assert.equal(queue.size, 0);
+});
+
+test("legacy unscoped receipts and receipts from another machine supply only lookup fingerprints", () => {
+  const scope = { driveId: "drive-a", machineId: "machine-a" };
+  for (const untrusted of [receipt("clip"), { ...receipt("clip"), driveId: scope.driveId, machineId: "machine-b" }]) {
+    const queue = new WatchQueue<{ path: string }>(scope);
+    queue.deleted("clip", untrusted);
+    assert.equal(queue.deletions()[0].receipt, undefined);
+    assert.equal(queue.deletions()[0].fingerprint?.quickHash, untrusted.quickHash);
+    queue.bootstrapReceipts(queue.deletions(), [untrusted], []);
+    assert.equal(queue.deletions()[0].receipt, undefined);
+  }
+});
+
+test("catalog revisions are compared only within one file id in the current machine and drive", () => {
+  const scope = { driveId: "drive-a", machineId: "machine-a" };
+  const old = { ...receipt("clip", 99), fileId: "old-file", ...scope };
+  const replacement = { ...receipt("clip", 1), fileId: "new-file", ...scope };
+  const snapshot = selectCatalogSnapshot({ receipt: old, fingerprint: old }, { receipt: replacement, fingerprint: replacement }, scope);
+  assert.equal(snapshot.receipt?.fileId, replacement.fileId);
+  const queue = new WatchQueue<{ path: string }>(scope);
+  queue.deleted("clip", old);
+  const deletion = queue.deletions()[0];
+  queue.deletionReceipts([deletion], [{ path: "clip", status: "conflict" }]);
+  queue.refreshFromCache(deletion, replacement);
+  assert.equal(deletion.receipt?.fileId, replacement.fileId);
+});
+
+test("a scanner's new acknowledgement discovered after unlink still reconciles a removed whole folder", t => {
+  const f = fixture(t), scope = { driveId: "drive-a", machineId: "machine-a" };
+  const guard = new WatchRootGuard([f.root]);
+  const sub = path.join(f.root, "external-scan");
+  fs.mkdirSync(sub);
+  const file = path.join(sub, "clip.mov");
+  fs.writeFileSync(file, "another scanner observed this");
+  const parent = directoryIdentity(sub);
+  const acknowledged = { ...receipt(file), ...scope };
+  const queue = new WatchQueue<{ path: string }>(scope), unresolved = new UnresolvedRemovals();
+  // The running watcher has no receipt, but a manual scan has just persisted it.
+  fs.unlinkSync(file); fs.rmdirSync(sub);
+  assert.equal(queue.deleted(file), false);
+  unresolved.removed(file);
+  const pending = unresolved.snapshot()[0];
+  const snapshot = selectCatalogSnapshot(undefined, { receipt: acknowledged, fingerprint: acknowledged, parent }, scope);
+  assert.equal(unresolved.consume(pending), true);
+  assert.equal(queue.deleted(file, snapshot.receipt, snapshot.parent, snapshot.fingerprint), true);
+  assert.equal(guard.fileMissing(file, queue.deletions()[0].parent), true);
+  assert.equal(queue.deletionReceipts(queue.deletions(), [{ path: file, status: "deleted" }]), 1);
+  assert.equal(queue.size, 0);
+  assert.equal(unresolved.size, 0);
+});
+
+test("a fresh local cache pass drains a thousand genuinely unindexed unlinks without catalog work", () => {
+  const queue = new WatchQueue<{ path: string }>(), unresolved = new UnresolvedRemovals();
+  for (let index = 0; index < 1000; index++) {
+    const name = `unindexed-${index}`;
+    assert.equal(queue.deleted(name), false);
+    unresolved.removed(name);
+  }
+  const pending = unresolved.snapshot();
+  for (let start = 0; start < pending.length; start += 500) {
+    for (const entry of pending.slice(start, start + 500)) assert.equal(unresolved.consume(entry), true);
+  }
+  assert.equal(queue.size, 0);
+  assert.equal(queue.invalidated.size, 0);
+  assert.equal(unresolved.size, 0);
+});
+
+test("a recreation cancels an unresolved unlink and old cache work cannot discard a second unlink", () => {
+  const unresolved = new UnresolvedRemovals();
+  unresolved.removed("clip");
+  const beforeAdd = unresolved.snapshot()[0];
+  unresolved.cancel("clip");
+  assert.equal(unresolved.consume(beforeAdd), false);
+  unresolved.removed("clip");
+  const beforeSecond = unresolved.snapshot()[0];
+  unresolved.removed("clip");
+  assert.equal(unresolved.consume(beforeSecond), false);
+  assert.equal(unresolved.size, 1);
+  assert.equal(unresolved.consume(unresolved.snapshot()[0]), true);
+});
+
+test("an older scanner's acknowledged fingerprint supersedes its preserved stale receipt", () => {
+  const scope = { driveId: "drive-a", machineId: "machine-a" };
+  const old = { ...receipt("clip", 1), ...scope };
+  const next = { ...receipt("clip", 2), ...scope, modifiedAtFile: 5678, quickHash: "new-quick", fullHash: "new-full" };
+  // This is the old stampUploaded behavior: spread all unknown fields, then
+  // replace the acknowledged metadata/fingerprint without knowing about ACKs.
+  const cache = { sizeBytes: old.sizeBytes, modifiedAt: old.modifiedAtFile, quickHash: old.quickHash, fullHash: old.fullHash,
+    catalogReceipt: old, uploadedFp: `${old.sizeBytes}|${old.modifiedAtFile}|${old.quickHash}|${old.fullHash}|CACHE|green` };
+  const oldStamp = (meta: CatalogReceipt) => ({ ...cache, sizeBytes: meta.sizeBytes, modifiedAt: meta.modifiedAtFile,
+    quickHash: meta.quickHash, fullHash: meta.fullHash, uploadedFp: `${meta.sizeBytes}|${meta.modifiedAtFile}|${meta.quickHash}|${meta.fullHash}|CACHE|green` });
+  const disk = oldStamp(next);
+  assert.equal(disk.catalogReceipt.catalogVersion, 1);
+  const refreshed = catalogSnapshotFromCache("clip", disk)!;
+  assert.equal(refreshed.receipt, undefined);
+  assert.equal(refreshed.fingerprint.quickHash, "new-quick");
+  const selected = selectCatalogSnapshot({ receipt: old, fingerprint: old }, refreshed, scope);
+  assert.equal(selected.receipt, undefined);
+  const queue = new WatchQueue<{ path: string }>(scope);
+  queue.deleted("clip", old);
+  const deletion = queue.deletions()[0];
+  queue.refreshFromSnapshot(deletion, selected);
+  assert.equal(deletion.receipt, undefined);
+  assert.equal(deletion.fingerprint?.quickHash, "new-quick");
+  queue.bootstrapReceipts([deletion], [next], []);
+  assert.equal(queue.deletionReceipts([deletion], [{ path: "clip", status: "deleted" }]), 1);
+  assert.equal(queue.size, 0);
+});
+
+test("a quick-only legacy fingerprint preserves a matching server-retained full hash", () => {
+  const stored = receipt("clip", 2);
+  const snapshot = catalogSnapshotFromCache("clip", { catalogReceipt: stored,
+    uploadedFp: `${stored.sizeBytes}|${stored.modifiedAtFile}|${stored.quickHash}||CACHE|green` });
+  assert.equal(snapshot?.receipt, stored);
+  assert.equal(snapshot?.fingerprint.fullHash, stored.fullHash);
+  assert.equal(snapshot?.receiptInvalidated, undefined);
 });

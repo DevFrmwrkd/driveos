@@ -14,6 +14,50 @@ export interface CatalogFingerprint {
 export interface CatalogReceipt extends CatalogFingerprint {
   fileId: string;
   catalogVersion: number;
+  driveId?: string;
+  machineId?: string;
+}
+
+export interface CatalogScope { driveId: string; machineId: string }
+
+export function receiptMatchesScope(receipt: CatalogReceipt, scope: CatalogScope): boolean {
+  return receipt.driveId === scope.driveId && receipt.machineId === scope.machineId;
+}
+
+export interface CatalogSnapshot {
+  receipt?: CatalogReceipt;
+  fingerprint: CatalogFingerprint;
+  parent?: DirectoryIdentity;
+  receiptInvalidated?: boolean;
+}
+
+function knownFingerprintMatches(receipt: CatalogFingerprint, uploaded: CatalogFingerprint): boolean {
+  return receipt.path === uploaded.path && receipt.sizeBytes === uploaded.sizeBytes && receipt.modifiedAtFile === uploaded.modifiedAtFile &&
+    (uploaded.quickHash === undefined || receipt.quickHash === uploaded.quickHash) &&
+    (uploaded.fullHash === undefined || receipt.fullHash === uploaded.fullHash);
+}
+
+export function catalogSnapshotFromCache(filePath: string, entry: { catalogReceipt?: CatalogReceipt; uploadedFp?: string; catalogParent?: DirectoryIdentity }): CatalogSnapshot | undefined {
+  const receipt = catalogReceipts([entry.catalogReceipt])[0];
+  const uploaded = fingerprintFromUploaded(filePath, entry.uploadedFp);
+  // Older scanners spread unknown cache fields while updating uploadedFp.
+  // Their newer acknowledged fingerprint can therefore retain an obsolete CAS
+  // receipt. Keep the fingerprint and bootstrap rather than retrying that ID.
+  if (receipt && uploaded && !knownFingerprintMatches(receipt, uploaded)) {
+    return { fingerprint: uploaded, parent: entry.catalogParent, receiptInvalidated: true };
+  }
+  const fingerprint = receipt || uploaded;
+  return fingerprint ? { receipt, fingerprint, parent: entry.catalogParent } : undefined;
+}
+
+export function selectCatalogSnapshot(previous: CatalogSnapshot | undefined, next: CatalogSnapshot, scope: CatalogScope): CatalogSnapshot {
+  if (next.receiptInvalidated) return { ...next, receipt: undefined, fingerprint: fingerprintOnly(next.fingerprint) };
+  const receipt = next.receipt && receiptMatchesScope(next.receipt, scope) ? next.receipt : undefined;
+  const current = previous?.receipt && receiptMatchesScope(previous.receipt, scope) ? previous.receipt : undefined;
+  if (current && (!receipt || (current.fileId === receipt.fileId && current.catalogVersion >= receipt.catalogVersion))) return previous!;
+  // A revision belongs to one file row, not to a physical path. Foreign and
+  // legacy receipts supply only a fingerprint for a lookup in the watch scope.
+  return { ...next, receipt, fingerprint: fingerprintOnly(next.fingerprint) };
 }
 
 function fingerprintOnly(value: CatalogFingerprint): CatalogFingerprint {
@@ -36,6 +80,8 @@ export function catalogReceipts(value: unknown): CatalogReceipt[] {
     typeof item.path === "string" && typeof item.fileId === "string" && item.fileId.length > 0 &&
     Number.isSafeInteger(item.catalogVersion) && item.catalogVersion >= 0 &&
     Number.isFinite(item.sizeBytes) && item.sizeBytes >= 0 && Number.isFinite(item.modifiedAtFile) &&
+    (item.driveId === undefined || (typeof item.driveId === "string" && item.driveId.length > 0)) &&
+    (item.machineId === undefined || (typeof item.machineId === "string" && item.machineId.length > 0)) &&
     (item.quickHash === undefined || typeof item.quickHash === "string") &&
     (item.fullHash === undefined || typeof item.fullHash === "string")));
 }
@@ -114,7 +160,25 @@ export class WatchRootGuard {
 
 export type WatchChange<T> = { path: string; generation: number; kind: "change"; metadata?: T; parent?: DirectoryIdentity; forceObservation: boolean };
 export type WatchDeletion = { path: string; generation: number; kind: "delete"; receipt?: CatalogReceipt; fingerprint?: CatalogFingerprint; parent?: DirectoryIdentity;
-  attemptedFingerprint?: boolean; conflictRefreshes?: number; rejectedVersion?: number; retiredReason?: "catalog_mismatch" | "conflict_limit" };
+  attemptedFingerprint?: boolean; conflictRefreshes?: number; rejectedVersion?: number; rejectedFileId?: string; retiredReason?: "catalog_mismatch" | "conflict_limit" };
+
+// Another scanner may still own the scan mutex and have not persisted its ACK
+// when unlink arrives. Hold paths only until a fresh cache pass under that same
+// mutex; genuinely unindexed paths never become recurring network work. Like
+// the normal event queue, this transient buffer coalesces repeated path events.
+export class UnresolvedRemovals {
+  private generation = 0;
+  private readonly paths = new Map<string, number>();
+  get size() { return this.paths.size; }
+  removed(filePath: string) { this.paths.set(filePath, ++this.generation); }
+  cancel(filePath: string) { this.paths.delete(filePath); }
+  snapshot() { return [...this.paths].map(([path, generation]) => ({ path, generation })); }
+  consume(entry: { path: string; generation: number }): boolean {
+    if (this.paths.get(entry.path) !== entry.generation) return false;
+    this.paths.delete(entry.path);
+    return true;
+  }
+}
 
 // Entries remain queued while requests are in flight. Only an acknowledgement
 // for the same generation may remove one, so late responses cannot erase a
@@ -124,6 +188,8 @@ export class WatchQueue<T extends { path: string }> {
   private readonly entries = new Map<string, WatchChange<T> | WatchDeletion>();
   private readonly inFlight = new Map<string, { generation: number; fingerprint: CatalogFingerprint; parent?: DirectoryIdentity }>();
   readonly invalidated = new Set<string>();
+  constructor(private readonly scope?: CatalogScope) {}
+  private trusted(receipt: CatalogReceipt) { return !this.scope || receiptMatchesScope(receipt, this.scope); }
   get size() { return this.entries.size; }
   changed(filePath: string, forceObservation = false): number {
     const previous = this.entries.get(filePath);
@@ -142,7 +208,8 @@ export class WatchQueue<T extends { path: string }> {
     // The current upload may have replaced an older acknowledged catalog
     // version even when its response is lost. Keep that newer attempted
     // fingerprint for a subsequent lookup if the old receipt conflicts.
-    fingerprint = uploading?.fingerprint || fingerprint;
+    fingerprint = uploading?.fingerprint || fingerprint || receipt;
+    if (receipt && !this.trusted(receipt)) receipt = undefined;
     parent = uploading?.parent || parent;
     // A tiny/unindexed file has no acknowledged catalog state to reconcile.
     // Retaining it cannot ever produce a safe deletion request. An in-flight
@@ -182,15 +249,25 @@ export class WatchQueue<T extends { path: string }> {
     if (this.inFlight.get(change.path)?.generation === change.generation) this.inFlight.delete(change.path);
   }
   refreshFromCache(entry: WatchDeletion, receipt: CatalogReceipt, parent?: DirectoryIdentity) {
-    if (!this.isCurrent(entry.path, entry.generation) || receipt.path !== entry.path ||
-      receipt.catalogVersion <= Math.max(entry.receipt?.catalogVersion ?? -1, entry.rejectedVersion ?? -1)) return;
+    if (!this.isCurrent(entry.path, entry.generation) || receipt.path !== entry.path || !this.trusted(receipt) ||
+      (entry.receipt?.fileId === receipt.fileId && receipt.catalogVersion <= entry.receipt.catalogVersion) ||
+      (entry.rejectedFileId === receipt.fileId && receipt.catalogVersion <= (entry.rejectedVersion ?? -1))) return;
     entry.receipt = receipt;
     if (!entry.attemptedFingerprint) {
       entry.fingerprint = fingerprintOnly(receipt);
       entry.parent = parent || entry.parent;
     }
   }
+  refreshFromSnapshot(entry: WatchDeletion, snapshot: CatalogSnapshot) {
+    if (!this.isCurrent(entry.path, entry.generation) || snapshot.fingerprint.path !== entry.path) return;
+    if (snapshot.receiptInvalidated && !entry.attemptedFingerprint) {
+      entry.receipt = undefined;
+      entry.fingerprint = fingerprintOnly(snapshot.fingerprint);
+      entry.parent = snapshot.parent || entry.parent;
+    } else if (snapshot.receipt) this.refreshFromCache(entry, snapshot.receipt, snapshot.parent);
+  }
   uploaded(change: WatchChange<T>, receipt: CatalogReceipt, parent?: DirectoryIdentity) {
+    if (!this.trusted(receipt)) return;
     const current = this.entries.get(change.path);
     if (current?.kind === "delete" && current.generation > change.generation) {
       current.receipt = receipt;
@@ -216,7 +293,8 @@ export class WatchQueue<T extends { path: string }> {
     const denied = new Map((Array.isArray(rejected) ? rejected : []).filter(item => item && typeof item.path === "string").map(item => [item.path, item]));
     for (const entry of batch) {
       if (!this.isCurrent(entry.path, entry.generation)) continue;
-      const receipt = accepted.get(entry.path);
+      const proposed = accepted.get(entry.path);
+      const receipt = proposed && this.trusted(proposed) ? proposed : undefined;
       if (receipt) {
         entry.receipt = receipt;
         entry.fingerprint = fingerprintOnly(receipt);
@@ -238,7 +316,9 @@ export class WatchQueue<T extends { path: string }> {
       const receipt = byPath.get(entry.path);
       // Deferred quarantine reservations and missing/malformed receipts retry.
       if (receipt?.status === "conflict" && this.isCurrent(entry.path, entry.generation)) {
-        entry.rejectedVersion = Math.max(entry.rejectedVersion ?? -1, entry.receipt?.catalogVersion ?? -1);
+        const rejectedFileId = entry.receipt?.fileId;
+        entry.rejectedVersion = Math.max(entry.rejectedFileId === rejectedFileId ? entry.rejectedVersion ?? -1 : -1, entry.receipt?.catalogVersion ?? -1);
+        entry.rejectedFileId = rejectedFileId;
         entry.fingerprint ||= fingerprintOnly(entry.receipt!);
         entry.receipt = undefined;
         entry.conflictRefreshes = (entry.conflictRefreshes || 0) + 1;

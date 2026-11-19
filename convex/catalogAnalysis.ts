@@ -2,6 +2,22 @@ interface CatalogAnalysisState {
   dirtyCount?: number;
   catalogGeneration?: number;
   analyzedGeneration?: number;
+  scheduled?: boolean;
+  analysisRunId?: number;
+  analysisFunctionId?: string;
+}
+
+export const ANALYSIS_DEBOUNCE_MS = 5 * 60 * 1000;
+export const ANALYSIS_MIN_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+export function analysisFollowUpDelay(lastRunAt: number, now: number): number {
+  return Math.max(ANALYSIS_DEBOUNCE_MS, lastRunAt + ANALYSIS_MIN_INTERVAL_MS - now);
+}
+
+export function ownsAnalysisRun(state: CatalogAnalysisState | null | undefined, runId: number | undefined): boolean {
+  return Boolean(state?.scheduled && (runId === undefined
+    ? state.analysisRunId === undefined && !state.analysisFunctionId
+    : state.analysisRunId === runId));
 }
 
 // Missing generations describe the legacy catalog and its existing analysis.

@@ -9,6 +9,8 @@ export interface CatalogFingerprint {
 export interface CatalogReceipt extends CatalogFingerprint {
   fileId: string;
   catalogVersion: number;
+  driveId?: string;
+  machineId?: string;
 }
 
 export const MAX_CATALOG_RECEIPTS = 100;
@@ -60,6 +62,8 @@ export function catalogKnownFingerprintMatches(file: any, expected: CatalogFinge
 
 export function catalogReceipt(file: any): CatalogReceipt {
   return { path: file.path, fileId: String(file._id), catalogVersion: file.observationRevision ?? 0,
+    ...(file.driveId ? { driveId: String(file.driveId) } : {}),
+    ...(file.machineId ? { machineId: String(file.machineId) } : {}),
     sizeBytes: file.sizeBytes, modifiedAtFile: file.modifiedAtFile,
     ...(file.quickHash !== undefined ? { quickHash: file.quickHash } : {}),
     ...(file.fullHash !== undefined ? { fullHash: file.fullHash } : {}) };

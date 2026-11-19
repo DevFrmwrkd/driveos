@@ -8,6 +8,56 @@ import { insertApprovedJob } from "./jobUtils";
 // caps reads/writes per mutation (~a few thousand); a drive can hold millions of
 // files, so deletion is paged and self-reschedules until the catalog is empty.
 const DRIVE_FILE_DELETE_BATCH = 500;
+const DRIVE_IDENTITY_VERSION = 1;
+
+async function authenticatedMachine(ctx: any, tenantId: string, machineId: string | undefined) {
+  const id = machineId ? ctx.db.normalizeId("machines", machineId) : null;
+  const machine = id ? await ctx.db.get(id) : null;
+  if (!tenantId || !machine || machine.tenantId !== tenantId) throw new ConvexError("Unknown authenticated machine.");
+  return machine;
+}
+
+async function driveIdentity(ctx: any, tenantId: string, machineId: string | undefined, volumeId: string, identityVersion: number | undefined) {
+  return await ctx.db.query("drives").withIndex("by_tenant_machine_volume_identity", (q: any) =>
+    q.eq("tenantId", tenantId).eq("machineId", machineId).eq("volumeId", volumeId).eq("identityVersion", identityVersion)).first();
+}
+
+// Check both sides of each ownership key with indexed point/range reads. A
+// sample of the first file cannot prove a legacy multi-million-row catalog safe.
+async function catalogOwnership(ctx: any, driveId: any, tenantId: string, machineId: string) {
+  for (const operator of ["lt", "gt"]) {
+    const foreignTenant = await ctx.db.query("files").withIndex("by_drive_catalog_owner", (q: any) =>
+      q.eq("driveId", driveId)[operator]("tenantId", tenantId)).first();
+    if (foreignTenant) return { safe: false, hasCatalog: true };
+    const foreignMachine = await ctx.db.query("files").withIndex("by_drive_catalog_owner", (q: any) =>
+      q.eq("driveId", driveId).eq("tenantId", tenantId)[operator]("machineId", machineId)).first();
+    if (foreignMachine) return { safe: false, hasCatalog: true };
+  }
+  const own = await ctx.db.query("files").withIndex("by_drive_catalog_owner", (q: any) =>
+    q.eq("driveId", driveId).eq("tenantId", tenantId).eq("machineId", machineId)).first();
+  return { safe: true, hasCatalog: Boolean(own) };
+}
+
+async function ownedDrive(ctx: any, tenantId: string, machineId: string, volumeId: string, allowEmptyUnassigned: boolean) {
+  const canonical = await driveIdentity(ctx, tenantId, machineId, volumeId, DRIVE_IDENTITY_VERSION);
+  if (canonical) {
+    const ownership = await catalogOwnership(ctx, canonical._id, tenantId, machineId);
+    return { drive: ownership.safe ? canonical : null, ...ownership, canonicalConflict: !ownership.safe };
+  }
+  const candidates = [
+    await driveIdentity(ctx, tenantId, machineId, volumeId, undefined),
+    await driveIdentity(ctx, tenantId, undefined, volumeId, undefined),
+  ];
+  let ambiguous = false;
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const ownership = await catalogOwnership(ctx, candidate._id, tenantId, machineId);
+    if (ownership.safe && (candidate.machineId || ownership.hasCatalog || allowEmptyUnassigned))
+      return { drive: candidate, ...ownership, canonicalConflict: false };
+    ambiguous = true;
+  }
+  return { drive: null, safe: !ambiguous, hasCatalog: false, canonicalConflict: false };
+}
 
 export const list = query({
   args: {},
@@ -57,7 +107,8 @@ async function deleteDriveCatalog(
   driveId: any,
   tenantId: string,
   actorId: string | undefined,
-  label: string
+  label: string,
+  machineId?: string
 ) {
   // Delete the drive row first so it disappears from the dashboard at once.
   await ctx.db.delete(driveId);
@@ -76,20 +127,27 @@ async function deleteDriveCatalog(
   await ctx.scheduler.runAfter(0, internal.drives.purgeDriveFiles, {
     driveId: String(driveId),
     deleted: 0,
+    tenantId,
+    ...(machineId ? { machineId } : {}),
   });
 }
 
 // Delete one page of a removed drive's file rows, then reschedule itself until
 // none remain. Each run stays well under the per-mutation write limit.
 export const purgeDriveFiles = internalMutation({
-  args: { driveId: v.string(), deleted: v.number() },
+  args: { driveId: v.string(), deleted: v.number(), tenantId: v.optional(v.string()), machineId: v.optional(v.string()) },
   handler: async (ctx, args) => {
     const driveId = ctx.db.normalizeId("drives", args.driveId);
     if (!driveId) return; // malformed id; nothing to do
-    const page = await ctx.db
-      .query("files")
-      .withIndex("by_drive_path", (q) => q.eq("driveId", driveId))
-      .take(DRIVE_FILE_DELETE_BATCH);
+    // Existing scheduled removals predate the scope arguments. New removals
+    // always retain tenant/machine ownership through every bounded page.
+    const owned = args.tenantId !== undefined
+      ? ctx.db.query("files").withIndex("by_drive_catalog_owner", q => {
+        const prefix = q.eq("driveId", driveId).eq("tenantId", args.tenantId);
+        return args.machineId !== undefined ? prefix.eq("machineId", args.machineId) : prefix;
+      })
+      : ctx.db.query("files").withIndex("by_drive_path", q => q.eq("driveId", driveId));
+    const page = await owned.take(DRIVE_FILE_DELETE_BATCH);
 
     for (const f of page) await ctx.db.delete(f._id);
 
@@ -98,6 +156,8 @@ export const purgeDriveFiles = internalMutation({
       await ctx.scheduler.runAfter(0, internal.drives.purgeDriveFiles, {
         driveId: args.driveId,
         deleted: args.deleted + page.length,
+        ...(args.tenantId !== undefined ? { tenantId: args.tenantId } : {}),
+        ...(args.machineId !== undefined ? { machineId: args.machineId } : {}),
       });
     }
   },
@@ -115,27 +175,24 @@ export const remove = mutation({
     const drive = inTenant(await ctx.db.get(driveId), tenantId);
     if (!drive) return { removed: false };
 
+    // A dashboard user selected this exact drive ID, including any legacy
+    // catalog with mixed machine ownership. Remove its tenant's whole catalog.
     await deleteDriveCatalog(ctx, driveId, tenantId, email, drive.label);
     return { removed: true };
   },
 });
 
-// Stop tracking a drive from the agent, matched by volumeId within the agent's
-// tenant. Internal-only: reached solely through the token-authenticated HTTP
-// route, which injects the verified machine's tenantId. Idempotent.
+// Agent removal uses the same canonical token-machine identity as registration.
 export const removeByVolumeId = internalMutation({
   args: { volumeId: v.string(), machineId: v.optional(v.string()), tenantId: v.optional(v.string()) },
   handler: async (ctx, args) => {
     const tenantId = args.tenantId || "";
-    const drive = await ctx.db
-      .query("drives")
-      .withIndex("by_tenant_volume", (q) =>
-        q.eq("tenantId", tenantId).eq("volumeId", args.volumeId)
-      )
-      .first();
-    if (!drive) return { removed: false };
+    const machine = await authenticatedMachine(ctx, tenantId, args.machineId);
+    const selected = await ownedDrive(ctx, tenantId, String(machine._id), args.volumeId, false);
+    const drive = selected.drive;
+    if (!drive) return { removed: false, ...(selected.safe ? {} : { reason: "legacy_catalog_ownership_conflict" }) };
 
-    await deleteDriveCatalog(ctx, drive._id, tenantId, args.machineId, drive.label);
+    await deleteDriveCatalog(ctx, drive._id, tenantId, String(machine._id), drive.label, String(machine._id));
     return { removed: true };
   },
 });
@@ -168,38 +225,23 @@ export const register = internalMutation({
   },
   handler: async (ctx, args) => {
     const tenantId = args.tenantId || "";
-    const existing = await ctx.db
-      .query("drives")
-      .withIndex("by_tenant_volume", (q) =>
-        q.eq("tenantId", tenantId).eq("volumeId", args.volumeId)
-      )
-      .first();
+    const machine = await authenticatedMachine(ctx, tenantId, args.machineId);
+    const machineId = String(machine._id);
+    const selected = await ownedDrive(ctx, tenantId, machineId, args.volumeId, true);
+    if (selected.canonicalConflict) throw new ConvexError("Drive catalog ownership conflict. Ask an administrator to review this drive.");
+    const existing = selected.drive;
 
     const timestamp = Date.now();
 
     // A drive's location is the location of the machine it's plugged into. Fall
     // back to that (not a hardcoded city) when the agent doesn't send one.
-    let machineLocation: string | undefined;
-    if (args.machineId) {
-      const machineIdObj = ctx.db.normalizeId("machines", args.machineId);
-      const machine = machineIdObj ? await ctx.db.get(machineIdObj) : null;
-      if (machine && machine.tenantId === tenantId) machineLocation = machine.location ?? undefined;
-    }
-    const resolvedLocation = args.location || machineLocation;
+    const resolvedLocation = args.location || machine.location;
 
     if (existing) {
-      // One indexed read tells an upgrading agent whether it can trust its
-      // existing local hash cache as the delta baseline. Without this signal,
-      // agent 1.1 would re-send every row once just to establish uploadedFp —
-      // more than 10 million records in the current production catalog.
-      const catalogFile = await ctx.db
-        .query("files")
-        .withIndex("by_drive_path", (q) => q.eq("driveId", existing._id))
-        .first();
-
       await ctx.db.patch(existing._id, {
         label: args.label,
-        machineId: args.machineId,
+        machineId,
+        identityVersion: DRIVE_IDENTITY_VERSION,
         ownerId: args.ownerId,
         capacityBytes: args.capacityBytes,
         freeBytes: args.freeBytes,
@@ -215,7 +257,7 @@ export const register = internalMutation({
       await ctx.db.insert("auditLogs", {
         tenantId,
         actorId: args.ownerId,
-        machineId: args.machineId,
+        machineId,
         action: "drive_update",
         entityType: "drive",
         entityId: existing._id,
@@ -223,16 +265,16 @@ export const register = internalMutation({
         createdAt: timestamp,
       });
 
-      // isNew tells the agent whether the backend already holds a catalog for
-      // this volume. A fresh row means any local "already uploaded" markers
-      // are stale (drive was forgotten/removed) and must be ignored.
-      return { driveId: existing._id, isNew: false, hasCatalog: Boolean(catalogFile) };
+      // Preserve a clean legacy catalog's ID and hash-cache baseline. An empty
+      // catalog needs replay even when a legacy drive row already existed.
+      return { driveId: existing._id, isNew: !selected.hasCatalog, hasCatalog: selected.hasCatalog };
     } else {
       const driveId = await ctx.db.insert("drives", {
         tenantId,
         label: args.label,
         volumeId: args.volumeId,
-        machineId: args.machineId,
+        machineId,
+        identityVersion: DRIVE_IDENTITY_VERSION,
         ownerId: args.ownerId,
         capacityBytes: args.capacityBytes,
         freeBytes: args.freeBytes,
@@ -250,7 +292,7 @@ export const register = internalMutation({
       await ctx.db.insert("auditLogs", {
         tenantId,
         actorId: args.ownerId,
-        machineId: args.machineId,
+        machineId,
         action: "drive_register",
         entityType: "drive",
         entityId: driveId,
@@ -295,6 +337,7 @@ export const listMachines = query({
 // Agent-only (internal): register/update the calling machine in its tenant.
 export const registerMachine = internalMutation({
   args: {
+    machineId: v.optional(v.string()),
     name: v.string(),
     ownerId: v.string(),
     agentVersion: v.string(),
@@ -304,6 +347,19 @@ export const registerMachine = internalMutation({
   },
   handler: async (ctx, args) => {
     const tenantId = args.tenantId || "";
+    if (args.machineId !== undefined) {
+      // Agent HTTP requests are bound to the issued token, never to a local
+      // label that may differ from the name chosen in workspace settings.
+      const machine = await authenticatedMachine(ctx, tenantId, args.machineId);
+      await ctx.db.patch(machine._id, {
+        agentVersion: args.agentVersion,
+        platform: args.platform,
+        location: machine.location || args.location,
+        lastSeenAt: Date.now(),
+        status: "online",
+      });
+      return machine._id;
+    }
     const tenantMachines = await ctx.db
       .query("machines")
       .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))

@@ -131,6 +131,8 @@ test("acknowledged upload, legacy lookup and idempotent tombstone use exact stor
   const f = fixture(), initial = await f.upload();
   const receipt = initial.receipts[0];
   assert.equal(receipt.catalogVersion, 1);
+  assert.equal(receipt.driveId, f.scope.driveId);
+  assert.equal(receipt.machineId, f.scope.machineId);
   assert.equal(f.rows("files")[0].source, "local");
   assert.deepEqual((await f.lookup([f.fingerprint(receipt)])).receipts, [receipt]);
   assert.equal((await f.remove([receipt])).receipts[0].status, "deleted");
@@ -140,6 +142,24 @@ test("acknowledged upload, legacy lookup and idempotent tombstone use exact stor
   const count = f.writes.length;
   assert.equal((await f.remove([receipt])).receipts[0].status, "already_deleted");
   assert.equal(f.writes.length, count);
+});
+
+test("overlapping scan roots return distinct scoped receipts and bootstrap the correct drive row", async () => {
+  const f = fixture(), parent = await f.upload();
+  const nestedDrive = f.add("drives", { tenantId: f.scope.tenantId, machineId: f.scope.machineId, mountPath: "/catalog/watched" });
+  const nestedSession = f.add("scanSessions", { tenantId: f.scope.tenantId, machineId: f.scope.machineId,
+    driveId: nestedDrive._id, rootPath: nestedDrive.mountPath, status: "running" });
+  const nested = await f.upload([f.meta()], { driveId: nestedDrive._id, scanSessionId: nestedSession._id });
+  const parentReceipt = parent.receipts[0], nestedReceipt = nested.receipts[0];
+  assert.notEqual(nestedReceipt.fileId, parentReceipt.fileId);
+  assert.equal(nestedReceipt.driveId, nestedDrive._id);
+  assert.equal((await f.remove([nestedReceipt])).receipts[0].status, "conflict");
+  assert.ok(f.rows("files").every(file => file.deletedAt === undefined));
+  const correct = await f.lookup([f.fingerprint(nestedReceipt)]);
+  assert.equal(correct.receipts[0].fileId, parentReceipt.fileId);
+  assert.equal(correct.receipts[0].driveId, f.scope.driveId);
+  assert.equal((await f.remove(correct.receipts)).receipts[0].status, "deleted");
+  assert.equal(f.rows("files").find(file => file._id === nestedReceipt.fileId).deletedAt, undefined);
 });
 
 test("normal unchanged uploads write nothing, while identical recreation fences stale unlink receipts", async () => {
