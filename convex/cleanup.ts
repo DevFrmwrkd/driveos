@@ -5,6 +5,7 @@ import { CLEANUP_RECOMMENDATION_TYPES, fileMachine, insertApprovedJob, MAX_JOB_F
 import { workspaceSettings } from "./settings";
 import { classifyFile } from "../packages/shared/src/index";
 import { decideJobLease, jobAvailableToAgent, withoutClaimToken } from "./jobLease";
+import { cleanupPathIdentity, KEEP_COPY_PROTOCOL, KEEP_COPY_REVIEW, keepCopyReservedIds, purgeItemMetadata, requiresKeepCopy, validKeepCopyProof } from "./keepCopy";
 
 const EDITORS = ["admin", "producer", "editor", "assistant_editor"];
 const ACTIVE_QUARANTINE = new Set(["quarantined", "pending_restore", "pending_purge"]);
@@ -54,6 +55,7 @@ async function validatedFiles(ctx: any, tenantId: string, ids: string[]) {
   const files = [];
   const selected = new Set(ids);
   const legacyReservedIds = new Set<string>();
+  const reservedKeepIds = new Set<string>();
   const reservationJobs = new Map<string, any>();
   for (const status of ["approved", "queued", "running"]) {
     const active = await ctx.db.query("cleanupJobs").withIndex("by_tenant_status", (q: any) => q.eq("tenantId", tenantId).eq("status", status)).take(201);
@@ -61,12 +63,15 @@ async function validatedFiles(ctx: any, tenantId: string, ids: string[]) {
     for (const job of active) {
       reservationJobs.set(String(job._id), job);
       if (job.action === "quarantine") for (const id of job.affectedFileIds) legacyReservedIds.add(id);
+      for (const id of keepCopyReservedIds(job)) reservedKeepIds.add(id);
     }
     if (active.some((job: any) => job.action === "quarantine" && job.affectedFileIds.some((id: string) => selected.has(id))))
       throw new ConvexError("Some selected files are already queued for quarantine.");
   }
+  if ([...selected].some(id => reservedKeepIds.has(id)))
+    throw new ConvexError("A selected file is the keep copy for a pending cleanup. Wait for that operation to finish.");
   const reserved = async (file: any) => {
-    if (legacyReservedIds.has(String(file._id))) return true;
+    if (legacyReservedIds.has(String(file._id)) || reservedKeepIds.has(String(file._id))) return true;
     if (!file.pendingCleanupJobId) return false;
     if (!reservationJobs.has(file.pendingCleanupJobId)) {
       const id = ctx.db.normalizeId("cleanupJobs", file.pendingCleanupJobId);
@@ -84,6 +89,8 @@ async function validatedFiles(ctx: any, tenantId: string, ids: string[]) {
     }
     if (protectedFile(file)) throw new ConvexError(`Protected file cannot be quarantined: ${file.name}`);
     if (await reserved(file)) throw new ConvexError(`File is already reserved for cleanup: ${file.name}`);
+    const machineId = await fileMachine(ctx, file, tenantId);
+    let keepCopyProof: any;
     let rules = settings.cleanupRules;
     if (file.projectId) {
       if (!projects.has(file.projectId)) {
@@ -114,7 +121,12 @@ async function validatedFiles(ctx: any, tenantId: string, ids: string[]) {
       for (const keepId of new Set(keepIds)) {
         const candidateId = ctx.db.normalizeId("files", keepId);
         const candidate = candidateId ? await ctx.db.get(candidateId) : null;
-        if (candidate?.tenantId === tenantId && !candidate.deletedAt && candidate.fullHash === file.fullHash && candidate.sizeBytes === file.sizeBytes && !(await reserved(candidate))) {
+        if (candidate?.tenantId === tenantId && candidate.source === "local" && !candidate.deletedAt &&
+          candidate.fullHash === file.fullHash && candidate.sizeBytes === file.sizeBytes &&
+          cleanupPathIdentity(candidate.path) !== cleanupPathIdentity(file.path) && !(await reserved(candidate))) {
+          let keepMachineId: string;
+          try { keepMachineId = await fileMachine(ctx, candidate, tenantId); } catch { continue; }
+          if (keepMachineId !== machineId) continue;
           keep = candidate;
           break;
         }
@@ -124,8 +136,12 @@ async function validatedFiles(ctx: any, tenantId: string, ids: string[]) {
         keep._id === file._id || keep.fullHash !== file.fullHash || keep.sizeBytes !== file.sizeBytes) {
         throw new ConvexError(`No separate verified keep copy is available for ${file.name}.`);
       }
+      keepCopyProof = { fileId: String(file._id), keepFileId: String(keep._id), keepPath: keep.path,
+        keepMachineId: machineId, fullHash: file.fullHash, sizeBytes: file.sizeBytes };
+      if (!validKeepCopyProof(keepCopyProof, file, machineId))
+        throw new ConvexError(`No separate verified keep copy is available for ${file.name}.`);
     }
-    files.push({ ...file, machineId: await fileMachine(ctx, file, tenantId) });
+    files.push({ ...file, machineId, ...(keepCopyProof ? { keepCopyProof } : {}) });
   }
   return files;
 }
@@ -138,6 +154,7 @@ async function queueFiles(ctx: any, member: any, ids: string[], purgeAfter = fal
   for (const file of files) groups.set(file.machineId, [...(groups.get(file.machineId) ?? []), file]);
   const { retentionDays } = await workspaceSettings(ctx, member.tenantId);
   const jobIds = [];
+  const jobProofs = new Map<string, any[]>();
   const clusterIds = new Set<string>();
   const visitedHashes = new Set<string>();
   for (const file of files) {
@@ -157,6 +174,7 @@ async function queueFiles(ctx: any, member: any, ids: string[], purgeAfter = fal
       rollbackUntil: purgeAfter ? undefined : Date.now() + retentionDays * 86400000,
     });
     jobIds.push(jobId);
+    jobProofs.set(String(jobId), group.flatMap(file => file.keepCopyProof ? [file.keepCopyProof] : []));
     for (const file of group) await ctx.db.patch(file._id, { pendingCleanupJobId: String(jobId) });
   }
   // The same file can appear in a cache recommendation and in Duplicate
@@ -183,6 +201,8 @@ async function queueFiles(ctx: any, member: any, ids: string[], purgeAfter = fal
   }
   for (const jobId of jobIds) await ctx.db.patch(jobId, { result: {
     clusterIds: [...clusterIds], batchJobIds: jobIds, recommendationIds: [...relatedRecommendationIds],
+    keepCopyProtocol: KEEP_COPY_PROTOCOL, keepCopyRequired: Boolean(jobProofs.get(String(jobId))?.length),
+    keepCopyProofs: jobProofs.get(String(jobId)) ?? [],
   } });
   return { jobIds, queued: files.length, bytes: files.reduce((s, f) => s + f.sizeBytes, 0) };
 }
@@ -268,14 +288,23 @@ export const approveJob = mutation({ args: { jobId: v.string(), approvedBy: v.st
   if (!job) throw new ConvexError("Unknown job.");
   if (job.status === "approved" || job.status === "queued") return;
   if (job.status !== "pending_approval" || !job.machineId) throw new ConvexError("This job cannot be approved. Create a new machine-targeted request.");
-  if (job.action === "quarantine") await validatedFiles(ctx, member.tenantId, job.affectedFileIds);
-  await ctx.db.patch(job._id, { status: "approved", approvedBy: member.email, leaseRequired: true, updatedAt: Date.now() });
+  let result = job.result;
+  if (job.action === "quarantine") {
+    const files = await validatedFiles(ctx, member.tenantId, job.affectedFileIds);
+    if (files.some(file => file.machineId !== job.machineId)) throw new ConvexError("Create a separate cleanup request for each machine.");
+    const proofs = files.flatMap(file => file.keepCopyProof ? [file.keepCopyProof] : []);
+    result = { ...result, keepCopyProtocol: KEEP_COPY_PROTOCOL, keepCopyRequired: Boolean(proofs.length), keepCopyProofs: proofs };
+  }
+  await ctx.db.patch(job._id, { status: "approved", approvedBy: member.email, leaseRequired: true, result, updatedAt: Date.now() });
 }});
 
 async function queuePurge(ctx: any, member: any, items: any[]) {
   const groups = new Map<string, any[]>();
   for (const item of items) {
     const machineId = await quarantineMachine(ctx, item, member.tenantId);
+    const entry = purgeItemMetadata(item);
+    if (entry.requiresKeepCopy && !validKeepCopyProof(entry.keepCopyProof, entry, machineId))
+      throw new ConvexError("A quarantined duplicate has no verified keep-copy proof. Restore and rescan it before permanent deletion.");
     if (!groups.has(machineId)) groups.set(machineId, []);
     groups.get(machineId)!.push(item);
   }
@@ -286,7 +315,8 @@ async function queuePurge(ctx: any, member: any, items: any[]) {
       jobIds.push(await insertApprovedJob(ctx, {
         tenantId: member.tenantId, machineId, requestedBy: member.email, action: "purge",
         fileIds: chunk.map(i => i.fileId), bytes: chunk.reduce((s, i) => s + i.sizeBytes, 0),
-        result: { purgeItems: chunk.map(i => ({ quarantineItemId: String(i._id), quarantinePath: i.quarantinePath })) },
+        result: { keepCopyProtocol: KEEP_COPY_PROTOCOL, keepCopyRequired: chunk.some(item => purgeItemMetadata(item).requiresKeepCopy),
+          purgeItems: chunk.map(purgeItemMetadata) },
       }));
     }
   }
@@ -344,17 +374,67 @@ export const requestRestoreAgent = internalMutation({ args: { quarantineId: v.st
   return queueRestoreJob(ctx, item, args.tenantId, args.machineId, `machine:${args.machineId}`);
 }});
 
-export const getJob = internalQuery({ args: { jobId: v.string(), tenantId: v.optional(v.string()), machineId: v.optional(v.string()) }, handler: async (ctx, args) => {
+// Older purge jobs only stored a quarantine id/path. Hydrate their effective
+// authorization from the persisted item, never from the requesting agent.
+async function jobKeepSafety(ctx: any, job: any, tenantId: string) {
+  const files = [];
+  let needed = false;
+  let missing = false;
+  let result = job.result;
+  if (job.action === "quarantine") {
+    for (const fid of job.affectedFileIds) {
+      const id = ctx.db.normalizeId("files", fid);
+      const file = id ? inTenant(await ctx.db.get(id), tenantId) : null;
+      if (!file) { needed = true; missing = true; continue; }
+      files.push(file);
+      if (!requiresKeepCopy(file)) continue;
+      needed = true;
+      const proofs = Array.isArray(job.result?.keepCopyProofs) ? job.result.keepCopyProofs : [];
+      const proof = proofs.find((entry: any) => entry?.fileId === String(file._id));
+      if (job.result?.keepCopyProtocol !== KEEP_COPY_PROTOCOL || !validKeepCopyProof(proof, file, job.machineId)) missing = true;
+    }
+  } else if (job.action === "purge") {
+    const items = [];
+    const entries = Array.isArray(job.result?.purgeItems) ? job.result.purgeItems : [];
+    if (!entries.length) missing = needed = true;
+    for (const entry of entries) {
+      const id = ctx.db.normalizeId("quarantineItems", entry.quarantineItemId);
+      const item = id ? inTenant(await ctx.db.get(id), tenantId) : null;
+      let machineId: string | undefined;
+      if (item) { try { machineId = await quarantineMachine(ctx, item, tenantId); } catch { /* fail closed below */ } }
+      if (!item || machineId !== job.machineId || item.quarantinePath !== entry.quarantinePath ||
+        (["approved", "queued", "running"].includes(job.status) && item.status !== "pending_purge") ||
+        !job.affectedFileIds.includes(item.fileId)) {
+        needed = missing = true;
+        items.push({ ...entry, requiresKeepCopy: true });
+        continue;
+      }
+      const metadata = purgeItemMetadata(item);
+      items.push(metadata);
+      if (metadata.requiresKeepCopy) {
+        needed = true;
+        if (!validKeepCopyProof(metadata.keepCopyProof, metadata, job.machineId)) missing = true;
+      }
+    }
+    result = { ...result, keepCopyProtocol: KEEP_COPY_PROTOCOL, keepCopyRequired: needed, purgeItems: items };
+  } else {
+    for (const fid of job.affectedFileIds) {
+      const id = ctx.db.normalizeId("files", fid);
+      const file = id ? inTenant(await ctx.db.get(id), tenantId) : null;
+      if (file) files.push(file);
+    }
+  }
+  return { files, result, needed, missing };
+}
+
+export const getJob = internalQuery({ args: { jobId: v.string(), tenantId: v.optional(v.string()), machineId: v.optional(v.string()), keepCopyProtocol: v.optional(v.number()) }, handler: async (ctx, args) => {
   const id = ctx.db.normalizeId("cleanupJobs", args.jobId);
   const job = id ? inTenant(await ctx.db.get(id), args.tenantId || "") : null;
   if (!job || (args.machineId && job.machineId !== args.machineId)) return null;
-  const files = [];
-  for (const fid of job.affectedFileIds) {
-    const id = ctx.db.normalizeId("files", fid);
-    const file = id ? inTenant(await ctx.db.get(id), args.tenantId || "") : null;
-    if (file) files.push(file);
-  }
-  return { ...withoutClaimToken(job), files };
+  const safety = await jobKeepSafety(ctx, job, args.tenantId || "");
+  if (safety.needed && args.keepCopyProtocol !== KEEP_COPY_PROTOCOL) return null;
+  if (safety.missing && ["approved", "queued", "pending_approval", "draft"].includes(job.status)) return null;
+  return { ...withoutClaimToken(job), result: safety.result, files: safety.files };
 }});
 
 export const getQuarantineItem = internalQuery({ args: { quarantineId: v.string(), tenantId: v.optional(v.string()), machineId: v.optional(v.string()) }, handler: async (ctx, args) => {
@@ -372,7 +452,9 @@ async function blockOversizedJob(ctx: any, job: any, reason: string) {
   await ctx.db.patch(job._id, { pollBlocked: true, pollBlockedReason: reason, updatedAt: Date.now() });
   await ctx.db.insert("auditLogs", {
     tenantId: job.tenantId, machineId: job.machineId, action: "job_recovery_required", entityType: "cleanupJob", entityId: String(job._id),
-    message: reason === "oversized_purge_waiting_split"
+    message: reason === KEEP_COPY_REVIEW
+      ? "Pending duplicate cleanup has no stored keep-copy proof and requires manual review before it can run."
+      : reason === "oversized_purge_waiting_split"
       ? "Oversized pending purge will be split into bounded jobs by the next agent poll."
       : "Oversized file operation requires manual review; existing physical-operation journals must be preserved.",
     createdAt: Date.now(),
@@ -408,14 +490,15 @@ async function splitOversizedPurge(ctx: any, job: any) {
     jobIds.push(await insertApprovedJob(ctx, {
       tenantId: job.tenantId, machineId: job.machineId, requestedBy: job.requestedBy, approvedBy: job.approvedBy, action: "purge",
       fileIds: chunk.map(item => item.fileId), bytes: chunk.reduce((sum, item) => sum + item.sizeBytes, 0),
-      result: { purgeItems: chunk.map(item => ({ quarantineItemId: String(item._id), quarantinePath: item.quarantinePath })), splitFromJobId: String(job._id) },
+      result: { keepCopyProtocol: KEEP_COPY_PROTOCOL, keepCopyRequired: chunk.some(item => purgeItemMetadata(item).requiresKeepCopy),
+        purgeItems: chunk.map(purgeItemMetadata), splitFromJobId: String(job._id) },
     }));
   }
   await ctx.db.patch(job._id, { result: { ...job.result, replacementJobIds: jobIds } });
   return true;
 }
 
-async function pollCandidates(ctx: any, tenantId: string, machineId: string, leaseProtocol: number | undefined, now: number) {
+async function pollCandidates(ctx: any, tenantId: string, machineId: string, leaseProtocol: number | undefined, keepCopyProtocol: number | undefined, now: number) {
   const jobs = [];
   const pendingJobs = [];
   for (const status of ["approved", "queued"]) {
@@ -423,6 +506,7 @@ async function pollCandidates(ctx: any, tenantId: string, machineId: string, lea
       q.eq("tenantId", tenantId).eq("machineId", machineId).eq("status", status).eq("pollBlockedReason", undefined));
     if (leaseProtocol !== 1) pending = pending.filter((q: any) =>
       q.and(q.neq(q.field("leaseRequired"), true), q.eq(q.field("claimToken"), undefined)));
+    if (keepCopyProtocol !== KEEP_COPY_PROTOCOL) pending = pending.filter((q: any) => q.neq(q.field("result.keepCopyRequired"), true));
     pendingJobs.push(...await pending.take(4));
   }
   if (leaseProtocol === 1) {
@@ -437,7 +521,7 @@ async function pollCandidates(ctx: any, tenantId: string, machineId: string, lea
   return jobs;
 }
 
-export const pollPendingJobs = internalMutation({ args: { machineId: v.string(), tenantId: v.optional(v.string()), leaseProtocol: v.optional(v.number()) }, handler: async (ctx, args) => {
+export const pollPendingJobs = internalMutation({ args: { machineId: v.string(), tenantId: v.optional(v.string()), leaseProtocol: v.optional(v.number()), keepCopyProtocol: v.optional(v.number()) }, handler: async (ctx, args) => {
   const tenantId = args.tenantId || "";
   const now = Date.now();
   let repairAttempted = false;
@@ -454,7 +538,7 @@ export const pollPendingJobs = internalMutation({ args: { machineId: v.string(),
       break;
     }
   }
-  let jobs = await pollCandidates(ctx, tenantId, args.machineId, args.leaseProtocol, now);
+  let jobs = await pollCandidates(ctx, tenantId, args.machineId, args.leaseProtocol, args.keepCopyProtocol, now);
   let inspected = 0;
   while (inspected < 16) {
     const oversized = jobs.filter(job => jobFileCount(job) > MAX_JOB_FILES);
@@ -469,21 +553,21 @@ export const pollPendingJobs = internalMutation({ args: { machineId: v.string(),
           ? "oversized_purge_waiting_split" : "oversized_operation_requires_review");
       }
     }
-    jobs = await pollCandidates(ctx, tenantId, args.machineId, args.leaseProtocol, now);
+    jobs = await pollCandidates(ctx, tenantId, args.machineId, args.leaseProtocol, args.keepCopyProtocol, now);
   }
   const result = [];
   let hydratedFiles = 0;
   for (const job of jobs.filter(j => jobAvailableToAgent(j, now, args.leaseProtocol))) {
     if (result.length >= 4) break;
     if (hydratedFiles + jobFileCount(job) > MAX_JOB_FILES) continue;
-    const files = [];
-    for (const fid of job.affectedFileIds) {
-      const id = ctx.db.normalizeId("files", fid);
-      const file = id ? inTenant(await ctx.db.get(id), tenantId) : null;
-      if (file) files.push(file);
-    }
+    const safety = await jobKeepSafety(ctx, job, tenantId);
     hydratedFiles += job.affectedFileIds.length;
-    result.push({ ...withoutClaimToken(job), files });
+    if (safety.missing && job.status !== "running") {
+      await blockOversizedJob(ctx, job, KEEP_COPY_REVIEW);
+      continue;
+    }
+    if (safety.needed && args.keepCopyProtocol !== KEEP_COPY_PROTOCOL) continue;
+    result.push({ ...withoutClaimToken(job), result: safety.result, files: safety.files });
   }
   return result;
 }});
@@ -508,6 +592,7 @@ export const markQuarantineRestoredAgent = internalMutation({ args: { quarantine
 export const updateJobStatus = internalMutation({ args: {
   jobId: v.string(), status: v.string(), result: v.optional(v.any()), tenantId: v.optional(v.string()), machineId: v.optional(v.string()),
   claimToken: v.optional(v.string()),
+  keepCopyProtocol: v.optional(v.number()),
   quarantineFiles: v.optional(v.array(v.object({ fileId: v.string(), originalPath: v.string(), quarantinePath: v.string(), sizeBytes: v.number() }))),
 }, handler: async (ctx, args) => {
   const tenantId = args.tenantId || "";
@@ -515,6 +600,21 @@ export const updateJobStatus = internalMutation({ args: {
   const job = id ? inTenant(await ctx.db.get(id), tenantId) : null;
   if (!job || !job.machineId || (args.machineId && job.machineId !== args.machineId)) throw new ConvexError("Unknown machine job.");
   if (!["running", "completed", "failed"].includes(args.status)) throw new ConvexError("Invalid job status.");
+  let safety: Awaited<ReturnType<typeof jobKeepSafety>> | undefined;
+  if (args.status === "running" && !["completed", "failed", "cancelled"].includes(job.status) && ["quarantine", "purge"].includes(job.action)) {
+    // New agents may recover already executed journal receipts from a running
+    // legacy attempt. Their physical-operation guard still refuses fresh work
+    // without proof. Unstarted legacy jobs require explicit human review.
+    const upgradedOwner = args.keepCopyProtocol === KEEP_COPY_PROTOCOL && job.status === "running" &&
+      Boolean(job.claimToken) && job.claimToken === args.claimToken;
+    if (!upgradedOwner) {
+      safety = await jobKeepSafety(ctx, job, tenantId);
+      if (safety.needed && args.keepCopyProtocol !== KEEP_COPY_PROTOCOL)
+        return { claimed: false, reason: "keep_copy_agent_upgrade_required", status: job.status };
+      if (safety.missing && job.status !== "running")
+        return { claimed: false, reason: KEEP_COPY_REVIEW, status: job.status };
+    }
+  }
   if (job.pollBlocked && args.status === "running" && (!job.claimToken || job.claimToken !== args.claimToken)) {
     return { claimed: false, reason: job.pollBlockedReason || "job_requires_review", status: job.status };
   }
@@ -523,10 +623,15 @@ export const updateJobStatus = internalMutation({ args: {
   if (!lease.accepted) return { claimed: false, reason: lease.reason, status: job.status };
   if (lease.renewing) {
     // A heartbeat never changes the action's original inputs or writes audit spam.
-    await ctx.db.patch(job._id, { ...lease.patch, updatedAt: now });
+    await ctx.db.patch(job._id, { ...lease.patch, ...(safety ? { result: safety.result } : {}), updatedAt: now });
     return { claimed: true, claimToken: lease.patch.claimToken, leaseExpiresAt: lease.patch.leaseExpiresAt };
   }
-  const result = { ...(job.result || {}), ...(args.result || {}) };
+  const jobResult = safety?.result ?? job.result ?? {};
+  const result = { ...jobResult, ...(args.result || {}) };
+  // Execution reports cannot rewrite the authorization used by later retries
+  // or chained purges.
+  for (const key of ["keepCopyProtocol", "keepCopyRequired", "keepCopyProofs", "purgeItems"])
+    if (key in jobResult) result[key] = jobResult[key]; else delete result[key];
   const terminal = args.status === "completed" || args.status === "failed";
   if (job.action === "quarantine" && terminal && args.quarantineFiles?.length) {
     const createdItems = [];
@@ -537,13 +642,18 @@ export const updateJobStatus = internalMutation({ args: {
       if (!file || protectedFile(file) || file.path !== qf.originalPath || await fileMachine(ctx, file, tenantId) !== job.machineId)
         throw new ConvexError("Quarantine confirmation does not match the requested file.");
       if (file.deletedAt) continue;
-      const qid = await ctx.db.insert("quarantineItems", {
+      const required = requiresKeepCopy(file);
+      const proofs = Array.isArray(job.result?.keepCopyProofs) ? job.result.keepCopyProofs : [];
+      const proposedProof = proofs.find((proof: any) => proof?.fileId === qf.fileId);
+      const keepCopyProof = validKeepCopyProof(proposedProof, file, job.machineId) ? proposedProof : undefined;
+      const itemData = {
         tenantId, machineId: job.machineId, cleanupJobId: String(job._id), fileId: qf.fileId,
         originalPath: qf.originalPath, quarantinePath: qf.quarantinePath, sizeBytes: file.sizeBytes,
         movedAt: now, rollbackUntil: job.purgeAfter ? now : job.rollbackUntil ?? now + (await workspaceSettings(ctx, tenantId)).retentionDays * 86400000,
-        status: "quarantined",
-      });
-      createdItems.push({ quarantineItemId: String(qid), quarantinePath: qf.quarantinePath });
+        status: "quarantined", requiresKeepCopy: required, ...(keepCopyProof ? { keepCopyProof } : {}),
+      };
+      const qid = await ctx.db.insert("quarantineItems", itemData);
+      createdItems.push(purgeItemMetadata({ ...itemData, _id: qid }));
       await ctx.db.patch(file._id, { deletedAt: now, pendingCleanupJobId: undefined });
       if (file.fullHash) {
         const cluster = await ctx.db.query("duplicateClusters").withIndex("by_tenant_hashKey", q => q.eq("tenantId", tenantId).eq("hashKey", file.fullHash!)).first();
@@ -558,9 +668,14 @@ export const updateJobStatus = internalMutation({ args: {
       }
     }
     if (job.purgeAfter && createdItems.length) {
-      await insertApprovedJob(ctx, { tenantId, machineId: job.machineId, requestedBy: job.requestedBy, action: "purge",
-        fileIds: args.quarantineFiles.map(f => f.fileId), bytes: args.quarantineFiles.reduce((s, f) => s + f.sizeBytes, 0), result: { purgeItems: createdItems } });
-      for (const item of createdItems) await ctx.db.patch(item.quarantineItemId as any, { status: "pending_purge" });
+      if (createdItems.some(item => item.requiresKeepCopy && !validKeepCopyProof(item.keepCopyProof, item, job.machineId!))) {
+        result.purgeBlockedReason = KEEP_COPY_REVIEW;
+      } else {
+        await insertApprovedJob(ctx, { tenantId, machineId: job.machineId, requestedBy: job.requestedBy, action: "purge",
+          fileIds: createdItems.map(item => item.fileId), bytes: createdItems.reduce((sum, item) => sum + item.sizeBytes, 0),
+          result: { keepCopyProtocol: KEEP_COPY_PROTOCOL, keepCopyRequired: createdItems.some(item => item.requiresKeepCopy), purgeItems: createdItems } });
+        for (const item of createdItems) await ctx.db.patch(item.quarantineItemId as any, { status: "pending_purge" });
+      }
     }
   }
   if (job.action === "quarantine" && terminal) {

@@ -299,6 +299,13 @@ export default defineSchema({
     fileId: v.string(), // links to files table ID
     sizeBytes: v.number(),
     movedAt: v.number(),
+    // Preserve the duplicate's keep authorization until permanent deletion.
+    // Missing legacy proofs fail closed for non-regenerable originals.
+    requiresKeepCopy: v.optional(v.boolean()),
+    keepCopyProof: v.optional(v.object({
+      fileId: v.string(), keepFileId: v.string(), keepPath: v.string(),
+      keepMachineId: v.string(), fullHash: v.string(), sizeBytes: v.number(),
+    })),
     rollbackUntil: v.number(),
     status: v.string(), // "quarantined" | "restored" | "permanently_deleted"
     restoredAt: v.optional(v.number()),

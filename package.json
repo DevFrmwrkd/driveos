@@ -19,7 +19,7 @@
     "test:local:auth": "node scripts/test-local-auth.mjs",
     "test:local:recovery": "npm run build --workspace=packages/shared && npm run build --workspace=apps/agent && node scripts/test-local-recovery.mjs",
     "test:local:watch": "npm run build --workspace=packages/shared && npm run build --workspace=apps/agent && node scripts/test-local-watch.mjs",
-    "test": "npm run build --workspace=packages/shared && npm test --workspace=packages/shared && npm test --workspace=apps/agent && node --test scripts/auth-membership.test.mjs scripts/job-leases.test.mjs scripts/demo-seed.test.mjs scripts/purge-queue.test.mjs"
+    "test": "npm run build --workspace=packages/shared && npm test --workspace=packages/shared && npm test --workspace=apps/agent && node --test scripts/auth-membership.test.mjs scripts/job-leases.test.mjs scripts/demo-seed.test.mjs scripts/purge-queue.test.mjs scripts/keep-copy-safety.test.mjs"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",
