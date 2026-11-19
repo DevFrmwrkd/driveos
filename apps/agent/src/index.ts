@@ -4,6 +4,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
+import { setImmediate as yieldToIO } from "node:timers/promises";
 import { Command } from "commander";
 import chokidar from "chokidar";
 import dotenv from "dotenv";
@@ -647,6 +648,9 @@ function writeProjectStructure(root: string, project: any, projectId: string, al
 }
 
 async function renewJobLease(job: any) {
+  // A fresh lease skips HTTP. Still service socket-close events and timers
+  // between synchronous file operations, including before terminal reports.
+  await yieldToIO();
   if (!(job.leaseClient instanceof JobLeaseClient)) throw new Error("The job has no active lease.");
   await job.leaseClient.ensureValid();
 }

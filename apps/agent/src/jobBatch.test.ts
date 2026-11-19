@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 test("real CLI batches 300 quarantine/purge files within the API budget and retries 429s", { timeout: 60_000 }, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "driveos-job-batch-"));
@@ -97,13 +97,31 @@ test("real CLI batches 300 quarantine/purge files within the API budget and retr
       return json(response, 500, { error: String(error) });
     }
   });
+  // Model a backend closing idle sockets while synchronous disk work runs.
+  // The file loop must let the client observe those closes before reporting.
+  server.keepAliveTimeout = 2000;
   await new Promise<void>(resolve => server!.listen(0, "127.0.0.1", () => resolve()));
   const address = server.address();
   assert.ok(address && typeof address !== "string");
   const baseUrl = `http://127.0.0.1:${address.port}`;
   const entry = fileURLToPath(new URL("./index.js", import.meta.url));
+  const slowDisk = path.join(root, "slow-disk.mjs");
+  const ioMarker = path.join(root, "io-serviced");
+  fs.writeFileSync(slowDisk, `import fs from 'node:fs';
+const rename = fs.renameSync;
+let writes = 0;
+fs.renameSync = function(from, to) {
+  if (String(to).replaceAll('\\\\', '/').includes('/jobs/')) {
+    if (++writes === 1) setTimeout(() => {
+      if (writes > 1 && writes < 600) fs.writeFileSync(${JSON.stringify(ioMarker)}, 'timer serviced during batch');
+    }, 10).unref();
+    const until = performance.now() + 5;
+    while (performance.now() < until) {} // model synchronous journal latency
+  }
+  return rename.call(this, from, to);
+};`);
   async function agent(args: string[]) {
-    const child = spawn(process.execPath, [entry, ...args], { cwd: root, windowsHide: true,
+    const child = spawn(process.execPath, ["--import", pathToFileURL(slowDisk).href, entry, ...args], { cwd: root, windowsHide: true,
       env: { ...process.env, DRIVEOS_AGENT_HOME: agentHome, DRIVEOS_CONVEX_URL: baseUrl }, stdio: ["ignore", "pipe", "pipe"] });
     children.add(child);
     let output = "";
@@ -120,7 +138,9 @@ test("real CLI batches 300 quarantine/purge files within the API budget and retr
     "--auth-token", token, "--roots", path.dirname(media), "--central-quarantine", "--quarantine", quarantineRoot]);
   const quarantineOutput = await agent(["run-jobs"]);
   const quarantine = receipts.get("quarantine-batch");
-  assert.equal(jobs.get("quarantine-batch").status, "completed", quarantineOutput);
+  assert.equal(jobs.get("quarantine-batch").status, "completed", quarantineOutput.slice(-8000));
+  assert.equal(fs.existsSync(ioMarker), true, "Timers and socket events must be serviced during a slow quarantine batch");
+  fs.unlinkSync(ioMarker);
   assert.equal(quarantine?.quarantineFiles.length, 300);
   assert.deepEqual(quarantine.result.failures, []);
   assert.equal(quarantine.result.moved, 300);
@@ -138,7 +158,8 @@ test("real CLI batches 300 quarantine/purge files within the API budget and retr
       ({ quarantineItemId: `quarantine-${file.fileId}`, quarantinePath: file.quarantinePath })) } });
   const purgeOutput = await agent(["run-jobs"]);
   const purge = receipts.get("purge-batch");
-  assert.equal(jobs.get("purge-batch").status, "completed", purgeOutput);
+  assert.equal(jobs.get("purge-batch").status, "completed", purgeOutput.slice(-8000));
+  assert.equal(fs.existsSync(ioMarker), true, "Timers and socket events must be serviced during a slow purge batch");
   assert.equal(purge?.result.purgedItemIds.length, 300);
   assert.deepEqual(purge.result.failures, []);
   for (const moved of quarantine.quarantineFiles) assert.equal(fs.existsSync(moved.quarantinePath), false);
