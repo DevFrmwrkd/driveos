@@ -22,7 +22,7 @@ function fmtTime(iso) {
 
 async function refresh() {
   let s;
-  try { s = await api.status(); } catch { s = { connected: false, paused: false, scanRoots: [] }; }
+  try { s = await api.status(); } catch { return; }
   showView(s.connected);
 
   if (s.connected) {

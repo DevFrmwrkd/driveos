@@ -93,16 +93,19 @@ test("desktop connect gives the CLI deadline room to finish and rejects killed c
   }
 });
 
-function renderer(scanNow) {
+function renderer(scanNow, status = async () => ({ connected: true, paused: false, machineName: "synthetic", scanRoots: [] })) {
   const html = fs.readFileSync(path.join(desktop, "renderer/index.html"), "utf8");
-  const elements = new Map([...html.matchAll(/id="([^"]+)"/g)].map(([, id]) => [id, {
-    textContent: "", className: "", disabled: false, style: {}, value: "", handlers: {},
-    classList: { toggle() {} }, appendChild() {},
-    addEventListener(name, handler) { this.handlers[name] = handler; },
-  }]));
+  const elements = new Map([...html.matchAll(/<[^>]*\bid="([^"]+)"[^>]*>/g)].map(([tag, id]) => {
+    const classes = new Set((tag.match(/\bclass="([^"]*)"/)?.[1] || "").split(/\s+/).filter(Boolean));
+    return [id, {
+      textContent: "", className: [...classes].join(" "), disabled: false, style: {}, value: "", handlers: {},
+      classList: { toggle(name, enabled) { enabled ? classes.add(name) : classes.delete(name); }, contains(name) { return classes.has(name); } },
+      appendChild() {}, addEventListener(name, handler) { this.handlers[name] = handler; },
+    }];
+  }));
   const intervals = [];
   const api = {
-    scanNow, status: async () => ({ connected: true, paused: false, machineName: "synthetic", scanRoots: [] }),
+    scanNow, status,
     getAutoLaunch: async () => false, logs: async () => [], onLog() {},
   };
   const context = vm.createContext({
@@ -141,6 +144,38 @@ test("scan IPC rejection is visible and always resets the button", async () => {
   assert.equal(ui.elements.get("scan-btn").textContent, "Scan Now");
   assert.match(ui.elements.get("scan-msg").textContent, /failed.*IPC connection closed/i);
   assert.equal(ui.elements.get("scan-msg").className, "msg err");
+});
+
+test("scan errors stay visible through a status IPC outage and periodic retries, then status recovers", async () => {
+  let unavailable = false, machineName = "initial";
+  const ui = renderer(async () => { unavailable = true; throw new Error("IPC connection closed."); }, async () => {
+    if (unavailable) throw new Error("Status IPC connection closed.");
+    return { connected: true, paused: false, machineName, scanRoots: [] };
+  });
+  await new Promise(setImmediate); // Finish the actual renderer's initial refresh.
+  assert.equal(ui.elements.get("status-view").classList.contains("hidden"), false);
+  assert.equal(ui.elements.get("s-machine").textContent, "initial");
+  await ui.click();
+  const message = ui.elements.get("scan-msg").textContent;
+  assert.match(message, /Scan failed.*IPC connection closed/i);
+  assert.equal(ui.elements.get("scan-btn").disabled, false);
+  assert.equal(ui.elements.get("status-view").classList.contains("hidden"), false);
+  assert.equal(ui.elements.get("connect-view").classList.contains("hidden"), true);
+  assert.equal(ui.intervals.length, 1);
+  await ui.intervals[0]();
+  assert.equal(ui.elements.get("status-view").classList.contains("hidden"), false);
+  assert.equal(ui.elements.get("scan-msg").textContent, message);
+  unavailable = false; machineName = "recovered";
+  await ui.intervals[0]();
+  assert.equal(ui.elements.get("s-machine").textContent, "recovered");
+  assert.equal(ui.elements.get("status-view").classList.contains("hidden"), false);
+});
+
+test("an unavailable initial status preserves the disconnected HTML view", async () => {
+  const ui = renderer(async () => ({ ok: true, message: "unused" }), async () => { throw new Error("Status IPC unavailable."); });
+  await new Promise(setImmediate);
+  assert.equal(ui.elements.get("status-view").classList.contains("hidden"), true);
+  assert.equal(ui.elements.get("connect-view").classList.contains("hidden"), false);
 });
 
 test("successful scans display the completion message and clear the pending state", async () => {
