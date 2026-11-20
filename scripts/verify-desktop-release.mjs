@@ -108,10 +108,19 @@ try {
   if (process.env.GITHUB_ACTIONS === "true" && process.env.RUNNER_TEMP) {
     await verifyDesktopUi({ executable: packaged.executable, fixture, home, env, release, platform, version: expected });
   }
-  const tests = ["fileOperations", "operationJournal", "scanLock", "keepCopy", "watchQueue", "manifestFiles"]
+  const tests = ["fileOperations", "operationJournal", "scanLock", "keepCopy", "watchQueue", "manifestFiles", "backendHttp", "scanExit"]
     .map(name => path.join(repository, `apps/agent/dist/${name}.test.js`));
   for (const filename of tests) assert.ok(fs.existsSync(filename), "Compile the agent regression tests before this gate.");
-  process.stdout.write(run(packaged.executable, ["--test", ...tests], { cwd: fixture, env }));
+  const testOutput = run(packaged.executable, ["--test", ...tests], {
+    cwd: fixture, env: { ...env, DRIVEOS_TEST_AGENT_ENTRY: packaged.bundle },
+  });
+  // A zero exit code with no test output is not evidence that Electron ran
+  // the Node test runner. Require an actual completed TAP summary.
+  assert.ok(Number(testOutput.match(/^# tests (\d+)\r?$/m)?.[1]) > 0, "The packaged runtime must execute the native and scan-exit tests.");
+  assert.ok(Number(testOutput.match(/^# pass (\d+)\r?$/m)?.[1]) > 0, "The packaged runtime must report passing tests.");
+  assert.match(testOutput, /^# fail 0\r?$/m);
+  assert.match(testOutput, /^# cancelled 0\r?$/m);
+  process.stdout.write(testOutput);
   if (platform === "mac") {
     fs.mkdirSync(mount);
     run("hdiutil", ["attach", "-readonly", "-nobrowse", "-mountpoint", mount, installer]);

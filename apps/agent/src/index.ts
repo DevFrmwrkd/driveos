@@ -17,6 +17,7 @@ import { JobLeaseClient, JobLeaseLostError, RateLimitedError, withRateLimitBacko
 import { isRegenerablePath, verifyKeepCopy, type KeepCopyProof } from "./keepCopy.js";
 import { WatchQueue, WatchRootGuard, UnresolvedRemovals, catalogReceipts, catalogSnapshotFromCache, cachedParentIdentities, directoryIdentity, receiptMatchesScope, selectCatalogSnapshot, type CatalogReceipt, type CatalogSnapshot, type DirectoryIdentity } from "./watchQueue.js";
 import { requireCatalogReplay } from "./catalogReplay.js";
+import { BackendRedirectError, postBackendJson } from "./backendHttp.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), "apps/web/.env.local") });
 dotenv.config({ path: path.resolve(process.cwd(), ".env.local") });
@@ -359,31 +360,13 @@ async function syncToConvex(endpoint: string, payload: any) {
 
   let response: Response;
   let text: string;
-  // Hard network timeout so a hung request can never wedge a scan (which left
-  // the desktop "Scanning…" button spinning forever). 60s is generous for a
-  // 100-file batch upload; anything longer is a stuck socket, not slow progress.
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60_000);
   try {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (config.authToken) headers.Authorization = `Bearer ${config.authToken}`;
-
-    response = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    text = await response.text();
+    ({ response, text } = await postBackendJson(url, payload, config.authToken));
   } catch (err: any) {
-    const message = controller.signal.aborted
-      ? `Request timed out after 60s`
-      : err?.message || "Network request failed";
+    const message = err?.message || "Network request failed";
     console.warn(`[Convex Sync Stopped] ${endpoint} failed: ${message}`);
     recordSyncFailure(endpoint, message);
     throw new BackendSyncError(message);
-  } finally {
-    clearTimeout(timeout);
   }
 
   let body: any = {};
@@ -1410,29 +1393,32 @@ program
     // rejected token (401) from a real network outage before saving.
     const baseUrl = resolveConvexHttpUrl(next.convexUrl);
     try {
-      const res = await fetch(`${baseUrl}/api/registerMachine`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${next.authToken}` },
-        body: JSON.stringify({
-          name: next.machineName,
-          ownerId: next.ownerId,
-          agentVersion: AGENT_VERSION,
-          platform: process.platform,
-          location: next.location,
-        }),
-      });
+      const { response: res } = await postBackendJson(`${baseUrl}/api/registerMachine`, {
+        name: next.machineName,
+        ownerId: next.ownerId,
+        agentVersion: AGENT_VERSION,
+        platform: process.platform,
+        location: next.location,
+      }, next.authToken, { timeoutMs: 30_000, discardBody: true });
       if (res.status === 401) {
         console.error("[Connect] Token rejected (401). Re-issue a token in the dashboard for this machine and try again.");
-        process.exit(1);
+        process.exitCode = 1;
+        return;
       }
       if (!res.ok) {
         console.error(`[Connect] Backend error ${res.status}. Saved nothing.`);
-        process.exit(1);
+        process.exitCode = 1;
+        return;
       }
       saveConfig(next);
       console.log(`[Connect] Connected as "${next.machineName}". Backend: ${next.convexUrl}`);
       console.log("[Connect] Token stored in the app-data config. You can now run `driveos-agent scan-now` or `sync`.");
     } catch (err: any) {
+      if (err instanceof BackendRedirectError) {
+        console.error(`[Connect] ${err.message} Saved nothing.`);
+        process.exitCode = 1;
+        return;
+      }
       // Network failure: save anyway so the agent works once back online.
       saveConfig(next);
       console.warn(`[Connect] Saved credentials, but could not reach the backend (${err.message}). It will sync when online.`);
