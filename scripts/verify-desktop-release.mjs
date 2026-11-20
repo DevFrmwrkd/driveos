@@ -8,6 +8,7 @@ import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
+import { verifyDesktopUi } from "./verify-desktop-ui.mjs";
 
 const require = createRequire(import.meta.url);
 const { extractFile } = require("@electron/asar");
@@ -104,6 +105,9 @@ try {
   assert.equal(path.resolve(status().appDataDir), path.resolve(home));
   cli("pause"); assert.equal(status().paused, true);
   cli("resume"); assert.equal(status().paused, false);
+  if (process.env.GITHUB_ACTIONS === "true" && process.env.RUNNER_TEMP) {
+    await verifyDesktopUi({ executable: packaged.executable, fixture, home, env, release, platform, version: expected });
+  }
   const tests = ["fileOperations", "operationJournal", "scanLock", "keepCopy", "watchQueue", "manifestFiles"]
     .map(name => path.join(repository, `apps/agent/dist/${name}.test.js`));
   for (const filename of tests) assert.ok(fs.existsSync(filename), "Compile the agent regression tests before this gate.");
