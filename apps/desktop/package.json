@@ -1,6 +1,6 @@
 {
   "name": "driveos-desktop",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "private": true,
   "description": "DriveOS Agent — desktop tray app for non-technical editors",
   "main": "dist/main.js",
@@ -17,8 +17,9 @@
     "build": "npm run build:agent && npm run build:main",
     "start": "npm run build && electron .",
     "dist": "npm run build && electron-builder --publish never",
-    "dist:win": "npm run build && electron-builder --win --publish never",
-    "dist:mac": "npm run build && electron-builder --mac --publish never"
+    "verify:release": "npm --prefix ../agent run build && node ../../scripts/verify-desktop-release.mjs",
+    "dist:win": "npm run build && electron-builder --win --publish never && npm run verify:release",
+    "dist:mac": "npm run build && electron-builder --mac --publish never && npm run verify:release"
   },
   "dependencies": {},
   "devDependencies": {
