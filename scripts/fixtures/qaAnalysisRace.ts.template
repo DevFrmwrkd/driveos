@@ -1,0 +1,34 @@
+// Disposable local QA ONLY. Never copied into repository Convex sources.
+import { internalMutation, internalQuery } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { v } from "convex/values";
+async function scope(ctx: any, tenantId: string) {
+  const id = ctx.db.normalizeId("tenants", tenantId);
+  const tenant = id ? await ctx.db.get(id) : null;
+  if (tenant?.name !== "DriveOS Analysis Race QA") throw new Error("Expected isolated analysis race QA workspace");
+  const state = await ctx.db.query("analysisState").withIndex("by_tenant", (q: any) => q.eq("tenantId", tenantId)).first();
+  if (!state) throw new Error("Expected QA catalog state");
+  return state;
+}
+export const seedPausedRun = internalMutation({ args: { tenantId: v.string() }, handler: async (ctx, args) => {
+  const state = await scope(ctx, args.tenantId);
+  if (state.analysisFunctionId) await ctx.scheduler.cancel(state.analysisFunctionId);
+  const analysisRunId = (state.analysisRunId ?? 0) + 1;
+  const analysisFunctionId = await ctx.scheduler.runAfter(60 * 60 * 1000, internal.scans.runPostScanAnalysis, { tenantId: args.tenantId, analysisRunId });
+  await ctx.db.patch(state._id, { scheduled: true, analysisRunId, analysisFunctionId, analysisClaimed: false, lastRunAt: 0, dirtyCount: Math.max(1, state.dirtyCount) });
+  return { analysisRunId };
+} });
+export const state = internalQuery({ args: { tenantId: v.string() }, handler: async (ctx, args) => {
+  const state = await scope(ctx, args.tenantId);
+  const scheduled: any = state.analysisFunctionId ? await ctx.db.system.get(state.analysisFunctionId) : null;
+  return { state, scheduled };
+} });
+export const expeditePendingRun = internalMutation({ args: { tenantId: v.string(), analysisRunId: v.number() }, handler: async (ctx, args) => {
+  const state = await scope(ctx, args.tenantId);
+  const scheduled: any = state.analysisFunctionId ? await ctx.db.system.get(state.analysisFunctionId) : null;
+  if (!state.scheduled || state.analysisClaimed || state.analysisRunId !== args.analysisRunId || scheduled?.state.kind !== "pending") throw new Error("Expected this QA tenant's pending follow-up");
+  await ctx.scheduler.cancel(state.analysisFunctionId);
+  const analysisFunctionId = await ctx.scheduler.runAfter(0, internal.scans.runPostScanAnalysis, { tenantId: args.tenantId, analysisRunId: args.analysisRunId });
+  await ctx.db.patch(state._id, { lastRunAt: 0, analysisFunctionId });
+  return { expedited: true, originalScheduledTime: scheduled.scheduledTime };
+} });

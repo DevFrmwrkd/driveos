@@ -3,6 +3,7 @@ import { internalAction, internalMutation, internalQuery, mutation, query } from
 import { internal } from "./_generated/api";
 import { requireMember, inTenant } from "./access";
 import { protectedFile } from "./jobUtils";
+import { cachedAnalysisIsCurrent } from "./catalogAnalysis";
 
 // Mirrors the agent-side protection list: these classifications are never auto-quarantined.
 const PROTECTED_CLASSIFICATIONS = new Set(["RAW", "EXPORT_FINAL", "PROJECT_FILE", "ADMIN", "ARCHIVE_MANIFEST"]);
@@ -11,6 +12,7 @@ export const list = query({
   args: {},
   handler: async (ctx) => {
     const { tenantId } = await requireMember(ctx);
+    if (!await cachedAnalysisIsCurrent(ctx, tenantId)) return [];
     // Only this tenant's open clusters appear in the Duplicate Center. Indexed +
     // capped: fetch the top clusters by wasted bytes and resolve a bounded number
     // of files per cluster (an uncapped version crashed once catalogs grew).
@@ -64,6 +66,7 @@ export const getCluster = query({
   args: { clusterId: v.string() },
   handler: async (ctx, args) => {
     const { tenantId } = await requireMember(ctx);
+    if (!await cachedAnalysisIsCurrent(ctx, tenantId)) return null;
     const id = ctx.db.normalizeId("duplicateClusters", args.clusterId);
     if (!id) return null;
     const cluster = inTenant(await ctx.db.get(id), tenantId);
@@ -74,7 +77,7 @@ export const getCluster = query({
       const fileIdObj = ctx.db.normalizeId("files", fId);
       if (fileIdObj) {
         const file = await ctx.db.get(fileIdObj);
-        if (file && file.tenantId === tenantId) {
+        if (file && !file.deletedAt && file.tenantId === tenantId) {
           resolvedFiles.push(file);
         }
       }

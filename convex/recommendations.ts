@@ -3,6 +3,7 @@ import { internalAction, internalMutation, internalQuery, mutation, query } from
 import { internal } from "./_generated/api";
 import { requireMember, inTenant } from "./access";
 import { protectedFile } from "./jobUtils";
+import { cachedAnalysisIsCurrent } from "./catalogAnalysis";
 
 // Cleanup screen recommendations. Only "open" recommendations belong here — once
 // a recommendation has been acted on (a cleanup job was created/approved/run) it
@@ -21,6 +22,7 @@ export const list = query({
   args: {},
   handler: async (ctx) => {
     const { tenantId } = await requireMember(ctx);
+    if (!await cachedAnalysisIsCurrent(ctx, tenantId)) return [];
     const all = await ctx.db
       .query("recommendations")
       .withIndex("by_tenant", (q) => q.eq("tenantId", tenantId))
@@ -33,6 +35,7 @@ export const get = query({
   args: { recommendationId: v.string() },
   handler: async (ctx, args) => {
     const { tenantId } = await requireMember(ctx);
+    if (!await cachedAnalysisIsCurrent(ctx, tenantId)) return null;
     const id = ctx.db.normalizeId("recommendations", args.recommendationId);
     if (!id) return null;
     return inTenant(await ctx.db.get(id), tenantId);

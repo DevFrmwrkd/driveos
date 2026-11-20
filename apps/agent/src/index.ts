@@ -15,6 +15,8 @@ import { createProcessLock } from "./scanLock.js";
 import { OperationJournal } from "./operationJournal.js";
 import { JobLeaseClient, JobLeaseLostError, RateLimitedError, withRateLimitBackoff } from "./jobLeaseClient.js";
 import { isRegenerablePath, verifyKeepCopy, type KeepCopyProof } from "./keepCopy.js";
+import { WatchQueue, WatchRootGuard, UnresolvedRemovals, catalogReceipts, catalogSnapshotFromCache, cachedParentIdentities, directoryIdentity, receiptMatchesScope, selectCatalogSnapshot, type CatalogReceipt, type CatalogSnapshot, type DirectoryIdentity } from "./watchQueue.js";
+import { requireCatalogReplay } from "./catalogReplay.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), "apps/web/.env.local") });
 dotenv.config({ path: path.resolve(process.cwd(), ".env.local") });
@@ -48,6 +50,9 @@ interface HashCacheEntry {
   // re-uploading the whole unchanged catalog every hour is what once burned
   // ~250 GB of database bandwidth in a week. Unset (or stale) → upload.
   uploadedFp?: string;
+  catalogReceipt?: CatalogReceipt;
+  catalogParent?: DirectoryIdentity;
+  observationInvalidated?: boolean;
 }
 
 // Persisted scheduler state. Survives restart so pause/resume and the
@@ -78,6 +83,7 @@ interface FileMetadata {
   isRaw: boolean;
   isFinal: boolean;
   isProjectFile: boolean;
+  forceObservation?: boolean;
 }
 
 const AGENT_VERSION = "1.2.1";
@@ -483,8 +489,8 @@ async function buildFileMetadata(
   const cacheKey = `${filePath}-${statObj.size}`;
   const cached = hashCache[cacheKey];
 
-  let quickHash = cached?.modifiedAt === statObj.mtimeMs ? cached.quickHash : undefined;
-  let fullHash = cached?.modifiedAt === statObj.mtimeMs ? cached.fullHash : undefined;
+  let quickHash = cached?.modifiedAt === statObj.mtimeMs && !cached.observationInvalidated ? cached.quickHash : undefined;
+  let fullHash = cached?.modifiedAt === statObj.mtimeMs && !cached.observationInvalidated ? cached.fullHash : undefined;
 
   if (!quickHash) {
     quickHash = await calculateQuickHash(filePath, statObj.size);
@@ -551,9 +557,13 @@ function cacheKeyFor(meta: FileMetadata): string {
 // Record a successful upload in the hash cache so the next scan skips these
 // files. Only called after the backend confirmed the batch (never in offline
 // mode) — an unstamped file simply retries on the next cycle.
-function stampUploaded(hashCache: Record<string, HashCacheEntry>, files: FileMetadata[]) {
+function stampUploaded(hashCache: Record<string, HashCacheEntry>, files: FileMetadata[], receipts?: unknown) {
+  const acknowledged = new Map(catalogReceipts(receipts).map(receipt => [receipt.path, receipt]));
   for (const meta of files) {
     const key = cacheKeyFor(meta);
+    const receipt = acknowledged.get(meta.path);
+    let parent: DirectoryIdentity | undefined;
+    if (receipt) { try { parent = directoryIdentity(path.dirname(meta.path)); } catch { /* Deletions require root availability too. */ } }
     hashCache[key] = {
       ...hashCache[key],
       sizeBytes: meta.sizeBytes,
@@ -561,6 +571,9 @@ function stampUploaded(hashCache: Record<string, HashCacheEntry>, files: FileMet
       quickHash: meta.quickHash || hashCache[key]?.quickHash || "",
       fullHash: meta.fullHash ?? (hashCache[key]?.modifiedAt === meta.modifiedAtFile ? hashCache[key]?.fullHash : undefined),
       uploadedFp: metadataFingerprint(meta),
+      catalogReceipt: receipt,
+      catalogParent: parent,
+      observationInvalidated: undefined,
     };
   }
 }
@@ -1040,12 +1053,11 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
     const rootPrefix = scanDir.endsWith(path.sep) ? scanDir : scanDir + path.sep;
     let cleared = 0;
     for (const key of Object.keys(hashCache)) {
-      if (hashCache[key].uploadedFp && key.startsWith(rootPrefix)) {
-        delete hashCache[key].uploadedFp;
-        cleared++;
-      }
+      if (key.startsWith(rootPrefix) && requireCatalogReplay(hashCache[key], { driveId, machineId }, true)) cleared++;
     }
     if (cleared > 0) {
+      // Persist the replay fence before any ACK; its cache save may be throttled.
+      saveHashCache(hashCache);
       console.log(`[Delta Sync] Backend has no catalog for ${scanDir} — re-uploading all ${cleared} previously synced file(s).`);
     }
   }
@@ -1088,8 +1100,8 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
         .then(async () => {
           if (uploadStopped) return;
           console.log(`[${final ? "Final " : ""}Batch Upload] Syncing ${batch.length} file(s) to Convex`);
-          await syncToConvex("uploadBatch", { scanSessionId: sessionId, machineId, driveId, files: batch });
-          stampUploaded(hashCache, batch);
+          const uploaded = await syncToConvex("uploadBatch", { scanSessionId: sessionId, machineId, driveId, files: batch, catalogReceiptProtocol: 1 });
+          stampUploaded(hashCache, batch, uploaded.receipts);
           result.uploadedCount += batch.length;
           saveHashCacheThrottled(hashCache);
         })
@@ -1134,6 +1146,7 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
         return;
       }
       const existingCacheEntry = hashCache[`${filePath}-${statObj.size}`];
+      if (existingCacheEntry) requireCatalogReplay(existingCacheEntry, { driveId, machineId });
       const meta = await buildFileMetadata(filePath, statObj, hashCache, calculateFull);
       result.fileCount++;
       result.byteCount += statObj.size;
@@ -1146,6 +1159,7 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
         !options.forceFullUpload &&
         canBootstrapDeltaBaseline &&
         !existingCacheEntry?.uploadedFp &&
+        !existingCacheEntry?.observationInvalidated &&
         existingCacheEntry?.modifiedAt === meta.modifiedAtFile &&
         existingCacheEntry.quickHash === meta.quickHash &&
         existingCacheEntry.fullHash === meta.fullHash
@@ -1722,7 +1736,6 @@ program
     const config = loadConfig();
     validateRuntimeConfig(config);
     const hashCache = loadHashCache();
-    let queue = new Map<string, FileMetadata>();
     const pending = new Map<string, NodeJS.Timeout>();
     const intervalMs = Math.max(1, Number(options.intervalMinutes) || 60) * 60 * 1000;
     const debounceMs = Math.max(1, Number(options.debounceSeconds) || 8) * 1000;
@@ -1744,6 +1757,10 @@ program
       })
       .sort((a, b) => b.length - a.length);
     const catalogRoot = containingRoots[0] || watchDir;
+    const rootGuard = new WatchRootGuard([watchDir, catalogRoot]);
+    const uploaded = new Map<string, CatalogSnapshot>();
+    const cacheKeys = new Map<string, Set<string>>();
+    const parentIdentityFor = cachedParentIdentities();
     const cloudProvider = cloudSyncProvider(catalogRoot);
     const machineRes = await syncToConvex("registerMachine", {
       name: config.machineName,
@@ -1765,6 +1782,27 @@ program
       tier: cloudProvider ? "cloud" : "hot",
     });
     const driveId = driveRes.driveId;
+    const catalogScope = { driveId, machineId };
+    const queue = new WatchQueue<FileMetadata>(catalogScope);
+    const unresolved = new UnresolvedRemovals();
+
+    function indexCatalogCache(cache: Record<string, HashCacheEntry>, selected?: Set<string>) {
+      for (const [key, entry] of Object.entries(cache)) {
+        const filePath = key.slice(0, -(String(entry.sizeBytes).length + 1));
+        if (selected && !selected.has(filePath)) continue;
+        const relative = path.relative(watchDir, filePath);
+        if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) continue;
+        if (!cacheKeys.has(filePath)) cacheKeys.set(filePath, new Set());
+        cacheKeys.get(filePath)!.add(key);
+        const cached = catalogSnapshotFromCache(filePath, entry);
+        if (!cached) continue;
+        const snapshot = selectCatalogSnapshot(uploaded.get(filePath), {
+          ...cached, parent: parentIdentityFor(filePath, cached.parent),
+        }, catalogScope);
+        uploaded.set(filePath, snapshot);
+      }
+    }
+    indexCatalogCache(hashCache);
 
     if (driveRes.isNew) {
       const rootPrefix = catalogRoot.endsWith(path.sep) ? catalogRoot : catalogRoot + path.sep;
@@ -1773,103 +1811,260 @@ program
       }
     }
 
-    // Flushes the accumulated local change-queue as ONE batched upload cycle.
-    // Only ever called on the interval timer or the safety cap — never per FS event.
-    async function processQueue() {
-      if (queue.size === 0) return;
+    function clearUploadStamps(cache: Record<string, HashCacheEntry>) {
+      for (const [key, entry] of Object.entries(cache)) {
+        const filePath = key.slice(0, -(String(entry.sizeBytes).length + 1));
+        if (queue.invalidated.has(filePath)) { delete entry.uploadedFp; entry.observationInvalidated = true; }
+      }
+    }
+
+    function clearPathUploadStamp(filePath: string) {
+      for (const key of cacheKeys.get(filePath) || []) {
+        if (hashCache[key]) { delete hashCache[key].uploadedFp; hashCache[key].observationInvalidated = true; }
+      }
+    }
+
+    let ignoredRemovals = 0;
+    function removed(filePath: string) {
+      const timer = pending.get(filePath);
+      if (timer) clearTimeout(timer);
+      pending.delete(filePath);
+      const snapshot = uploaded.get(filePath);
+      let parent = snapshot?.parent;
+      if (snapshot && !parent) { try { parent = directoryIdentity(path.dirname(filePath)); } catch { /* Hold until physical availability can be proven. */ } }
+      const queued = queue.deleted(filePath, snapshot?.receipt, parent, snapshot?.fingerprint);
+      // Preserve the successful fingerprint/receipt for deletion CAS, but make
+      // an identical recreation upload again instead of trusting that stamp.
+      clearPathUploadStamp(filePath);
+      if (!queued) {
+        unresolved.removed(filePath);
+        if (unresolved.size >= 500) void processQueue();
+        return;
+      }
+      unresolved.cancel(filePath);
+      console.log(`[Watcher File Removed] Queued catalog reconciliation: ${filePath}`);
+    }
+
+    let flushing: Promise<void> | undefined;
+    let retryAfter = 0;
+    function processQueue(): Promise<void> {
+      if (flushing) return flushing;
+      flushing = flushQueue().catch(error => {
+        console.warn(`[Watcher Sync] Queue remains held after local failure: ${error.message}`);
+      }).finally(() => { flushing = undefined; });
+      return flushing;
+    }
+
+    async function flushQueue() {
+      if ((!queue.size && !unresolved.size) || Date.now() < retryAfter) return;
       if (loadState().paused) {
         console.log(`[Watcher Paused] Holding ${queue.size} queued change(s) until resume.`);
         return;
       }
+      if (!rootGuard.available()) {
+        console.warn("[Watcher Safety] Watched root is unavailable or its physical identity changed; holding catalog changes.");
+        return;
+      }
+      // An outage or a file that was still being written may have prevented
+      // the debounce callback from hashing it. Retry preparation on the next
+      // interval, without needing another filesystem event.
+      await Promise.all(queue.unpreparedChanges().map(entry => enqueue(entry.path, entry.generation)));
       if (!await acquireScanLock()) return;
-      const batch = Array.from(queue.values());
-      queue = new Map<string, FileMetadata>();
+      let persistedCache: Record<string, HashCacheEntry> | undefined;
       try {
-        // Merge successful uploads into the latest on-disk cache while holding
-        // the same mutex as scheduled/manual scans. Event metadata stays local.
-        const persistedCache = loadHashCache();
-        console.log(`[Watcher Batch] Flushing ${batch.length} file change(s) to Convex`);
-
+        persistedCache = loadHashCache();
+        const unknown = unresolved.snapshot();
+        const relevant = new Set([...unknown.map(entry => entry.path), ...queue.deletions().map(entry => entry.path)]);
+        indexCatalogCache(persistedCache, relevant);
+        for (let start = 0; start < unknown.length; start += 500) {
+          for (const entry of unknown.slice(start, start + 500)) {
+            if (!unresolved.consume(entry)) continue;
+            const snapshot = uploaded.get(entry.path);
+            if (snapshot && queue.deleted(entry.path, snapshot.receipt, snapshot.parent, snapshot.fingerprint)) {
+              clearPathUploadStamp(entry.path);
+            } else {
+              for (const key of cacheKeys.get(entry.path) || []) {
+                if (!hashCache[key]?.catalogReceipt && !hashCache[key]?.uploadedFp) delete hashCache[key];
+              }
+              cacheKeys.delete(entry.path);
+              ignoredRemovals++;
+            }
+          }
+          await yieldToIO();
+        }
+        if (ignoredRemovals) console.log(`[Watcher Removed] ${ignoredRemovals} removal(s) had no uploaded catalog fingerprint after refreshing the scan cache.`);
+        // Unknown tiny-file churn drains locally and never opens scan sessions
+        // or sends receipt requests when the fresh cache proves nothing uploaded.
+        if (!queue.size) { persistedCache = undefined; return; }
+        clearUploadStamps(hashCache);
+        clearUploadStamps(persistedCache);
+        const batch = queue.changes();
+        const deletions = queue.deletions();
+        for (const deletion of deletions) {
+          const snapshot = uploaded.get(deletion.path);
+          if (snapshot) queue.refreshFromSnapshot(deletion, snapshot);
+        }
+        function assertCanSync() {
+          if (loadState().paused) throw new Error("Watcher paused; queued changes remain held.");
+          if (!rootGuard.available()) throw new Error("Watched root became unavailable or changed.");
+        }
+        assertCanSync();
+        console.log(`[Watcher Batch] Flushing up to ${batch.length} file change(s) and ${deletions.length} removal(s) to Convex`);
         const scanRes = await syncToConvex("startScan", {
-          machineId,
-          driveId,
-          rootPath: catalogRoot,
-          agentVersion: AGENT_VERSION,
+          machineId, driveId, rootPath: watchDir, agentVersion: AGENT_VERSION,
         });
         const sessionId = scanRes.sessionId;
         let partial = false;
-
         for (let i = 0; i < batch.length; i += 100) {
-          const slice = batch.slice(i, i + 100);
+          assertCanSync();
+          const slice = batch.slice(i, i + 100).filter(change => {
+            if (!queue.isCurrent(change.path, change.generation)) return false;
+            try {
+              const current = fs.statSync(change.path);
+              if (current.isFile() && current.size === change.metadata!.sizeBytes && current.mtimeMs === change.metadata!.modifiedAtFile) return true;
+              schedule(change.path, change.forceObservation);
+            } catch (error: any) { if (error.code === "ENOENT") removed(change.path); }
+            return false;
+          });
+          if (!slice.length) continue;
+          for (const change of slice) queue.beginUpload(change, change.metadata!);
+          let result: any;
           try {
-            await syncToConvex("uploadBatch", {
-              scanSessionId: sessionId,
-              machineId,
-              driveId,
-              files: slice,
+            result = await syncToConvex("uploadBatch", {
+              scanSessionId: sessionId, machineId, driveId, catalogReceiptProtocol: 1,
+              files: slice.map(change => ({ ...change.metadata!, ...(change.forceObservation ? { forceObservation: true } : {}) })),
             });
-            stampUploaded(hashCache, slice);
-            stampUploaded(persistedCache, slice);
-          } catch (err: any) {
-            partial = true;
-            // Put the unsent remainder back without duplicating repeated events
-            // for the same path.
-            for (const meta of batch.slice(i)) {
-              if (!queue.has(meta.path)) queue.set(meta.path, meta);
+          } finally { for (const change of slice) queue.endUpload(change); }
+          const receipts = new Map(catalogReceipts(result.receipts).filter(receipt => receiptMatchesScope(receipt, catalogScope)).map(receipt => [receipt.path, receipt]));
+          for (const change of slice) {
+            const meta = change.metadata!, receipt = receipts.get(change.path);
+            if (!receipt || receipt.sizeBytes !== meta.sizeBytes || receipt.modifiedAtFile !== meta.modifiedAtFile ||
+                receipt.quickHash !== meta.quickHash || (meta.fullHash && receipt.fullHash !== meta.fullHash)) {
+              partial = true;
+              continue;
             }
-            if (err instanceof RateLimitedError) {
-              console.warn(`[Watcher Budget] Backend rate limit hit — holding ${batch.length - i} change(s) for the next interval.`);
-            } else {
-              console.warn(`[Watcher Sync] Upload stopped — holding ${batch.length - i} change(s): ${err.message}`);
+            const current = queue.isCurrent(change.path, change.generation);
+            stampUploaded(hashCache, [meta], [receipt]);
+            stampUploaded(persistedCache, [meta], [receipt]);
+            hashCache[cacheKeyFor(meta)].catalogParent = change.parent;
+            persistedCache[cacheKeyFor(meta)].catalogParent = change.parent;
+            uploaded.set(change.path, { receipt, fingerprint: receipt, parent: change.parent });
+            queue.uploaded(change, receipt, change.parent);
+            if (!current) {
+              delete hashCache[cacheKeyFor(meta)].uploadedFp;
+              delete persistedCache[cacheKeyFor(meta)].uploadedFp;
+              hashCache[cacheKeyFor(meta)].observationInvalidated = true;
+              persistedCache[cacheKeyFor(meta)].observationInvalidated = true;
             }
-            break;
+          }
+          if (partial) break; // Missing acknowledgements remain queued for retry.
+        }
+
+        for (let i = 0; i < deletions.length; i += 100) {
+          assertCanSync();
+          const candidates = deletions.slice(i, i + 100).filter(entry => {
+            if (!queue.isCurrent(entry.path, entry.generation)) return false;
+            if (rootGuard.fileMissing(entry.path, entry.parent)) return true;
+            try { if (fs.statSync(entry.path).isFile()) schedule(entry.path, true); } catch { queue.defer(entry); }
+            return false;
+          });
+          const legacy = candidates.filter(entry => !entry.receipt && entry.fingerprint);
+          if (legacy.length) {
+            assertCanSync();
+            const result = await syncToConvex("getCatalogReceipts", {
+              scanSessionId: sessionId, machineId, driveId, files: legacy.map(entry => entry.fingerprint),
+            });
+            queue.bootstrapReceipts(legacy, result.receipts, result.rejected);
+            for (const entry of legacy) {
+              if (entry.retiredReason) console.warn(`[Watcher Safety] Catalog fingerprint changed; removed event retired without deleting the newer row. Review/rescan: ${entry.path}`);
+            }
+          }
+          // Recheck after the lookup/network wait. An unplugged volume or a
+          // recreation during that wait must not become a catalog deletion.
+          const ready = candidates.filter(entry => entry.receipt && queue.isCurrent(entry.path, entry.generation) && rootGuard.fileMissing(entry.path, entry.parent));
+          const readyPaths = new Set(ready.map(entry => entry.path));
+          for (const entry of candidates) {
+            if (!readyPaths.has(entry.path) && queue.isCurrent(entry.path, entry.generation)) {
+              partial = true;
+              try { if (fs.statSync(entry.path).isFile()) schedule(entry.path, true); } catch { queue.defer(entry); }
+            }
+            if (!entry.receipt && queue.isCurrent(entry.path, entry.generation)) {
+              partial = true;
+              queue.defer(entry);
+              console.warn(`[Watcher Safety] No matching catalog receipt for removed path; holding for review/rescan: ${entry.path}`);
+            }
+          }
+          if (!ready.length) continue;
+          assertCanSync();
+          const result = await syncToConvex("reportMissingFiles", {
+            scanSessionId: sessionId, machineId, driveId, files: ready.map(entry => entry.receipt),
+          });
+          if (queue.deletionReceipts(ready, result.receipts) !== ready.length) partial = true;
+          for (const entry of ready) {
+            if (!entry.receipt && entry.conflictRefreshes && queue.isCurrent(entry.path, entry.generation)) {
+              console.log(`[Watcher Conflict] Refreshing catalog receipt after newer observation: ${entry.path}`);
+            }
+            if (entry.retiredReason) console.warn(`[Watcher Safety] Catalog kept changing; removed event retired without another deletion. Review/rescan: ${entry.path}`);
+          }
+          // A reappearance may race the HTTP request before chokidar delivers
+          // its add event. Force a fresh observation even for identical stats.
+          for (const entry of ready) {
+            try { if (fs.statSync(entry.path).isFile()) schedule(entry.path, true); } catch { /* Still absent. */ }
           }
         }
+        clearUploadStamps(persistedCache);
         saveHashCache(persistedCache);
         await syncToConvex("completeScan", {
-          sessionId,
-          status: partial ? "partial" : "completed",
-          errorsCount: partial ? 1 : 0,
-          filesSeen: batch.length,
-          bytesSeen: batch.reduce((total, file) => total + file.sizeBytes, 0),
+          sessionId, status: partial ? "partial" : "completed", errorsCount: partial ? 1 : 0,
+          filesSeen: batch.length, bytesSeen: batch.reduce((total, entry) => total + entry.metadata!.sizeBytes, 0),
         });
       } catch (error: any) {
-        for (const meta of batch) if (!queue.has(meta.path)) queue.set(meta.path, meta);
+        if (error instanceof RateLimitedError) retryAfter = Date.now() + error.retryAfterSeconds * 1000;
         console.warn(`[Watcher Sync] Holding ${queue.size} change(s) for retry: ${error.message}`);
-      } finally { await releaseScanLock(); }
+      } finally {
+        try { if (persistedCache) { clearUploadStamps(persistedCache); saveHashCache(persistedCache); } }
+        finally { await releaseScanLock(); }
+      }
     }
 
-    // Builds metadata into the local queue. Does NOT upload — uploads happen only
-    // in processQueue() on the interval, so filesystem events never stream to Convex.
-    async function enqueue(filePath: string) {
+    async function enqueue(filePath: string, generation: number) {
       try {
-        const statObj = fs.statSync(filePath);
-        if (!statObj.isFile() || statObj.size < Math.max(config.minFileSizeBytes, MIN_CATALOG_FILE_SIZE_BYTES)) return;
+        if (!rootGuard.available() || !queue.isCurrent(filePath, generation)) return;
         if (!(await isFileStable(filePath))) {
           console.log(`[Watcher Stable Check] Skipping actively changing file until next event: ${filePath}`);
           return;
         }
-        const meta = await buildFileMetadata(filePath, statObj, hashCache, config.fullHash);
-        // Event fired but nothing the backend stores actually changed (e.g.
-        // atime-only touches) — skip the upload.
-        if (hashCache[cacheKeyFor(meta)]?.uploadedFp === metadataFingerprint(meta)) return;
-        queue.set(meta.path, meta);
-        // Safety cap only — bounds memory if a huge burst arrives between intervals.
-        if (queue.size >= 500) {
-          console.log("[Watcher Cap] Local queue reached 500 — flushing early to bound memory.");
-          await processQueue();
-        }
+        const statObj = fs.statSync(filePath);
+        if (!statObj.isFile() || statObj.size < Math.max(config.minFileSizeBytes, MIN_CATALOG_FILE_SIZE_BYTES)) { queue.acknowledge({ path: filePath, generation }); return; }
+        const parent = directoryIdentity(path.dirname(filePath));
+        const key = `${filePath}-${statObj.size}`;
+        // Hashing can outlive a later unlink/add or a second debounce callback.
+        // Do not let obsolete asynchronous work overwrite the live cache.
+        const localCache: Record<string, HashCacheEntry> = hashCache[key] ? { [key]: hashCache[key] } : {};
+        const meta = await buildFileMetadata(filePath, statObj, localCache, config.fullHash);
+        const after = fs.statSync(filePath);
+        if (!queue.isCurrent(filePath, generation) || !rootGuard.available()) return;
+        if (statObj.dev !== after.dev || statObj.ino !== after.ino || statObj.size !== after.size ||
+            statObj.mtimeMs !== after.mtimeMs || statObj.ctimeMs !== after.ctimeMs) { schedule(filePath); return; }
+        if (!queue.invalidated.has(filePath) && hashCache[cacheKeyFor(meta)]?.uploadedFp === metadataFingerprint(meta)) { queue.acknowledge({ path: filePath, generation }); return; }
+        hashCache[key] = localCache[key];
+        if (!cacheKeys.has(filePath)) cacheKeys.set(filePath, new Set());
+        cacheKeys.get(filePath)!.add(key);
+        queue.metadata(filePath, generation, meta, parent);
       } catch (err: any) {
         console.warn(`[Watcher Skip] ${filePath}: ${err.message}`);
       }
     }
 
-    function schedule(filePath: string) {
+    function schedule(filePath: string, forceObservation = false) {
+      unresolved.cancel(filePath);
+      const generation = queue.changed(filePath, forceObservation);
+      if (forceObservation) clearPathUploadStamp(filePath);
       const existing = pending.get(filePath);
       if (existing) clearTimeout(existing);
       pending.set(filePath, setTimeout(() => {
         pending.delete(filePath);
-        void enqueue(filePath);
+        void enqueue(filePath, generation);
       }, debounceMs));
     }
 
@@ -1891,11 +2086,9 @@ program
         persistent: true,
         ignoreInitial: true,
       })
-      .on("add", schedule)
-      .on("change", schedule)
-      .on("unlink", (filePath) => {
-        console.log(`[Watcher File Removed] ${filePath}`);
-      });
+      .on("add", filePath => schedule(filePath, true))
+      .on("change", filePath => schedule(filePath))
+      .on("unlink", removed);
   });
 
 program
