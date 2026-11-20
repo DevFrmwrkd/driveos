@@ -110,6 +110,7 @@ try {
   }
   const tests = ["fileOperations", "operationJournal", "scanLock", "keepCopy", "watchQueue", "manifestFiles", "backendHttp", "scanExit"]
     .map(name => path.join(repository, `apps/agent/dist/${name}.test.js`));
+  tests.push(path.join(repository, "scripts/desktop-agent.test.mjs"));
   for (const filename of tests) assert.ok(fs.existsSync(filename), "Compile the agent regression tests before this gate.");
   const testOutput = run(packaged.executable, ["--test", ...tests], {
     cwd: fixture, env: { ...env, DRIVEOS_TEST_AGENT_ENTRY: packaged.bundle },

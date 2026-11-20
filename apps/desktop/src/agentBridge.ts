@@ -3,6 +3,10 @@ import { spawn, execFile } from "child_process";
 import path from "path";
 import fs from "fs";
 
+// Let the CLI finish its 30s connection deadline and clean up before the
+// desktop's last-resort process timeout can terminate it.
+const CONNECT_TIMEOUT_MS = 35_000;
+
 // Bridges the desktop app to the DriveOS agent CLI. We run the agent as a child
 // process (Node script bundled with the app) rather than importing it, so the
 // well-tested CLI stays the single source of truth for all scan/sync/safety logic.
@@ -74,7 +78,7 @@ export async function connect(opts: {
   const args = ["connect", "--token", opts.token, "--machine", opts.machine];
   if (opts.convexUrl) args.push("--convex", opts.convexUrl);
   if (opts.owner) args.push("--owner", opts.owner);
-  const { stdout, stderr, code } = await runAgent(args, 30000);
+  const { stdout, stderr, code } = await runAgent(args, CONNECT_TIMEOUT_MS);
   const out = (stdout + stderr).trim();
   const ok = code === 0 && /\[Connect\] Connected/i.test(out);
   return { ok, message: out.split("\n").filter(Boolean).slice(-2).join(" ") || "Connect finished." };
@@ -85,11 +89,17 @@ export async function scanNow(): Promise<{ ok: boolean; message: string }> {
   // with no timeout (0), so a hung upload left the button spinning forever. Two
   // hours is well beyond a real large-drive scan; past that it's stuck, not slow.
   // (The agent's own per-request fetch timeout normally prevents reaching this.)
-  const { stdout, stderr } = await runAgent(["scan-now"], 2 * 60 * 60 * 1000);
-  const out = (stdout + stderr).trim();
-  const ok = /Sync Cycle Complete|Scan Complete/i.test(out);
-  const summary = out.split("\n").filter((l) => /Cycle Complete|paused|Unauthorized|unavailable|already running/i.test(l)).pop();
-  return { ok, message: summary || "Scan finished." };
+  const { stdout, stderr, code } = await runAgent(["scan-now"], 2 * 60 * 60 * 1000);
+  const lines = `${stdout}\n${stderr}`.split("\n").map(line => line.trim()).filter(Boolean);
+  const finalCycle = lines.filter(line => /^\[Sync Cycle (Complete|Partial)\]/.test(line)).pop();
+  if (code === 0 && finalCycle?.startsWith("[Sync Cycle Complete]")) {
+    return { ok: true, message: finalCycle };
+  }
+  const partial = finalCycle?.startsWith("[Sync Cycle Partial]") ? finalCycle : undefined;
+  const reason = lines.filter(line => /failed|\berror\b|paused|No folders are being tracked|already running|unavailable|Unauthorized/i.test(line)).pop();
+  return { ok: false, message: partial || reason || (code !== 0
+    ? "Scan failed or was interrupted. Check Recent activity for details."
+    : "Scan did not complete. Check Recent activity for details.") };
 }
 
 export async function pause(): Promise<void> {

@@ -21,7 +21,7 @@
     "test:local:watch": "npm run build --workspace=packages/shared && npm run build --workspace=apps/agent && node scripts/test-local-watch.mjs",
     "test:local:watch-review": "npm run build --workspace=packages/shared && npm run build --workspace=apps/agent && node scripts/test-local-watch-review.mjs",
     "test:local:analysis-race": "node scripts/test-local-analysis-race.mjs",
-    "test": "npm run build --workspace=packages/shared && npm test --workspace=packages/shared && npm test --workspace=apps/agent && node --test scripts/auth-membership.test.mjs scripts/job-leases.test.mjs scripts/demo-seed.test.mjs scripts/purge-queue.test.mjs scripts/keep-copy-safety.test.mjs scripts/catalog-analysis.test.mjs scripts/watch-catalog.test.mjs scripts/drive-identity.test.mjs"
+    "test": "npm run build --workspace=packages/shared && npm test --workspace=packages/shared && npm test --workspace=apps/agent && node --test scripts/auth-membership.test.mjs scripts/job-leases.test.mjs scripts/demo-seed.test.mjs scripts/purge-queue.test.mjs scripts/keep-copy-safety.test.mjs scripts/catalog-analysis.test.mjs scripts/watch-catalog.test.mjs scripts/drive-identity.test.mjs scripts/desktop-agent.test.mjs"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",

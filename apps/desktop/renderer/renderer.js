@@ -82,10 +82,18 @@ $("open-dash").addEventListener("click", () => {
 
 // ---- Status actions ----
 $("scan-btn").addEventListener("click", async () => {
-  $("scan-btn").disabled = true; $("scan-btn").textContent = "Scanning…";
-  await api.scanNow();
-  $("scan-btn").disabled = false; $("scan-btn").textContent = "Scan Now";
-  refresh();
+  const button = $("scan-btn");
+  button.disabled = true; button.textContent = "Scanning…";
+  setMsg($("scan-msg"), "Scanning…");
+  try {
+    const result = await api.scanNow();
+    setMsg($("scan-msg"), result.message, result.ok ? "ok" : "err");
+  } catch (error) {
+    setMsg($("scan-msg"), `Scan failed: ${error?.message || "Could not contact the agent."}`, "err");
+  } finally {
+    button.disabled = false; button.textContent = "Scan Now";
+    await refresh();
+  }
 });
 $("pause-btn").addEventListener("click", async () => {
   const s = await api.status();
