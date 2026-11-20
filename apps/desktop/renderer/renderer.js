@@ -77,8 +77,7 @@ $("connect-btn").addEventListener("click", async () => {
   if (r.ok) setTimeout(refresh, 600);
 });
 $("open-dash").addEventListener("click", () => {
-  const url = $("url").value.trim() || "https://dashboard.convex.dev";
-  api.openDashboard(url);
+  api.openDashboard("https://driveos-ochre.vercel.app/");
 });
 
 // ---- Status actions ----
