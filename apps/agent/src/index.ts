@@ -17,6 +17,7 @@ import { JobLeaseClient, JobLeaseLostError, RateLimitedError, withRateLimitBacko
 import { isRegenerablePath, verifyKeepCopy, type KeepCopyProof } from "./keepCopy.js";
 import { WatchQueue, WatchRootGuard, UnresolvedRemovals, catalogReceipts, catalogSnapshotFromCache, cachedParentIdentities, directoryIdentity, receiptMatchesScope, selectCatalogSnapshot, type CatalogReceipt, type CatalogSnapshot, type DirectoryIdentity } from "./watchQueue.js";
 import { requireCatalogReplay } from "./catalogReplay.js";
+import { BackendRedirectError, postBackendJson } from "./backendHttp.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), "apps/web/.env.local") });
 dotenv.config({ path: path.resolve(process.cwd(), ".env.local") });
@@ -64,6 +65,8 @@ interface AgentState {
   lastSyncCompletedAt?: string;
   lastSyncFiles?: number;
   lastSyncBytes?: number;
+  lastSyncStatus?: "completed" | "partial";
+  lastSyncErrors?: number;
 }
 
 interface FileMetadata {
@@ -359,31 +362,13 @@ async function syncToConvex(endpoint: string, payload: any) {
 
   let response: Response;
   let text: string;
-  // Hard network timeout so a hung request can never wedge a scan (which left
-  // the desktop "Scanning…" button spinning forever). 60s is generous for a
-  // 100-file batch upload; anything longer is a stuck socket, not slow progress.
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60_000);
   try {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (config.authToken) headers.Authorization = `Bearer ${config.authToken}`;
-
-    response = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    text = await response.text();
+    ({ response, text } = await postBackendJson(url, payload, config.authToken));
   } catch (err: any) {
-    const message = controller.signal.aborted
-      ? `Request timed out after 60s`
-      : err?.message || "Network request failed";
+    const message = err?.message || "Network request failed";
     console.warn(`[Convex Sync Stopped] ${endpoint} failed: ${message}`);
     recordSyncFailure(endpoint, message);
     throw new BackendSyncError(message);
-  } finally {
-    clearTimeout(timeout);
   }
 
   let body: any = {};
@@ -916,7 +901,7 @@ async function executeJob(job: any, config: DriveOSConfig): Promise<boolean> {
       if (!await acquireScanLock()) throw new Error("Another scan is running. Retry when it finishes.");
       try {
         const scan = await performScan(root, loadConfig(), { checkStability: true });
-        await reportJob(job, { status: scan.errorsCount > 0 ? "failed" : "completed", result: { ...job.result, ...scan } });
+        await reportJob(job, { status: scan.partial ? "failed" : "completed", result: { ...job.result, ...scan } });
       } finally {
         await releaseScanLock();
       }
@@ -982,6 +967,7 @@ interface ScanOptions {
 }
 
 interface ScanResult {
+  partial: boolean;
   fileCount: number;
   byteCount: number;
   errorsCount: number;
@@ -1072,6 +1058,7 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
 
   const fileBatch: FileMetadata[] = [];
   const result: ScanResult = {
+    partial: false,
     fileCount: 0,
     byteCount: 0,
     errorsCount: 0,
@@ -1178,6 +1165,12 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
         return;
       }
 
+      // This is a modern observation awaiting a server acknowledgement, not
+      // an old 1.0 cache baseline. Keep it retryable if this batch fails or a
+      // later batch persists the cache before the scan is interrupted.
+      const pendingEntry = hashCache[cacheKeyFor(meta)];
+      delete pendingEntry.uploadedFp;
+      pendingEntry.observationInvalidated = true;
       fileBatch.push(meta);
       if (fileBatch.length >= 100) await flushBatch();
     } catch (err: any) {
@@ -1208,9 +1201,12 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
   await Promise.all([...inFlight]);
   await flushBatch(true);
   saveHashCache(hashCache);
+  // A rate-limited upload is incomplete even when it is not counted as a file
+  // error. Preserve that outcome through jobs, one-shot commands and cycles.
+  result.partial = uploadStopped || result.errorsCount > 0;
   await syncToConvex("completeScan", {
     sessionId,
-    status: uploadStopped || result.errorsCount > 0 ? "partial" : "completed",
+    status: result.partial ? "partial" : "completed",
     errorsCount: result.errorsCount,
     // True walk totals: with delta sync the per-batch progress counts only
     // changed files, so the session record gets the real numbers here.
@@ -1218,7 +1214,7 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
     bytesSeen: result.byteCount,
   });
 
-  console.log(`[Scan Complete] ${scanDir} — ${result.fileCount} file(s) seen (${result.uploadedCount} uploaded, ${result.skippedUnchanged} unchanged, ${result.baselinedCount} baselined from agent 1.0 cache), ${(result.byteCount / 1024 ** 4).toFixed(2)} TB, errors: ${result.errorsCount}, deferred: ${result.skippedUnstable}`);
+  console.log(`[Scan ${result.partial ? "Partial" : "Complete"}] ${scanDir} — ${result.fileCount} file(s) seen (${result.uploadedCount} uploaded, ${result.skippedUnchanged} unchanged, ${result.baselinedCount} baselined from agent 1.0 cache), ${(result.byteCount / 1024 ** 4).toFixed(2)} TB, errors: ${result.errorsCount}, deferred: ${result.skippedUnstable}`);
   return result;
 }
 
@@ -1253,6 +1249,7 @@ async function runSyncCycle(config: DriveOSConfig, options: ScanOptions = {}): P
 async function runSyncCycleLocked(config: DriveOSConfig, options: ScanOptions, roots: string[]): Promise<ScanResult> {
   saveState({ lastSyncStartedAt: new Date().toISOString() });
   const totals: ScanResult = {
+    partial: false,
     fileCount: 0,
     byteCount: 0,
     errorsCount: 0,
@@ -1303,6 +1300,7 @@ async function runSyncCycleLocked(config: DriveOSConfig, options: ScanOptions, r
       }
       try {
         const res = await performScan(resolved, config, { ...options, checkStability: true, sharedHashCache, ...pass, forceFullUpload });
+        totals.partial ||= res.partial;
         totals.fileCount += res.fileCount;
         totals.byteCount += res.byteCount;
         totals.errorsCount += res.errorsCount;
@@ -1312,17 +1310,24 @@ async function runSyncCycleLocked(config: DriveOSConfig, options: ScanOptions, r
         totals.baselinedCount += res.baselinedCount;
       } catch (err: any) {
         console.error(`[Sync] Scan of ${resolved} failed: ${err.message}`);
+        totals.partial = true;
         totals.errorsCount++;
       }
     }
   }
 
   saveState({
-    lastSyncCompletedAt: new Date().toISOString(),
-    lastSyncFiles: totals.fileCount,
-    lastSyncBytes: totals.byteCount,
+    // Keep the successful timestamp and its matching totals together when
+    // only part of the catalog synced. Attempt details are reported below.
+    ...(!totals.partial ? {
+      lastSyncCompletedAt: new Date().toISOString(),
+      lastSyncFiles: totals.fileCount,
+      lastSyncBytes: totals.byteCount,
+    } : {}),
+    lastSyncStatus: totals.partial ? "partial" : "completed",
+    lastSyncErrors: totals.errorsCount,
   });
-  console.log(`[Sync Cycle Complete] ${totals.fileCount} file(s) across ${roots.length} root(s), ${(totals.byteCount / 1024 ** 4).toFixed(2)} TB — ${totals.uploadedCount} uploaded, ${totals.skippedUnchanged} unchanged (skipped), ${totals.baselinedCount} upgrade-baselined.`);
+  console.log(`[Sync Cycle ${totals.partial ? "Partial" : "Complete"}] ${totals.fileCount} file(s) across ${roots.length} root(s), ${(totals.byteCount / 1024 ** 4).toFixed(2)} TB — ${totals.uploadedCount} uploaded, ${totals.skippedUnchanged} unchanged (skipped), ${totals.baselinedCount} upgrade-baselined, errors: ${totals.errorsCount}.`);
   return totals;
 }
 
@@ -1410,29 +1415,32 @@ program
     // rejected token (401) from a real network outage before saving.
     const baseUrl = resolveConvexHttpUrl(next.convexUrl);
     try {
-      const res = await fetch(`${baseUrl}/api/registerMachine`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${next.authToken}` },
-        body: JSON.stringify({
-          name: next.machineName,
-          ownerId: next.ownerId,
-          agentVersion: AGENT_VERSION,
-          platform: process.platform,
-          location: next.location,
-        }),
-      });
+      const { response: res } = await postBackendJson(`${baseUrl}/api/registerMachine`, {
+        name: next.machineName,
+        ownerId: next.ownerId,
+        agentVersion: AGENT_VERSION,
+        platform: process.platform,
+        location: next.location,
+      }, next.authToken, { timeoutMs: 30_000, discardBody: true });
       if (res.status === 401) {
         console.error("[Connect] Token rejected (401). Re-issue a token in the dashboard for this machine and try again.");
-        process.exit(1);
+        process.exitCode = 1;
+        return;
       }
       if (!res.ok) {
         console.error(`[Connect] Backend error ${res.status}. Saved nothing.`);
-        process.exit(1);
+        process.exitCode = 1;
+        return;
       }
       saveConfig(next);
       console.log(`[Connect] Connected as "${next.machineName}". Backend: ${next.convexUrl}`);
       console.log("[Connect] Token stored in the app-data config. You can now run `driveos-agent scan-now` or `sync`.");
     } catch (err: any) {
+      if (err instanceof BackendRedirectError) {
+        console.error(`[Connect] ${err.message} Saved nothing.`);
+        process.exitCode = 1;
+        return;
+      }
       // Network failure: save anyway so the agent works once back online.
       saveConfig(next);
       console.warn(`[Connect] Saved credentials, but could not reach the backend (${err.message}). It will sync when online.`);
@@ -1534,12 +1542,13 @@ program
     const config = loadConfig();
     if (!await acquireScanLock()) throw new Error(scanLock.lastFailure || "Another scan is already running.");
     try {
-      await performScan(scanDir, config, {
+      const result = await performScan(scanDir, config, {
         fullHash: Boolean(options.fullHash),
         allowCloudRoot: Boolean(options.allowCloudRoot),
         checkStability: Boolean(options.checkStability),
         forceFullUpload: Boolean(options.forceFull),
       });
+      if (result.partial) process.exitCode = 1;
     } finally { await releaseScanLock(); }
   });
 
@@ -1563,12 +1572,15 @@ program
 
     // Always run an immediate catch-up cycle on start (unless paused), then pick
     // up any jobs approved in the dashboard.
-    await runSyncCycle(config, scanOpts);
+    const firstScan = await runSyncCycle(config, scanOpts);
     // --force-full applies to the first cycle only; scheduled cycles fall back
     // to delta sync.
     scanOpts.forceFullUpload = false;
     await runPendingJobs(config);
-    if (options.once) return;
+    if (options.once) {
+      if (firstScan?.partial) process.exitCode = 1;
+      return;
+    }
 
     console.log(`[Scheduler Started] Next sync in ${Math.round(intervalMs / 60000)} minute(s). Convex receives one batched update per cycle — no constant streaming.`);
 
@@ -1611,10 +1623,11 @@ program
           // Add/remove drive actions run in separate CLI processes. Reload roots
           // each cycle so the resident scheduler immediately honors that config.
           const res = await runSyncCycle(loadConfig(), scanOpts);
-          // uploadedCount === 0 → nothing changed on disk; back off. Any upload
-          // (or an errored/null cycle we want to retry sooner) resets to base.
-          const quiet = res != null && res.uploadedCount === 0;
-          scanDelay = quiet ? Math.min(scanDelay * 2, SCAN_MAX_MS) : SCAN_BASE_MS;
+          // Back off both idle and incomplete cycles. A rejected upload must
+          // not look idle or cause minute-by-minute retries of a limited API.
+          const quiet = res != null && !res.partial && res.uploadedCount === 0;
+          scanDelay = quiet || res?.partial ? Math.min(scanDelay * 2, SCAN_MAX_MS) : SCAN_BASE_MS;
+          if (res?.partial) console.log(`[Scan Retry] Cycle incomplete — retrying in ${Math.round(scanDelay / 60000)} min.`);
           if (quiet) console.log(`[Scan Idle] No changes this cycle — next scan in ${Math.round(scanDelay / 60000)} min.`);
         } catch (err: any) {
           console.error(`[Scan Cycle Error] ${err.message}`);
@@ -1677,7 +1690,7 @@ program
       allowCloudRoot: Boolean(options.allowCloudRoot),
       forceFullUpload: Boolean(options.forceFull),
     });
-    if (!res) process.exitCode = 0;
+    process.exitCode = res?.partial ? 1 : 0;
   });
 
 program
@@ -1712,6 +1725,8 @@ program
       scanRoots: config.scanRoots,
       lastSyncStartedAt: state.lastSyncStartedAt,
       lastSyncCompletedAt: state.lastSyncCompletedAt,
+      lastSyncStatus: state.lastSyncStatus,
+      lastSyncErrors: state.lastSyncErrors,
       lastSyncFiles: state.lastSyncFiles,
       lastSyncTB: state.lastSyncBytes ? (state.lastSyncBytes / 1024 ** 4).toFixed(2) : undefined,
       appDataDir: AGENT_HOME,
