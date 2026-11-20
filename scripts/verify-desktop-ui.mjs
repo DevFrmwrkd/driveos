@@ -98,6 +98,8 @@ export async function verifyDesktopUi({ executable, fixture, home, env, release,
       await delay(100);
     }
     assert.equal(ready, true, "Actual renderer and isolated preload bridge must load.");
+    assert.equal(await evaluate("[...document.images].every(image => image.complete && image.naturalWidth > 0)"), true,
+      "Packaged renderer images must load from their shipped resources.");
     const status = await evaluate("window.driveos.status()");
     assert.equal(status.connected, false);
     assert.equal(path.resolve(status.appDataDir), path.resolve(home));
