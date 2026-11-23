@@ -360,8 +360,6 @@ function ActivityRail({ go }: ScreenProps) {
 // ============================================================
 function Dashboard({ go, toast, requestScan, actionBusy }: ScreenProps) {
   const actions = [
-    { label: "Scan Drive", icon: "refresh", onClick: () => void requestScan(), disabled: actionBusy || DB.drives.length === 0 },
-    { label: "Create Project", icon: "plus", primary: true, onClick: () => go("wizard") },
     { label: "Review Duplicates", icon: "copy", onClick: () => go("duplicates") },
     { label: "Clean Up Safely", icon: "broom", onClick: () => go("cleanup") },
     { label: "Archive Project", icon: "archive", onClick: () => go("archive") },
@@ -376,12 +374,12 @@ function Dashboard({ go, toast, requestScan, actionBusy }: ScreenProps) {
           h("b", { className: "hi" }, (DB.drives || []).length + (DB.drives && DB.drives.length === 1 ? " drive" : " drives")), " and ",
           h("b", { className: "hi" }, (DB.projects || []).length + (DB.projects && DB.projects.length === 1 ? " project" : " projects")), ".")),
       h("div", { className: "page-head-actions" },
-        h("button", { className: "btn", disabled: actions[0].disabled, onClick: actions[0].onClick }, h(Icon, { name: "refresh", size: 15 }), "Scan Drive"),
+        h("button", { className: "btn", disabled: actionBusy || DB.drives.length === 0, onClick: () => void requestScan() }, h(Icon, { name: "refresh", size: 15 }), "Scan & Analyze"),
         h("button", { className: "btn primary", onClick: () => go("wizard") }, h(Icon, { name: "plus", size: 16 }), "Create Project"))),
 
     h("div", { className: "card card-pad", style: { display: "flex", gap: 10, marginBottom: 18, flexWrap: "wrap", alignItems: "center" } },
       h("div", { className: "eyebrow", style: { marginRight: 4 } }, "Quick Actions"),
-      actions.map((a) => h("button", { key: a.label, className: "btn " + (a.primary ? "primary" : ""), disabled: a.disabled, onClick: a.onClick },
+      actions.map((a) => h("button", { key: a.label, className: "btn", onClick: a.onClick },
         h(Icon, { name: a.icon, size: 15 }), a.label))),
 
     h("div", { style: { display: "grid", gridTemplateColumns: "1fr 332px", gap: "var(--gap)", alignItems: "start" } },

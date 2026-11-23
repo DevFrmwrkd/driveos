@@ -901,6 +901,7 @@ async function executeJob(job: any, config: DriveOSConfig): Promise<boolean> {
       if (!await acquireScanLock()) throw new Error("Another scan is running. Retry when it finishes.");
       try {
         const scan = await performScan(root, loadConfig(), { checkStability: true });
+        if (!scan.partial) await requestScanAnalysis(scan);
         await reportJob(job, { status: scan.partial ? "failed" : "completed", result: { ...job.result, ...scan } });
       } finally {
         await releaseScanLock();
@@ -964,9 +965,13 @@ interface ScanOptions {
   // Ignore uploadedFp and re-send every file (first sync or explicit
   // --force-full). Normal cycles upload only what changed.
   forceFullUpload?: boolean;
+  // Only explicit user scans request analysis. Scheduled scans keep their
+  // existing background policy and do not enable unbounded auto-analysis.
+  analyzeAfterScan?: boolean;
 }
 
 interface ScanResult {
+  sessionId?: string;
   partial: boolean;
   fileCount: number;
   byteCount: number;
@@ -975,6 +980,19 @@ interface ScanResult {
   uploadedCount: number;
   skippedUnchanged: number;
   baselinedCount: number;
+}
+
+async function requestScanAnalysis(scan: ScanResult): Promise<void> {
+  if (scan.partial || !scan.sessionId) return;
+  try {
+    const result = await syncToConvex("requestScanAnalysis", { sessionId: scan.sessionId });
+    if (result.success !== true) throw new Error("The backend did not acknowledge the analysis request.");
+    if (result.status === "failed" || result.status === "stale") throw new Error(result.message || "Analysis needs to be retried.");
+    console.log(`[Analysis Queued] ${result.message || "Scan finished. Duplicate and cleanup analysis will run automatically; file moves and deletion still require approval."}`);
+  } catch (error: any) {
+    console.error(`[Analysis Failed] Scan finished, but analysis could not be queued: ${error.message}`);
+    throw error;
+  }
 }
 
 // Single batched scan of one directory: register machine/drive, open a scan
@@ -1058,6 +1076,7 @@ async function performScan(scanDir: string, config: DriveOSConfig, options: Scan
 
   const fileBatch: FileMetadata[] = [];
   const result: ScanResult = {
+    sessionId,
     partial: false,
     fileCount: 0,
     byteCount: 0,
@@ -1272,10 +1291,8 @@ async function runSyncCycleLocked(config: DriveOSConfig, options: ScanOptions, r
   // the next volume loads from disk.
   const sharedHashCache = loadHashCache();
 
-  // Progressive scan: pass 1 covers big media (the bulk of duplicate bytes) on
-  // every root so duplicates surface on the dashboard within minutes; pass 2
-  // re-walks for the remaining small files, so nothing is ever skipped. Each
-  // pass completion triggers backend analysis, so results refresh after both.
+  // Progressive scan: cover large media first, then the remaining files. An
+  // explicit scan requests analysis once, after every root/pass has finished.
   const PROGRESSIVE_THRESHOLD = 50 * ONE_MB;
   const passes = config.minFileSizeBytes < PROGRESSIVE_THRESHOLD
     ? [
@@ -1290,16 +1307,21 @@ async function runSyncCycleLocked(config: DriveOSConfig, options: ScanOptions, r
       // packaged app (cwd is the app folder, not the project), so flag it clearly.
       if (!path.isAbsolute(root)) {
         console.warn(`[Sync] Ignoring folder "${root}" — please re-add it as a full path via Add drive.`);
+        totals.partial = true;
+        totals.errorsCount++;
         continue;
       }
       const resolved = path.resolve(root);
       if (!fs.existsSync(resolved)) {
         // Disconnected drive / missing root: skip safely, keep last-known catalog in Convex.
         console.warn(`[Sync] Folder not found right now (skipped, last catalog kept): ${resolved}`);
+        totals.partial = true;
+        totals.errorsCount++;
         continue;
       }
       try {
         const res = await performScan(resolved, config, { ...options, checkStability: true, sharedHashCache, ...pass, forceFullUpload });
+        totals.sessionId = res.sessionId;
         totals.partial ||= res.partial;
         totals.fileCount += res.fileCount;
         totals.byteCount += res.byteCount;
@@ -1328,6 +1350,7 @@ async function runSyncCycleLocked(config: DriveOSConfig, options: ScanOptions, r
     lastSyncErrors: totals.errorsCount,
   });
   console.log(`[Sync Cycle ${totals.partial ? "Partial" : "Complete"}] ${totals.fileCount} file(s) across ${roots.length} root(s), ${(totals.byteCount / 1024 ** 4).toFixed(2)} TB — ${totals.uploadedCount} uploaded, ${totals.skippedUnchanged} unchanged (skipped), ${totals.baselinedCount} upgrade-baselined, errors: ${totals.errorsCount}.`);
+  if (options.analyzeAfterScan && !totals.partial) await requestScanAnalysis(totals);
   return totals;
 }
 
@@ -1527,7 +1550,7 @@ program
 
 program
   .command("scan")
-  .description("Recursively scan directory metadata and upload to Convex (one-shot)")
+  .description("Scan directory metadata, then automatically analyze duplicates and cleanup (one-shot)")
   .requiredOption("-p, --path <dir>", "Directory path to scan")
   .option("--full-hash", "Calculate streaming SHA-256 full hashes for this scan")
   .option("--allow-cloud-root", "Allow scanning a cloud-synced folder as metadata-only")
@@ -1549,6 +1572,7 @@ program
         forceFullUpload: Boolean(options.forceFull),
       });
       if (result.partial) process.exitCode = 1;
+      else await requestScanAnalysis(result);
     } finally { await releaseScanLock(); }
   });
 
@@ -1678,7 +1702,7 @@ program
 
 program
   .command("scan-now")
-  .description("Flush a sync cycle immediately across all configured roots (ignores schedule, respects pause)")
+  .description("Scan all configured roots, then automatically analyze (ignores schedule, respects pause)")
   .option("--full-hash", "Calculate streaming SHA-256 full hashes for this scan")
   .option("--allow-cloud-root", "Allow cloud-synced roots as metadata-only")
   .option("--force-full", "Re-upload all metadata even if unchanged since the last sync")
@@ -1689,6 +1713,7 @@ program
       fullHash: Boolean(options.fullHash),
       allowCloudRoot: Boolean(options.allowCloudRoot),
       forceFullUpload: Boolean(options.forceFull),
+      analyzeAfterScan: true,
     });
     process.exitCode = res?.partial ? 1 : 0;
   });

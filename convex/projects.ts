@@ -3,6 +3,7 @@ import { internalQuery, mutation, query } from "./_generated/server";
 import { requireMember, requireRole, inTenant } from "./access";
 import { cleanupRulesValidator, DEFAULT_CLEANUP_RULES, validateCleanupRules } from "./settings";
 import { insertApprovedJob } from "./jobUtils";
+import { invalidateAnalysisInputs } from "./catalogAnalysis";
 
 export const list = query({
   args: {},
@@ -115,6 +116,7 @@ export const create = mutation({
       riskyBytes: 0,
       notes: args.notes,
     });
+    await invalidateAnalysisInputs(ctx, tenantId);
 
     // Create a background job for local agent to create the folder structure if rootPath is specified
     if (args.rootPath) {
@@ -185,6 +187,7 @@ export const updateStatus = mutation({
       status: args.status,
       archivedAt: args.status === "archived" ? Date.now() : project.archivedAt,
     });
+    if (project.status !== args.status) await invalidateAnalysisInputs(ctx, tenantId);
 
     await ctx.db.insert("auditLogs", {
       tenantId,
@@ -221,6 +224,7 @@ export const updateStats = mutation({
       riskyBytes: args.riskyBytes,
       storageHealthScore: args.storageHealthScore,
     });
+    if (project.storageHealthScore !== args.storageHealthScore) await invalidateAnalysisInputs(ctx, tenantId);
   },
 });
 

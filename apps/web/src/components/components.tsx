@@ -1,4 +1,5 @@
 import React from "react";
+import { createPortal } from "react-dom";
 import { Icon } from "./icons";
 import { DB } from "../data";
 import { formatBytes } from "../lib/download";
@@ -315,7 +316,10 @@ export function Modal({ title, subtitle, icon, iconKind = "accent", onClose, chi
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
   }, [onClose]);
-  return React.createElement("div", { className: "modal-scrim", onMouseDown: (e) => e.target === e.currentTarget && onClose() },
+  // A retained animation transform makes fixed descendants relative to the
+  // scrolling page. Keep all dialogs at the viewport, even in long lists.
+  if (typeof document === "undefined") return null;
+  return createPortal(React.createElement("div", { className: "modal-scrim", onMouseDown: (e: React.MouseEvent<HTMLDivElement>) => e.target === e.currentTarget && onClose() },
     React.createElement("div", { className: "modal", style: { maxWidth: width } },
       React.createElement("div", { className: "modal-head" },
         icon && React.createElement("div", { style: { width: 38, height: 38, borderRadius: 10, flexShrink: 0, display: "grid", placeItems: "center",
@@ -326,7 +330,7 @@ export function Modal({ title, subtitle, icon, iconKind = "accent", onClose, chi
           subtitle && React.createElement("div", { className: "muted", style: { fontSize: 13, marginTop: 3 } }, subtitle)),
         React.createElement("button", { className: "btn ghost icon sm", onClick: onClose }, React.createElement(Icon, { name: "x", size: 17 }))),
       React.createElement("div", { className: "modal-body" }, children),
-      footer && React.createElement("div", { className: "modal-foot" }, footer)));
+      footer && React.createElement("div", { className: "modal-foot" }, footer))), document.body);
 }
 
 // ---- Section header ----

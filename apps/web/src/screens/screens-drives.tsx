@@ -136,7 +136,7 @@ type AnyRecord = Record<string, any>;
 
     return h("div", { className: "page-inner" },
       h(PageHead, { eyebrow: "Storage", title: "Drives", desc: "Every tracked hard drive, RAID, and cloud volume across the studio and remote agents.",
-        actions: [h("button", { key: 1, className: "btn", disabled: actionBusy || DB.drives.length === 0, onClick: () => void requestScan() }, h(Icon, { name: "refresh", size: 15 }), "Scan All"),
+        actions: [h("button", { key: 1, className: "btn", disabled: actionBusy || DB.drives.length === 0, onClick: () => void requestScan() }, h(Icon, { name: "refresh", size: 15 }), "Scan & Analyze All"),
           h("button", { key: 2, className: "btn primary", onClick: () => setShowAdd(true) }, h(Icon, { name: "plus", size: 16 }), "Add Drive")] }),
 
       h("div", { style: { display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: "var(--gap)", marginBottom: "var(--gap)" } },
@@ -217,7 +217,7 @@ type AnyRecord = Record<string, any>;
         <li>Install and open the DriveOS desktop app on the computer attached to the drive.</li>
         <li>Use Settings → Machines / Agents to issue a connection token for that computer.</li>
         <li>Connect the app, choose Add drive, and select the drive or folder locally.</li>
-        <li>Run Scan Now. Its catalog will appear here after the agent finishes.</li>
+        <li>Choose Scan &amp; Analyze. The agent catalogs the folder, then analysis finds duplicates and cleanup candidates.</li>
       </ol>
       <p className="muted" style={{ fontSize: 12 }}>DriveOS uploads file metadata and hashes. Your media stays on its original disk.</p>
       <button className="btn" onClick={() => { onClose(); go("settings"); }}>Manage agents</button>
@@ -244,8 +244,8 @@ type AnyRecord = Record<string, any>;
       <PageHead eyebrow={owner.name + " · " + d.location} title={d.name} desc={d.mountPath || d.model}
         actions={[
           <button key="watch" className="btn" onClick={() => go("download")}><Icon name="eye" size={15} />Manage local agent</button>,
-          <button key="scan" className="btn" disabled={actionBusy} onClick={() => void requestScan(d.id)}><Icon name="refresh" size={15} />Start Scan</button>,
-          <button key="analysis" className="btn primary" disabled={actionBusy} onClick={() => void requestAnalysis()}><Icon name="broom" size={15} />Generate Cleanup Plan</button>,
+          <button key="scan" className="btn primary" disabled={actionBusy} onClick={() => void requestScan(d.id)}><Icon name="refresh" size={15} />Scan &amp; Analyze</button>,
+          <button key="analysis" className="btn" title="Analyze the current catalog without scanning the disk again" disabled={actionBusy} onClick={() => void requestAnalysis()}><Icon name="broom" size={15} />Re-run analysis</button>,
         ]} />
       <div className="card card-pad" style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr 1fr", gap: 22, marginBottom: "var(--gap)" }}>
         <div><div className="row" style={{ gap: 8, marginBottom: 10 }}><StatusBadge status={d.status} /><RiskBadge risk={d.risk} /></div><CapMeter d={d} /></div>
@@ -267,7 +267,7 @@ type AnyRecord = Record<string, any>;
           {dupes.length ? dupes.map((du) => <div key={du.id} className="spread" style={{ padding: "8px 0" }}><span>{du.name}</span><span>{du.copies} copies</span></div>) : <span className="muted">No current duplicate clusters on this drive.</span>}
         </div></div>
         <div className="card"><div className="card-head"><div className="card-title">Cleanup Recommendations</div><button className="btn sm ghost" onClick={() => go("cleanup")}>Review</button></div><div className="card-pad">
-          {recommendations.length ? recommendations.map((rec) => <div key={rec.id} style={{ padding: "8px 0" }}><div>{rec.title}</div><div className="muted" style={{ fontSize: 12 }}>{rec.why}</div></div>) : <span className="muted">No recommendations for these indexed files. Generate a cleanup plan after scanning.</span>}
+          {recommendations.length ? recommendations.map((rec) => <div key={rec.id} style={{ padding: "8px 0" }}><div>{rec.title}</div><div className="muted" style={{ fontSize: 12 }}>{rec.why}</div></div>) : <span className="muted">No recommendations for these indexed files. Scan &amp; Analyze refreshes the catalog and analysis together.</span>}
         </div></div>
         <div className="card"><div className="card-head"><div className="card-title">Backup Verification</div><Badge kind="warn">Not verified</Badge></div><div className="card-pad muted">The catalog does not establish that every file has a verified archive or cloud copy. No single-copy count or backup assurance is inferred from volume usage.</div></div>
       </div>

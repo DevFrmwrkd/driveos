@@ -1,6 +1,7 @@
 import { ConvexError, v } from "convex/values";
 import { internalQuery, mutation, query } from "./_generated/server";
 import { requireMember, requireRole } from "./access";
+import { invalidateAnalysisInputs } from "./catalogAnalysis";
 
 export const cleanupRulesValidator = v.object({
   rawKeep: v.boolean(), proxyDelete: v.boolean(), cacheDelete: v.boolean(),
@@ -47,9 +48,12 @@ export const update = mutation({
     if (args.cleanupRules) validateCleanupRules(args.cleanupRules);
     const existing = await ctx.db.query("workspaceSettings")
       .withIndex("by_tenant", q => q.eq("tenantId", member.tenantId)).first();
-    const next = { ...(await workspaceSettings(ctx, member.tenantId)), ...args, updatedAt: Date.now() };
+    const current = await workspaceSettings(ctx, member.tenantId);
+    const next = { ...current, ...args, updatedAt: Date.now() };
     if (existing) await ctx.db.patch(existing._id, next);
     else await ctx.db.insert("workspaceSettings", { tenantId: member.tenantId, ...next });
+    if (current.cleanupRules.cacheDelete !== next.cleanupRules.cacheDelete ||
+        current.cleanupRules.proxyDelete !== next.cleanupRules.proxyDelete) await invalidateAnalysisInputs(ctx, member.tenantId);
     return next;
   },
 });

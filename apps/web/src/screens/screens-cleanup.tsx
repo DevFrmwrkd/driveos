@@ -1,5 +1,4 @@
 import React from "react";
-import { createPortal } from "react-dom";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convexApi";
 import { Icon } from "@/components/icons";
@@ -59,7 +58,7 @@ export function CleanupScreen({ go, toast }: ScreenProps) {
 
   return <div className="page-inner">
     <PageHead eyebrow="Maintenance" title="Cleanup Recommendations" desc="Review actual files before approving cleanup. The agent reports when each move completes." actions={[<button key="q" className="btn" onClick={() => go("quarantine")}><Icon name="shield" size={15} />View Quarantine</button>]} />
-    {recommendations === undefined ? <div className="card card-pad muted">Loading recommendations…</div> : all.length === 0 ? <div className="card"><div className="empty"><Icon name="shieldCheck" size={24} /><h3>No cleanup recommendations yet</h3><div className="muted">Scan your drives, then run analysis from the Drives screen.</div></div></div> : <>
+    {recommendations === undefined ? <div className="card card-pad muted">Loading recommendations…</div> : all.length === 0 ? <div className="card"><div className="empty"><Icon name="shieldCheck" size={24} /><h3>No cleanup recommendations yet</h3><div className="muted">Use Scan &amp; Analyze from Drives. Review its results before approving any file changes.</div></div></div> : <>
       <div className="card card-pad" style={{ marginBottom: "var(--gap)" }}>
         <div className="spread" style={{ gap: 20 }}><div><div className="eyebrow">Safe cleanup</div><h2 style={{ margin: "8px 0" }}>{safeIds.length} unique file(s)</h2><div className="muted">Only eligible cache, proxies, and redundant copies are included.</div>{safeBatch.length < safe.length && <p className="muted" style={{ fontSize: 12 }}>This batch contains {batchIds.size} files. Remaining recommendations can be reviewed in the next batch.</p>}</div><button className="btn primary lg" disabled={!settings || batchIds.size === 0 || busyId !== null} onClick={() => setPreview({ title: safeBatch.length === safe.length ? "All safe cleanup" : "Safe cleanup batch", recommendations: safeBatch })}><Icon name="broom" size={16} />{safeBatch.length === safe.length ? "Quarantine all safe" : "Quarantine safe batch"}</button></div>
         <div className="mono dim" style={{ marginTop: 14, fontSize: 12 }}>New quarantine jobs retain files for {retention} days. Existing items keep their original restore deadline.</div>
@@ -73,7 +72,7 @@ export function CleanupScreen({ go, toast }: ScreenProps) {
           <p className="muted" style={{ fontSize: 13, lineHeight: 1.6 }}>{r.explanation}</p><div className="mono dim" style={{ fontSize: 12 }}>{r.affectedFileIds.length} listed file(s) · {formatBytes(r.affectedBytes)} · {category(r.type)}</div>
           {!supported && <p className="muted" style={{ fontSize: 12 }}>This recommendation needs a storage or backup decision. It does not authorize deleting the original files.</p>}
           {r.status === "failed" && <p style={{ color: "var(--risk)", fontSize: 12 }}>A previous cleanup attempt failed. Run analysis again to refresh the remaining files before approving another move.</p>}
-          <div className="row" style={{ gap: 8, marginTop: 14, flexWrap: "wrap" }}><button className="btn sm" onClick={() => setPreview({ title: r.title, recommendations: [r] })}><Icon name="eye" size={13} />Preview</button>{eligible && <button className="btn sm primary" disabled={!settings || busyId !== null} onClick={() => void enqueue([r])}><Icon name="shield" size={13} />{busyId === r._id ? "Queuing…" : "Quarantine"}</button>}{eligible && canPurge && <button className="btn sm danger" disabled={!settings || busyId !== null} onClick={() => setDeleting(r)}><Icon name="trash" size={13} />Delete permanently</button>}<button className="btn sm ghost" disabled={busyId !== null} onClick={() => void ignore(r)}>Ignore</button></div>
+          <div className="row" style={{ gap: 8, marginTop: 14, flexWrap: "wrap" }}><button className={`btn sm${eligible ? " primary" : ""}`} disabled={busyId !== null || (eligible && !settings)} onClick={() => setPreview({ title: r.title, recommendations: [r] })}><Icon name={eligible ? "shield" : "eye"} size={13} />{eligible ? "Review & quarantine" : "Preview"}</button>{eligible && canPurge && <button className="btn sm danger" disabled={!settings || busyId !== null} onClick={() => setDeleting(r)}><Icon name="trash" size={13} />Delete permanently</button>}<button className="btn sm ghost" disabled={busyId !== null} onClick={() => void ignore(r)}>Ignore</button></div>
         </div>;
       })}</div>
     </>}
@@ -106,7 +105,7 @@ function DeleteConfirmModal({ title, count, busy, onClose, onConfirm }: { title:
   const [typed, setTyped] = React.useState("");
   const armed = typed.trim().toUpperCase() === "DELETE";
   if (typeof document === "undefined") return null;
-  return createPortal(<Modal title="Permanently delete files" subtitle={title} icon="trash" iconKind="risk" onClose={onClose} width={560} footer={[<button key="cancel" className="btn" onClick={onClose}>Cancel</button>, <button key="delete" className="btn danger" disabled={!armed || busy} onClick={onConfirm}>{busy ? "Queuing…" : "Permanently delete"}</button>]}><p>These {count} file(s) will be permanently removed by their local agent. This cannot be undone.</p><label className="field-label" htmlFor="permanent-delete-confirm">Type DELETE to confirm</label><input id="permanent-delete-confirm" className="input mono" placeholder="DELETE" value={typed} autoFocus onChange={e => setTyped(e.target.value)} /></Modal>, document.body);
+  return <Modal title="Permanently delete files" subtitle={title} icon="trash" iconKind="risk" onClose={onClose} width={560} footer={[<button key="cancel" className="btn" onClick={onClose}>Cancel</button>, <button key="delete" className="btn danger" disabled={!armed || busy} onClick={onConfirm}>{busy ? "Queuing…" : "Permanently delete"}</button>]}><p>These {count} file(s) will be permanently removed by their local agent. This cannot be undone.</p><label className="field-label" htmlFor="permanent-delete-confirm">Type DELETE to confirm</label><input id="permanent-delete-confirm" className="input mono" placeholder="DELETE" value={typed} autoFocus onChange={e => setTyped(e.target.value)} /></Modal>;
 }
 
 export function QuarantineScreen({ go, toast }: ScreenProps) {

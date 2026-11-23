@@ -84,14 +84,14 @@ $("open-dash").addEventListener("click", () => {
 $("scan-btn").addEventListener("click", async () => {
   const button = $("scan-btn");
   button.disabled = true; button.textContent = "Scanning…";
-  setMsg($("scan-msg"), "Scanning…");
+  setMsg($("scan-msg"), "Scanning files. Analysis will be queued after the scan succeeds.");
   try {
     const result = await api.scanNow();
     setMsg($("scan-msg"), result.message, result.ok ? "ok" : "err");
   } catch (error) {
-    setMsg($("scan-msg"), `Scan failed: ${error?.message || "Could not contact the agent."}`, "err");
+    setMsg($("scan-msg"), `Scan & Analyze failed: ${error?.message || "Could not contact the agent."}`, "err");
   } finally {
-    button.disabled = false; button.textContent = "Scan Now";
+    button.disabled = false; button.textContent = "Scan & Analyze";
     await refresh();
   }
 });

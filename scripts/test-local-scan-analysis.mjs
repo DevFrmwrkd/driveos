@@ -1,0 +1,257 @@
+// Real CLI -> HTTP -> scheduled analysis -> explicit approval regression.
+// Requires a disposable loopback backend with DRIVEOS_AUTO_ANALYSIS=false.
+// Optional timer acceleration: copy fixtures/qaScanAnalysisReview.ts.template
+// to convex/qaScanAnalysisReview.ts ONLY in that separate disposable loopback
+// app, deploy it there, and set DRIVEOS_TEST_ANALYSIS_FIXTURE to its app path.
+// Without that opt-in, this harness waits through the real analysis cooldown.
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { ConvexHttpClient } from 'convex/browser';
+import { anyApi } from 'convex/server';
+import ts from 'typescript';
+const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const agentEntry = process.env.DRIVEOS_TEST_AGENT_ENTRY || path.join(repository, 'apps/agent/dist/index.js');
+assert.ok(path.isAbsolute(agentEntry) && fs.statSync(agentEntry).isFile(), 'The selected real CLI or bundled agent entry must exist.');
+const backendUrl = process.env.DRIVEOS_TEST_URL || 'http://127.0.0.1:3210';
+const siteUrl = process.env.DRIVEOS_TEST_SITE_URL || 'http://127.0.0.1:3211';
+for (const url of [backendUrl, siteUrl]) assert.ok(['localhost', '127.0.0.1', '[::1]'].includes(new URL(url).hostname), 'A disposable loopback backend is required.');
+const fixture = fs.mkdtempSync(path.join(process.env.DRIVEOS_TEST_DIRECTORY || os.tmpdir(), 'driveos-scan-analysis-'));
+const roots = [path.join(fixture, 'media-a'), path.join(fixture, 'media-b')];
+const agentHome = path.join(fixture, 'agent-home'), quarantineRoot = path.join(fixture, 'quarantine');
+const email = 'qa-scan-analysis-' + Date.now() + '@driveos.test', password = 'DriveOS-local-QA-2026!';
+const client = new ConvexHttpClient(backendUrl, { logger: false });
+const statusModule = ts.transpileModule(fs.readFileSync(path.join(repository, 'apps/web/src/lib/scan-analysis.ts'), 'utf8'), {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText;
+const { scanAnalysisMessage } = await import('data:text/javascript;base64,' + Buffer.from(statusModule).toString('base64'));
+const qaFixture = process.env.DRIVEOS_TEST_ANALYSIS_FIXTURE;
+let admin, tenantId;
+if (qaFixture) {
+  const localConfig = JSON.parse(fs.readFileSync(path.join(qaFixture, '.convex/local/default/config.json'), 'utf8'));
+  assert.equal(new URL(backendUrl).port, String(localConfig.ports.cloud), 'QA fixture must match the loopback backend.');
+  admin = new ConvexHttpClient(backendUrl, { logger: false }); admin.setAdminAuth(localConfig.adminKey);
+}
+const results = [], hashes = new Map();
+let machine, browserFixtureOnly = false;
+const record = name => { results.push({ name, status: 'passed' }); process.stdout.write('PASS ' + name + '\n'); };
+const query = (module, name, args = {}) => client.query(anyApi[module][name], args);
+const mutation = (module, name, args = {}) => client.mutation(anyApi[module][name], args);
+const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function write(root, relative, fill) {
+  const file = path.join(root, relative); fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, Buffer.alloc(1024 * 1024 + 17, fill));
+  const stable = new Date(Date.now() - 120_000); fs.utimesSync(file, stable, stable);
+  hashes.set(file, hash(file)); return file;
+}
+function assertUntouched() { for (const [file, expected] of hashes) assert.equal(hash(file), expected, 'Scan/analysis must preserve ' + file); }
+function agent(args, label, home = agentHome) {
+  const result = spawnSync(process.execPath, [agentEntry, ...args], {
+    cwd: repository, encoding: 'utf8', windowsHide: true, timeout: 120_000, maxBuffer: 8 * 1024 * 1024,
+    env: { ...process.env, DRIVEOS_AGENT_HOME: home, DRIVEOS_CONVEX_URL: siteUrl },
+  });
+  fs.writeFileSync(path.join(fixture, label + '.log'), (result.stdout || '') + '\n' + (result.stderr || ''));
+  assert.equal(result.status, 0, label + ' exited ' + result.status + ': ' + (result.stderr || result.error || ''));
+  return (result.stdout || '') + '\n' + (result.stderr || '');
+}
+async function api(operation, body, token = machine.token) {
+  const response = await fetch(siteUrl + '/api/' + operation, { method: 'POST', headers: {
+    'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}),
+  }, body: JSON.stringify(body), signal: AbortSignal.timeout(20_000) });
+  return { status: response.status, body: await response.json() };
+}
+const qaState = () => admin.query(anyApi.qaScanAnalysisReview.state, { tenantId });
+async function expediteCooldown() {
+  if (!admin || !tenantId) return false;
+  const pending = await qaState();
+  if (pending.scheduled?.state.kind !== 'pending' || pending.state.analysisClaimed ||
+      pending.scheduled.scheduledTime <= Date.now() + 1500) return false;
+  assert.ok(Math.ceil(pending.scheduled.scheduledTime) >= pending.state.lastRunAt + 300_000,
+    'Real scheduling must preserve the five-minute analysis cooldown before QA advances its timer.');
+  const expedited = await admin.mutation(anyApi.qaScanAnalysisReview.expeditePendingRun, {
+    tenantId, analysisRunId: pending.state.analysisRunId,
+  });
+  assert.equal(expedited.expedited, true);
+  return true;
+}
+async function analysisComplete() {
+  // Without the explicitly selected local QA helper, wait through the real
+  // production cooldown. The helper advances only this disposable tenant's
+  // pending timer; its actual worker still claims, analyzes and publishes.
+  const until = Date.now() + (admin ? 30_000 : 330_000); let status;
+  do {
+    status = await query('scans', 'analysisStatus');
+    if (status.status === 'completed' && status.catalogCurrent) return status;
+    assert.notEqual(status.status, 'failed', status.error || 'Analysis failed');
+    if (status.status === 'queued') await expediteCooldown();
+    await sleep(status.status === 'queued' && !admin ? 1000 : 100);
+  } while (Date.now() < until);
+  throw new Error('Analysis did not complete: ' + JSON.stringify(status));
+}
+async function assertNoCleanup() {
+  assert.ok((await query('cleanup', 'listJobs')).every(job => job.action === 'scan'), 'Scan/analysis must not create move/delete jobs.');
+  assert.deepEqual(await query('cleanup', 'listQuarantine'), []); assertUntouched();
+}
+try {
+  const auth = await client.action(anyApi.auth.signIn, { provider: 'password', params: {
+    flow: 'signUp', email, password, name: 'One-click Scan QA', orgName: 'DriveOS Scan Analysis QA',
+  } });
+  assert.ok(auth.tokens?.token); client.setAuth(auth.tokens.token);
+  fs.writeFileSync(path.join(fixture, 'browser-login.json'), JSON.stringify({ email, password, backendUrl, siteUrl }, null, 2));
+  machine = await mutation('agentAuth', 'issueMachineToken', { machineName: 'OneClick-QA-' + Date.now() });
+  const cacheA = write(roots[0], '06_RENDERS_CACHE/preview-a.dat', 65), cacheB = write(roots[1], '06_RENDERS_CACHE/preview-b.dat', 66);
+  const musicA = write(roots[0], '04_ASSETS/MUSIC/song-a.wav', 77), musicB = write(roots[1], '04_ASSETS/MUSIC/song-b.wav', 77);
+  const raw = write(roots[0], '02_RAW/A_CAM/take.mov', 71), final = write(roots[1], '08_DELIVERY/master.mov', 72);
+  agent(['init', '--machine', machine.machineName, '--owner', email, '--convex', siteUrl, '--auth-token', machine.token,
+    '--roots', roots.join(','), '--full-hash', '--central-quarantine', '--quarantine', quarantineRoot], 'init');
+  const first = agent(['scan-now', '--full-hash'], 'one-click-multi-root');
+  assert.equal((first.match(/\[Analysis Queued\]/g) || []).length, 1, 'One analysis request must follow the whole explicit cycle.');
+  await analysisComplete();
+  tenantId = (await query('drives', 'list'))[0].tenantId;
+  let files = await query('files', 'list', { limit: 100 }); assert.equal(files.length, 6);
+  for (const [file, classification] of [[raw, 'RAW'], [final, 'EXPORT_FINAL'], [cacheA, 'CACHE']]) assert.equal(files.find(f => f.path === file).classification, classification);
+  assert.ok((await query('duplicates', 'list')).some(cluster => cluster.type === 'exact' && cluster.fileCount === 2));
+  assert.ok((await query('recommendations', 'list')).some(rec => rec.type === 'delete_cache' && rec.affectedFileIds.length === 2));
+  record('one scan-now catalogs both roots, automatically tags files and publishes duplicate/cleanup analysis without a second click');
+  const beforeUnchanged = await query('scans', 'analysisStatus');
+  const beforeUnchangedState = admin ? (await qaState()).state : undefined;
+  for (let repeat = 0; repeat < 2; repeat++) {
+    assert.match(agent(['scan-now'], 'unchanged-scan-' + repeat), /\[Analysis Queued\]/);
+    const reused = await analysisComplete();
+    assert.equal(reused.lastRunAt, beforeUnchanged.lastRunAt, 'An unchanged scan must reuse the fresh catalog analysis.');
+    assert.equal(reused.completedAt, beforeUnchanged.completedAt, 'An unchanged scan must not publish another expensive analysis.');
+    assert.ok(reused.validatedAt >= beforeUnchanged.completedAt, 'The reused analysis records a new validation receipt.');
+    if (admin) assert.equal((await qaState()).state.analysisRunId, beforeUnchangedState.analysisRunId);
+  }
+  record('repeated unchanged scans reuse current analysis without starting or publishing another rebuild');
+  await assertNoCleanup(); agent(['run-jobs'], 'unapproved-no-jobs'); await assertNoCleanup();
+  record('analysis and subsequent agent polling never move/delete files before explicit approval');
+  assert.equal((await api('requestScanAnalysis', {}, null)).status, 401);
+  for (const body of [{}, { sessionId: 123 }]) assert.equal((await api('requestScanAnalysis', body)).status, 400);
+  const session = (await query('scans', 'list')).find(scan => scan.status === 'completed');
+  const other = await mutation('agentAuth', 'issueMachineToken', { machineName: 'Other-QA-' + Date.now() });
+  assert.ok((await api('requestScanAnalysis', { sessionId: session._id }, other.token)).status >= 400);
+  const foreignClient = new ConvexHttpClient(backendUrl, { logger: false });
+  const foreignLogin = await foreignClient.action(anyApi.auth.signIn, { provider: 'password', params: { flow: 'signUp', email: 'other-' + email, password, name: 'Other workspace QA', orgName: 'Other workspace QA' } });
+  foreignClient.setAuth(foreignLogin.tokens.token);
+  const foreignMachine = await foreignClient.mutation(anyApi.agentAuth.issueMachineToken, { machineName: 'Foreign-workspace-QA' });
+  assert.ok((await api('requestScanAnalysis', { sessionId: session._id }, foreignMachine.token)).status >= 400);
+  const beforeReplay = await query('scans', 'analysisStatus');
+  assert.equal((await api('requestScanAnalysis', { sessionId: session._id })).status, 200); await sleep(150);
+  assert.equal((await query('scans', 'analysisStatus')).lastRunAt, beforeReplay.lastRunAt);
+  record('HTTP analysis rejects missing auth, malformed requests and foreign-machine sessions; session replay is idempotent');
+  for (const status of ['partial', 'failed']) {
+    const start = await api('startScan', { machineId: machine.machineId, rootPath: roots[0], agentVersion: 'one-click-qa' }); assert.equal(start.status, 200);
+    assert.equal((await api('completeScan', { sessionId: start.body.sessionId, status, errorsCount: 1 })).status, 200);
+    assert.ok((await api('requestScanAnalysis', { sessionId: start.body.sessionId })).status >= 400);
+  }
+  assert.equal((await query('scans', 'analysisStatus')).lastRunAt, beforeReplay.lastRunAt);
+  record('partial and failed sessions do not authorize analysis');
+  const newCache = write(roots[0], '06_RENDERS_CACHE/new-dashboard.dat', 81);
+  const drive = (await query('drives', 'list')).find(d => d.mountPath === roots[0]);
+  const queued = await mutation('drives', 'requestScan', { driveId: drive._id }); assert.equal(queued.queued, 1); assertUntouched();
+  agent(['run-jobs'], 'dashboard-scan-job');
+  const delayed = await query('scans', 'analysisStatus'); assert.equal(delayed.status, 'queued'); assert.equal(delayed.catalogCurrent, false);
+  assert.equal(delayed.lastRunAt, beforeUnchanged.lastRunAt, 'A changed catalog must wait for the shared rebuild cooldown.');
+  if (admin) {
+    const pending = await qaState(); assert.equal(pending.scheduled.state.kind, 'pending');
+    assert.ok(Math.ceil(pending.scheduled.scheduledTime) >= beforeUnchanged.lastRunAt + 300_000);
+  }
+  await analysisComplete(); files = await query('files', 'list', { limit: 100 });
+  assert.ok((await query('recommendations', 'list')).some(rec => rec.affectedFileIds.includes(files.find(f => f.path === newCache)._id)));
+  assert.equal((await query('cleanup', 'listJobs')).find(job => job._id === queued.jobIds[0]).status, 'completed'); await assertNoCleanup();
+  record('one dashboard scan request runs on its owning agent and automatically analyzes the newly cataloged file');
+  record('changed scans inside the cooldown queue delayed work that the real scheduled analyzer publishes automatically');
+  const scheduledCache = write(roots[1], '06_RENDERS_CACHE/scheduled.dat', 82);
+  assert.doesNotMatch(agent(['sync', '--once'], 'scheduled-scan-only'), /\[Analysis Queued\]/); await sleep(250);
+  assert.equal((await query('scans', 'analysisStatus')).catalogCurrent, false); await assertNoCleanup();
+  record('background sync remains scan-only with automatic analysis disabled');
+  agent(['scan', '--path', roots[1], '--full-hash'], 'direct-scan-analysis'); await analysisComplete(); files = await query('files', 'list', { limit: 100 });
+  assert.ok((await query('recommendations', 'list')).some(rec => rec.affectedFileIds.includes(files.find(f => f.path === scheduledCache)._id))); await assertNoCleanup();
+  record('direct scan also publishes fresh analysis automatically');
+  const beforePause = await query('scans', 'analysisStatus'); agent(['pause'], 'pause');
+  assert.doesNotMatch(agent(['scan-now'], 'paused-scan-now'), /\[Analysis Queued\]/); agent(['resume'], 'resume');
+  assert.equal((await query('scans', 'analysisStatus')).lastRunAt, beforePause.lastRunAt); record('pause prevents explicit scans and their analysis requests');
+  const remoteRoot = path.join(fixture, 'other-owner-media'), remoteHome = path.join(fixture, 'other-agent-home');
+  write(remoteRoot, '06_RENDERS_CACHE/other-owner.dat', 83);
+  agent(['init', '--machine', other.machineName, '--owner', email, '--convex', siteUrl, '--auth-token', other.token,
+    '--roots', remoteRoot, '--full-hash', '--central-quarantine', '--quarantine', path.join(fixture, 'other-quarantine')], 'other-owner-init', remoteHome);
+  agent(['scan-now'], 'other-owner-catalog', remoteHome); await analysisComplete(); await assertNoCleanup();
+  const remoteDrive = (await query('drives', 'list')).find(d => d.mountPath === remoteRoot);
+  const allScans = await mutation('drives', 'requestScan'); assert.equal(allScans.queued, 3);
+  agent(['run-jobs'], 'cross-drive-original-owner'); await analysisComplete();
+  const statusForJobs = async () => scanAnalysisMessage(await query('scans', 'analysisStatus'),
+    await query('cleanup', 'listJobs'), await query('scans', 'list'));
+  let remoteJob = (await query('cleanup', 'listJobs')).find(job => job.result?.driveId === remoteDrive._id);
+  assert.equal(remoteJob.status, 'approved');
+  assert.match((await statusForJobs()).title, /queued|Scanning/i);
+  await mutation('drives', 'requestScan', { driveId: drive._id }); agent(['run-jobs'], 'cross-drive-retry-a-pending'); await analysisComplete();
+  assert.match((await statusForJobs()).title, /queued|Scanning/i, 'Retrying drive A must preserve another owner\'s pending drive.');
+  record('real cross-owner pending scan remains visible after a successful retry of another drive');
+  const disconnectedRoot = remoteRoot + '-disconnected'; fs.renameSync(remoteRoot, disconnectedRoot);
+  try { agent(['run-jobs'], 'cross-drive-disconnected-owner', remoteHome); }
+  finally { fs.renameSync(disconnectedRoot, remoteRoot); }
+  remoteJob = (await query('cleanup', 'listJobs')).find(job => job._id === remoteJob._id);
+  assert.equal(remoteJob.status, 'failed');
+  await mutation('drives', 'requestScan', { driveId: drive._id }); agent(['run-jobs'], 'cross-drive-retry-a-failure'); await analysisComplete();
+  assert.equal((await statusForJobs()).title, 'Scan & Analyze failed', 'Retrying drive A must preserve another owner\'s failed drive.');
+  await assertNoCleanup();
+  record('real disconnected-drive failure remains visible after a successful retry of another drive');
+  await mutation('drives', 'requestScan', { driveId: remoteDrive._id }); agent(['run-jobs'], 'cross-drive-recover-own-drive', remoteHome); await analysisComplete();
+  assert.equal((await statusForJobs()).title, 'Analysis complete', 'Only the matching drive\'s clean retry and analysis resolve its old failure.');
+  files = await query('files', 'list', { limit: 100 }); await assertNoCleanup();
+  const projectId = await mutation('projects', 'create', { name: 'InputValidityQA', client: 'InputValidityClient',
+    ownerId: email, status: 'active', tier: 'hot' });
+  const proxy = write(roots[0], 'InputValidityQA/05_PROXIES/input-proxy.mov', 84);
+  agent(['scan', '--path', roots[0]], 'project-input-active'); await analysisComplete();
+  files = await query('files', 'list', { limit: 100 });
+  const proxyFile = files.find(file => file.path === proxy); assert.equal(proxyFile.classification, 'PROXY'); assert.equal(proxyFile.projectId, projectId);
+  assert.ok(!(await query('recommendations', 'list')).some(rec => rec.type === 'delete_proxies'));
+  const beforeDelivered = await query('scans', 'analysisStatus');
+  await mutation('projects', 'updateStatus', { projectId, status: 'delivered' });
+  assert.equal((await query('scans', 'analysisStatus')).catalogCurrent, false); assert.deepEqual(await query('recommendations', 'list'), []);
+  agent(['scan', '--path', roots[0]], 'project-input-delivered');
+  assert.equal((await query('scans', 'analysisStatus')).status, 'queued');
+  assert.equal((await query('scans', 'analysisStatus')).lastRunAt, beforeDelivered.lastRunAt);
+  await analysisComplete();
+  assert.ok((await query('recommendations', 'list')).some(rec => rec.type === 'delete_proxies' && rec.affectedFileIds.includes(proxyFile._id)));
+  await assertNoCleanup(); record('marking a project delivered invalidates fresh cached analysis and rebuilds proxy recommendations automatically');
+  const originalSettings = await query('settings', 'get'), beforeRules = await query('scans', 'analysisStatus');
+  await mutation('settings', 'update', { cleanupRules: { ...originalSettings.cleanupRules, proxyDelete: false, cacheDelete: false } });
+  assert.equal((await query('scans', 'analysisStatus')).catalogCurrent, false); assert.deepEqual(await query('recommendations', 'list'), []);
+  agent(['scan', '--path', roots[0]], 'cleanup-input-rules-disabled');
+  assert.equal((await query('scans', 'analysisStatus')).status, 'queued');
+  assert.equal((await query('scans', 'analysisStatus')).lastRunAt, beforeRules.lastRunAt);
+  await analysisComplete();
+  assert.ok((await query('recommendations', 'list')).every(rec => !['delete_proxies', 'delete_cache'].includes(rec.type)));
+  await mutation('settings', 'update', { cleanupRules: originalSettings.cleanupRules });
+  await mutation('projects', 'updateStatus', { projectId, status: 'active' });
+  agent(['scan', '--path', roots[0]], 'cleanup-input-rules-restored'); await analysisComplete();
+  assert.ok((await query('recommendations', 'list')).some(rec => rec.type === 'delete_cache'));
+  files = await query('files', 'list', { limit: 100 }); await assertNoCleanup();
+  record('cleanup-rule changes invalidate fresh cached analysis and rebuild the enabled recommendations automatically');
+  if (process.env.DRIVEOS_TEST_PREPARE_BROWSER === '1') browserFixtureOnly = true;
+  else {
+    await assert.rejects(mutation('cleanup', 'queueQuarantine', { fileIds: [files.find(f => f.path === raw)._id] }));
+    const approved = await mutation('cleanup', 'queueQuarantine', { fileIds: [files.find(f => f.path === cacheA)._id] }); assert.equal(approved.queued, 1); assertUntouched();
+    agent(['run-jobs'], 'approved-quarantine');
+    const item = (await query('cleanup', 'listQuarantine')).find(q => q.originalPath === cacheA); assert.ok(item); assert.equal(fs.existsSync(cacheA), false); assert.equal(hash(item.quarantinePath), hashes.get(cacheA));
+    for (const file of [cacheB, musicA, musicB, raw, final]) assert.equal(hash(file), hashes.get(file));
+    record('only explicit approval quarantines a selected file; protected media and duplicate copies remain intact');
+    await mutation('cleanup', 'requestRestore', { quarantineId: item._id }); agent(['run-jobs'], 'approved-restore'); assertUntouched();
+    await mutation('cleanup', 'queueQuarantine', { fileIds: [files.find(f => f.path === cacheB)._id], purgeAfter: true }); assertUntouched();
+    agent(['run-jobs'], 'approved-permanent-delete-move'); agent(['run-jobs'], 'approved-permanent-delete-purge');
+    assert.equal(fs.existsSync(cacheB), false); assert.ok(!(await query('cleanup', 'listQuarantine')).some(q => q.originalPath === cacheB)); hashes.delete(cacheB); assertUntouched();
+    record('explicit restore and permanent-delete requests execute correctly; scanning never grants their approval');
+  }
+} catch (error) {
+  process.exitCode = 1; results.push({ name: 'one-click end-to-end flow', status: 'failed', error: String(error?.stack || error) }); process.stderr.write('FAIL ' + (error?.stack || error) + '\n');
+} finally {
+  fs.writeFileSync(path.join(fixture, 'summary.json'), JSON.stringify({ fixture, email, agentHome, roots, quarantineRoot,
+    agentEntry, results, browserFixtureOnly }, null, 2)); process.stdout.write('One-click scan/analysis evidence: ' + fixture + '\n');
+}

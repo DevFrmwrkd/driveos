@@ -82,9 +82,9 @@ async function refreshTrayMenu() {
     { type: "separator" },
     { label: "Open DriveOS…", click: () => showWindow() },
     {
-      label: "Scan Now",
+      label: "Scan & Analyze",
       enabled: status.connected && !status.paused,
-      click: async () => { pushLog("Scan Now requested…"); const r = await agent.scanNow(); pushLog(r.message); refreshTrayMenu(); },
+      click: async () => { pushLog("Scan & Analyze requested…"); const r = await agent.scanNow(); pushLog(r.message); refreshTrayMenu(); },
     },
     status.paused
       ? { label: "Resume hourly sync", click: async () => { await agent.resume(); pushLog("Resumed."); refreshTrayMenu(); } }

@@ -88,7 +88,7 @@ export const requestScan = mutation({
       if (existing) continue;
       jobIds.push(await insertApprovedJob(ctx, {
         tenantId: member.tenantId, machineId: String(machine._id), requestedBy: member.email,
-        action: "scan", result: { rootPath: drive.mountPath, driveId: String(drive._id) },
+        action: "scan", result: { rootPath: drive.mountPath, driveId: String(drive._id), analyzeAfterScan: true },
       }));
     }
     if (!jobIds.length && !active.some(j => j.action === "scan" && ["approved", "queued", "running"].includes(j.status)))
