@@ -134,10 +134,13 @@ export default defineSchema({
     analysisStatus: v.optional(v.union(v.literal("queued"), v.literal("running"), v.literal("completed"), v.literal("failed"), v.literal("stale"))),
     analysisError: v.optional(v.string()),
     analysisCompletedAt: v.optional(v.number()),
+    // Latest successful catalog validation, including reuse after an unchanged
+    // scan. Worker start/completion timestamps retain their original meaning.
+    analysisValidatedAt: v.optional(v.number()),
     scanAnalysisRequestVersion: v.optional(v.number()),
     scanAnalysisResolvedVersion: v.optional(v.number()),
     scanAnalysisFollowUps: v.optional(v.number()),
-    dirtyCount: v.number(), // files inserted/materially changed since last run
+    dirtyCount: v.number(), // files or recommendation inputs changed since last run
     scheduled: v.boolean(), // an analysis run is already queued
     lastRunAt: v.number(), // when analysis last STARTED (0 = never)
   }).index("by_tenant", ["tenantId"]),

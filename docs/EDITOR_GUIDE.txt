@@ -88,6 +88,11 @@ The main screen has a few simple buttons:
       after all drives and scan passes finish successfully.
       No separate analysis click or manual tagging is needed.
 
+      Recent unchanged scans reuse current results. New changes
+      wait for any remaining five-minute analysis cooldown and
+      run automatically. Project status and cleanup-rule changes
+      invalidate old results too. No second click is needed.
+
    ADD DRIVE
       Choose a folder or drive you want DriveOS to keep
       track of.
@@ -118,7 +123,8 @@ Your admin will give you the link and your login.
 There you can see drive space, duplicates, large files, and
 cleanup suggestions. Browsing and analysis leave files alone.
 Scan & Analyze sends the combined request to the owning agent.
-Review selected files and approve quarantine before they move.
+Choose Review & quarantine in Cleanup. Review selected files
+and approve quarantine before they move.
 Delete and Empty expired require an admin to type DELETE.
 Expiry by itself does not permanently delete files.
 

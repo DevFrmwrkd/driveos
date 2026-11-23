@@ -226,9 +226,9 @@ function TopBar({ go, route, requestScan, busy, memberId }: TopBarProps) {
         <button className="btn ghost icon" title="Notifications" onClick={() => go("settings")}>
           <Icon name="bell" size={17} />
         </button>
-        <button className="btn ghost icon" title="Scan & Analyze all tracked drives" disabled={busy || DB.drives.length === 0} onClick={() => void requestScan()}>
+        {!['dashboard', 'drives'].includes(route.screen) && <button className="btn ghost icon" title="Scan & Analyze all tracked drives" disabled={busy || DB.drives.length === 0} onClick={() => void requestScan()}>
           <Icon name="refresh" size={16} />
-        </button>
+        </button>}
         <div style={{ width: 1, height: 22, background: "var(--line)" }} />
         <Avatar id={memberId} size={30} />
         <button className="btn ghost icon" title="Sign out" onClick={() => void signOut()}>

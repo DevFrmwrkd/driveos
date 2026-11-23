@@ -39,6 +39,19 @@ export async function analysisStateForTenant(ctx: any, tenantId: string) {
   return await ctx.db.query("analysisState").withIndex("by_tenant", (q: any) => q.eq("tenantId", tenantId)).first();
 }
 
+// Recommendations also depend on project state and cleanup rules. Advance the
+// same publication fence as file changes, using one indexed read and write.
+export async function invalidateAnalysisInputs(ctx: any, tenantId: string) {
+  const state = await analysisStateForTenant(ctx, tenantId);
+  if (state) {
+    await ctx.db.patch(state._id, { dirtyCount: state.dirtyCount + 1,
+      catalogGeneration: catalogGeneration(state) + 1 });
+  } else {
+    await ctx.db.insert("analysisState", { tenantId, dirtyCount: 1, catalogGeneration: 1,
+      analyzedGeneration: 0, scheduled: false, lastRunAt: 0 });
+  }
+}
+
 // Deleting a file invalidates all cached aggregate claims in one write. Public
 // readers do not fan out over every recommendation/cluster to discover ghosts.
 export async function cachedAnalysisIsCurrent(ctx: any, tenantId: string): Promise<boolean> {

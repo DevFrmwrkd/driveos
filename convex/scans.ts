@@ -17,7 +17,11 @@ const ANALYSIS_OWNER_GRACE_MS = 60 * 60 * 1000;
 
 async function enqueueAnalysis(ctx: any, state: any, manual = false, context: any = {}, scan = false) {
   const analysisRunId = (state.analysisRunId ?? 0) + 1;
-  const analysisFunctionId = await ctx.scheduler.runAfter(scan ? SCAN_ANALYSIS_DEBOUNCE_MS : manual ? 0 : analysisFollowUpDelay(state.lastRunAt, Date.now()),
+  // Explicit scans keep their intent during the tenant cooldown instead of
+  // repeatedly reading the catalog or requiring another user request.
+  const delay = scan ? Math.max(SCAN_ANALYSIS_DEBOUNCE_MS, state.lastRunAt + MANUAL_ANALYSIS_COOLDOWN_MS - Date.now())
+    : manual ? 0 : analysisFollowUpDelay(state.lastRunAt, Date.now());
+  const analysisFunctionId = await ctx.scheduler.runAfter(delay,
     manual ? internal.scans.runManualAnalysis : internal.scans.runPostScanAnalysis,
     { tenantId: state.tenantId, ...context, analysisRunId });
   await ctx.db.patch(state._id, { scheduled: true, analysisRunId, analysisFunctionId, analysisClaimed: false,
@@ -41,10 +45,11 @@ async function releaseAnalysis(ctx: any, state: any, patch: any = {}, options: {
 async function finishAnalysis(ctx: any, state: any, success: boolean, generation?: number, error?: string, patch: any = {}) {
   const current = success && canPublishAnalysis(state, generation);
   const requested = hasRequestedScanAnalysis(state);
-  const common = { ...patch, ...(current ? { dirtyCount: 0, analyzedGeneration: generation } : {}),
+  const completedAt = Date.now();
+  const common = { ...patch, ...(current ? { dirtyCount: 0, analyzedGeneration: generation, analysisValidatedAt: completedAt } : {}),
     analysisStatus: current ? "completed" : success ? "stale" : "failed",
     analysisError: current ? undefined : success ? "The catalog changed during analysis. Run Scan & Analyze again to refresh the results." : error || "Analysis failed. Try analysis again.",
-    analysisCompletedAt: Date.now() };
+    analysisCompletedAt: completedAt };
   if (requested && success && !current && (state.scanAnalysisFollowUps ?? 0) > 0) {
     await releaseAnalysis(ctx, state, { ...common, scanAnalysisFollowUps: state.scanAnalysisFollowUps - 1 }, { scanFollowUp: true });
     return { current, followingUp: true };
@@ -86,6 +91,7 @@ async function analysisStatusForState(ctx: any, state: any) {
     : state?.analysisStatus === "completed" && !current ? "stale" : state?.analysisStatus ?? (current ? "idle" : "stale");
   return { status, catalogCurrent: current, lastRunAt: state?.lastRunAt || null,
     completedAt: state?.analysisCompletedAt ?? null,
+    validatedAt: state?.analysisValidatedAt ?? null,
     error: stopped ? "The analysis worker stopped before it finished. Run analysis again."
       : state?.analysisError ?? (status === "stale" ? "The catalog has changed since the last analysis." : null),
     maxFiles: MANUAL_ANALYSIS_MAX_FILES };
@@ -142,6 +148,15 @@ export const requestScanAnalysis = internalMutation({
     const patch = { scanAnalysisRequestVersion: (state.scanAnalysisRequestVersion ?? 0) + 1,
       scanAnalysisFollowUps: 1, analysisError: undefined };
     await ctx.db.patch(session._id, { analysisRequested: true });
+    // An unchanged scan can confirm recent results without running both full
+    // catalog readers again. Preserve the actual worker timestamps so clients
+    // can distinguish validation of cached results from a new analysis run.
+    if (!owner.active && state.analysisStatus === "completed" && catalogAnalysisIsCurrent(state) &&
+        state.analysisCompletedAt !== undefined && state.analysisCompletedAt + MANUAL_ANALYSIS_COOLDOWN_MS > Date.now()) {
+      await ctx.db.patch(state._id, { ...patch, scanAnalysisResolvedVersion: patch.scanAnalysisRequestVersion,
+        analysisValidatedAt: Date.now() });
+      return { scheduled: false, status: "completed", message: "Scan completed. Recent analysis is current; results reused." };
+    }
     await ctx.db.patch(state._id, patch);
     state = { ...state, ...patch };
     if (owner.active) {

@@ -1,0 +1,41 @@
+// Disposable local QA only. Never copied into repository Convex sources.
+import { internalMutation, internalQuery } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { v } from "convex/values";
+
+async function scope(ctx: any, tenantId: string) {
+  for (const value of [process.env.CONVEX_CLOUD_URL, process.env.CONVEX_SITE_URL]) {
+    let url: URL;
+    try { url = new URL(value || ""); }
+    catch { throw new Error("Expected a disposable loopback backend environment"); }
+    if (url.protocol !== "http:" || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))
+      throw new Error("Expected a disposable loopback backend environment");
+  }
+  const id = ctx.db.normalizeId("tenants", tenantId);
+  const tenant = id ? await ctx.db.get(id) : null;
+  if (tenant?.name !== "DriveOS Scan Analysis QA") throw new Error("Expected isolated scan-analysis QA workspace");
+  const state = await ctx.db.query("analysisState").withIndex("by_tenant", (q: any) => q.eq("tenantId", tenantId)).first();
+  if (!state) throw new Error("Expected QA catalog state");
+  return state;
+}
+
+export const state = internalQuery({ args: { tenantId: v.string() }, handler: async (ctx, args) => {
+  const state = await scope(ctx, args.tenantId);
+  const scheduled: any = state.analysisFunctionId ? await ctx.db.system.get(state.analysisFunctionId) : null;
+  return { state, scheduled };
+} });
+
+export const expeditePendingRun = internalMutation({ args: { tenantId: v.string(), analysisRunId: v.number() }, handler: async (ctx, args) => {
+  const state = await scope(ctx, args.tenantId);
+  const scheduled: any = state.analysisFunctionId ? await ctx.db.system.get(state.analysisFunctionId) : null;
+  if (!state.scheduled || state.analysisClaimed || state.analysisRunId !== args.analysisRunId ||
+      scheduled?.state.kind !== "pending" || !scheduled.name.endsWith(":runManualAnalysis") ||
+      Math.ceil(scheduled.scheduledTime) < state.lastRunAt + 300_000)
+    throw new Error("Expected this QA tenant's pending explicit analysis after the five-minute cooldown");
+  await ctx.scheduler.cancel(state.analysisFunctionId);
+  const analysisFunctionId = await ctx.scheduler.runAfter(0, internal.scans.runManualAnalysis, {
+    tenantId: args.tenantId, analysisRunId: args.analysisRunId,
+  });
+  await ctx.db.patch(state._id, { lastRunAt: 0, analysisFunctionId });
+  return { expedited: true, originalScheduledTime: scheduled.scheduledTime };
+} });

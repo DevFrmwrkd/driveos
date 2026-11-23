@@ -97,7 +97,7 @@ function checkbox(tree) {
   return found;
 }
 
-test("individual Cleanup quarantine requires the Preview approval before a job is queued", async () => {
+test("individual Cleanup has one review action and still requires approval before a job is queued", async () => {
   const rec = { _id: "rec", type: "delete_cache", title: "Synthetic cache", explanation: "Regenerable fixture", riskLevel: "green", status: "open", affectedFileIds: ["file"], affectedBytes: 2048 };
   const ui = runtime({
     "recommendations.list": [rec], "settings.get": { retentionDays: 14 }, "tenants.currentContext": { member: { role: "admin" } },
@@ -107,7 +107,9 @@ test("individual Cleanup quarantine requires the Preview approval before a job i
   const props = { go() {}, toast() {} };
   let tree = ui.render(exports.CleanupScreen, props);
   assert.equal(ui.calls.length, 0);
-  button(tree, "Quarantine").props.onClick();
+  assert.equal([...nodes(tree)].filter(node => node.type === "button" && text(node) === "Review & quarantine").length, 1);
+  assert.equal([...nodes(tree)].filter(node => node.type === "button" && ["Preview", "Quarantine"].includes(text(node))).length, 0);
+  button(tree, "Review & quarantine").props.onClick();
   assert.equal(ui.calls.length, 0, "Opening quarantine must not approve a physical move.");
   tree = ui.render(exports.CleanupScreen, props);
   let modal = component(tree, "CleanupPreviewModal");
@@ -118,7 +120,7 @@ test("individual Cleanup quarantine requires the Preview approval before a job i
   assert.equal(ui.calls.length, 0);
   tree = ui.render(exports.CleanupScreen, props);
   assert.equal([...nodes(tree)].some(node => node.type?.name === "CleanupPreviewModal"), false);
-  button(tree, "Quarantine").props.onClick();
+  button(tree, "Review & quarantine").props.onClick();
   modal = component(ui.render(exports.CleanupScreen, props), "CleanupPreviewModal");
   preview = ui.render(modal.type, modal.props);
   checkbox(preview).props.onChange({ target: { checked: true } });
@@ -127,6 +129,22 @@ test("individual Cleanup quarantine requires the Preview approval before a job i
   button(preview, "Move to Quarantine").props.onClick();
   await new Promise(setImmediate);
   assert.deepEqual(ui.calls, [{ name: "cleanup.queueRecommendations", args: { recommendationIds: ["rec"] } }]);
+});
+
+test("read-only recommendations retain Preview without a duplicate cleanup action", () => {
+  const rec = { _id: "storage-rec", type: "archive_project", title: "Archive review", riskLevel: "yellow", status: "open", affectedFileIds: ["file"], affectedBytes: 2048 };
+  const ui = runtime({ "recommendations.list": [rec], "settings.get": { retentionDays: 14 }, "cleanup.previewFiles": [{ _id: "file", path: "/fixture/original.mov", sizeBytes: 2048 }] });
+  const { exports } = ui.load("screens/screens-cleanup.tsx");
+  const props = { go() {}, toast() {} };
+  const tree = ui.render(exports.CleanupScreen, props);
+  assert.equal([...nodes(tree)].filter(node => node.type === "button" && text(node) === "Preview").length, 1);
+  assert.equal([...nodes(tree)].filter(node => node.type === "button" && text(node) === "Review & quarantine").length, 0);
+  button(tree, "Preview").props.onClick();
+  const modal = component(ui.render(exports.CleanupScreen, props), "CleanupPreviewModal");
+  const preview = ui.render(modal.type, modal.props);
+  assert.equal(button(preview, "Move to Quarantine").props.disabled, true);
+  button(preview, "Cancel").props.onClick();
+  assert.equal(ui.calls.length, 0);
 });
 
 test("duplicate quarantine confirms selected paths and queues only the approved snapshot", async () => {
@@ -199,9 +217,9 @@ test("scan requests and analysis states never label queued, stale, failed or mis
   assert.equal(helpers.scanAnalysisMessage(state("completed", { catalogCurrent: true }), []).title, "Analysis complete");
 });
 
-test("combined scan status keeps offline and failed request groups visible until a newer scan", () => {
+test("combined scan status keeps requests visible until a newer attempt on the same drive", () => {
   const { exports: helpers } = runtime().load("lib/scan-analysis.ts");
-  const job = (status, createdAt, extra = {}) => ({ action: "scan", status, createdAt, result: { analyzeAfterScan: true, ...extra } });
+  const job = (status, createdAt, extra = {}) => ({ action: "scan", status, createdAt, machineId: "machine-A", result: { analyzeAfterScan: true, driveId: "drive-A", ...extra } });
   assert.equal(helpers.scanAnalysisMessage(state("idle"), [job("approved", 1)]).title, "Scan & Analyze queued");
   assert.equal(helpers.scanAnalysisMessage(state("idle"), [job("running", 1)]).title, "Scanning files");
   const failed = job("failed", 1, { error: "Synthetic drive is disconnected." });
@@ -213,6 +231,67 @@ test("combined scan status keeps offline and failed request groups visible until
   assert.match(partlyWaiting.detail, /1 other drive scan/);
   assert.equal(helpers.scanAnalysisMessage(state("idle"), [failed, job("approved", 2)]).title, "Scan & Analyze queued");
   assert.equal(helpers.scanAnalysisMessage(state("completed", { catalogCurrent: true }), [failed, job("completed", 2)]).title, "Analysis complete");
+});
+
+test("scanning one drive cannot hide another drive's queued, running, or failed scan", () => {
+  const { exports: helpers } = runtime().load("lib/scan-analysis.ts");
+  const job = (driveId, status, createdAt, machineId = "machine-A") => ({
+    action: "scan", status, createdAt, machineId,
+    result: { analyzeAfterScan: true, driveId, error: status === "failed" ? `${driveId} is disconnected.` : undefined },
+  });
+  const analyzed = state("completed", { catalogCurrent: true, lastRunAt: 300, completedAt: 310 });
+  const refreshedA = job("drive-A", "completed", 200);
+  for (const [status, title] of [["approved", "Scan & Analyze queued"], ["queued", "Scan & Analyze queued"], ["running", "Scanning files"], ["failed", "Scan & Analyze failed"]]) {
+    const outstandingB = job("drive-B", status, 100);
+    const message = helpers.scanAnalysisMessage(analyzed, [outstandingB, job("drive-A", "completed", 100), refreshedA]);
+    assert.equal(message.title, title, `${status} drive-B must survive a later drive-A scan`);
+    if (status === "failed") assert.match(message.detail, /drive-B is disconnected/);
+    else assert.match(message.detail, /1 drive scan/);
+  }
+  const failedB = job("drive-B", "failed", 100);
+  const retryingA = helpers.scanAnalysisMessage(analyzed, [failedB, job("drive-A", "approved", 200)]);
+  assert.equal(retryingA.title, "Scan & Analyze failed");
+  assert.match(retryingA.detail, /1 other drive scan/);
+  assert.equal(helpers.scanAnalysisMessage(analyzed, [failedB, refreshedA, job("drive-B", "approved", 220)]).title, "Scan & Analyze queued");
+  assert.equal(helpers.scanAnalysisMessage(analyzed, [failedB, refreshedA, job("drive-B", "completed", 220)]).title, "Analysis complete");
+  assert.equal(helpers.scanAnalysisMessage(analyzed, [failedB, job("drive-B", "completed", 220, "machine-B")]).title, "Scan & Analyze failed");
+  assert.equal(helpers.scanAnalysisMessage(analyzed, [failedB, job("drive-B", "completed", 100)]).title, "Scan & Analyze failed");
+});
+
+test("scan status retains every active request and does not guess the owner of legacy failures", () => {
+  const { exports: helpers } = runtime().load("lib/scan-analysis.ts");
+  const known = { action: "scan", status: "completed", machineId: "machine-A", createdAt: 200, result: { analyzeAfterScan: true, driveId: "drive-A" } };
+  const analyzed = state("completed", { catalogCurrent: true, lastRunAt: 300 });
+  for (const legacy of [
+    { machineId: undefined },
+    { result: { analyzeAfterScan: true } },
+    { createdAt: undefined },
+  ]) {
+    const failed = { ...known, status: "failed", createdAt: 100, ...legacy };
+    assert.equal(helpers.scanAnalysisMessage(analyzed, [failed, known]).title, "Scan & Analyze failed", JSON.stringify(legacy));
+  }
+  const active = [
+    { ...known, status: "approved", createdAt: 100 },
+    { ...known, status: "running", createdAt: 90, machineId: undefined },
+  ];
+  const message = helpers.scanAnalysisMessage(analyzed, [...active, known]);
+  assert.equal(message.title, "Scanning files");
+  assert.match(message.detail, /2 drive scan/);
+});
+
+test("a validated cached analysis recovers a later successful desktop scan without a new analyzer run", () => {
+  const { exports: helpers } = runtime().load("lib/scan-analysis.ts");
+  const failed = { action: "scan", status: "failed", machineId: "machine-A", createdAt: 10, updatedAt: 50, result: { analyzeAfterScan: true, driveId: "drive-A" } };
+  const scan = { machineId: "machine-A", driveId: "drive-A", startedAt: 60, completedAt: 80, status: "completed", errorsCount: 0 };
+  const reused = state("completed", { catalogCurrent: true, lastRunAt: 20, completedAt: 30, validatedAt: 90 });
+  assert.equal(helpers.scanAnalysisMessage(reused, [failed], [scan]).title, "Analysis complete");
+  for (const changed of [
+    { validatedAt: 79 }, { validatedAt: null }, { validatedAt: undefined },
+    { status: "queued" }, { status: "running" }, { status: "failed" }, { status: "stale" }, { catalogCurrent: false },
+  ]) {
+    assert.equal(helpers.scanAnalysisMessage({ ...reused, ...changed }, [failed], [scan]).title, "Scan & Analyze failed", JSON.stringify(changed));
+  }
+  assert.equal(helpers.scanAnalysisMessage(reused, [failed], [scan, { ...scan, startedAt: 85, completedAt: 88, status: "partial" }]).title, "Scan & Analyze failed");
 });
 
 test("analysis progress renders a live status without approving any file operation", () => {

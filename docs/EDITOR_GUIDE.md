@@ -65,6 +65,11 @@ drive and scan pass finishes successfully. A partial scan or failed analysis
 shows an error instead of claiming the whole flow completed. Background scans
 continue on their existing schedule; they do not enable automatic cleanup.
 
+Recent unchanged scans reuse current results. If analysis ran recently and your
+catalog changed, the new analysis waits for the five-minute cooldown and starts
+automatically. You do not need another click. Project status and cleanup-rule
+changes also invalidate the old results.
+
 ---
 
 ## The dashboard (website)
@@ -75,7 +80,8 @@ files, and cleanup suggestions — all read-only and safe to browse.
 
 The dashboard's **Scan & Analyze** button sends the same combined request to the
 owning computer. Once analysis completes, review Cleanup or Duplicate Center.
-Confirm the selected files and approve quarantine before anything moves. Cancel
+Choose **Review & quarantine** in Cleanup, confirm the selected files, and
+approve quarantine before anything moves. Cancel
 the confirmation to leave files in place. **Delete** and **Empty expired**
 require admin access and typing `DELETE`; expiry alone does not delete files.
 

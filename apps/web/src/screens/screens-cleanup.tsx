@@ -1,5 +1,4 @@
 import React from "react";
-import { createPortal } from "react-dom";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convexApi";
 import { Icon } from "@/components/icons";
@@ -73,7 +72,7 @@ export function CleanupScreen({ go, toast }: ScreenProps) {
           <p className="muted" style={{ fontSize: 13, lineHeight: 1.6 }}>{r.explanation}</p><div className="mono dim" style={{ fontSize: 12 }}>{r.affectedFileIds.length} listed file(s) · {formatBytes(r.affectedBytes)} · {category(r.type)}</div>
           {!supported && <p className="muted" style={{ fontSize: 12 }}>This recommendation needs a storage or backup decision. It does not authorize deleting the original files.</p>}
           {r.status === "failed" && <p style={{ color: "var(--risk)", fontSize: 12 }}>A previous cleanup attempt failed. Run analysis again to refresh the remaining files before approving another move.</p>}
-          <div className="row" style={{ gap: 8, marginTop: 14, flexWrap: "wrap" }}><button className="btn sm" onClick={() => setPreview({ title: r.title, recommendations: [r] })}><Icon name="eye" size={13} />Preview</button>{eligible && <button className="btn sm primary" disabled={!settings || busyId !== null} onClick={() => setPreview({ title: r.title, recommendations: [r] })}><Icon name="shield" size={13} />{busyId === r._id ? "Queuing…" : "Quarantine"}</button>}{eligible && canPurge && <button className="btn sm danger" disabled={!settings || busyId !== null} onClick={() => setDeleting(r)}><Icon name="trash" size={13} />Delete permanently</button>}<button className="btn sm ghost" disabled={busyId !== null} onClick={() => void ignore(r)}>Ignore</button></div>
+          <div className="row" style={{ gap: 8, marginTop: 14, flexWrap: "wrap" }}><button className={`btn sm${eligible ? " primary" : ""}`} disabled={busyId !== null || (eligible && !settings)} onClick={() => setPreview({ title: r.title, recommendations: [r] })}><Icon name={eligible ? "shield" : "eye"} size={13} />{eligible ? "Review & quarantine" : "Preview"}</button>{eligible && canPurge && <button className="btn sm danger" disabled={!settings || busyId !== null} onClick={() => setDeleting(r)}><Icon name="trash" size={13} />Delete permanently</button>}<button className="btn sm ghost" disabled={busyId !== null} onClick={() => void ignore(r)}>Ignore</button></div>
         </div>;
       })}</div>
     </>}
@@ -106,7 +105,7 @@ function DeleteConfirmModal({ title, count, busy, onClose, onConfirm }: { title:
   const [typed, setTyped] = React.useState("");
   const armed = typed.trim().toUpperCase() === "DELETE";
   if (typeof document === "undefined") return null;
-  return createPortal(<Modal title="Permanently delete files" subtitle={title} icon="trash" iconKind="risk" onClose={onClose} width={560} footer={[<button key="cancel" className="btn" onClick={onClose}>Cancel</button>, <button key="delete" className="btn danger" disabled={!armed || busy} onClick={onConfirm}>{busy ? "Queuing…" : "Permanently delete"}</button>]}><p>These {count} file(s) will be permanently removed by their local agent. This cannot be undone.</p><label className="field-label" htmlFor="permanent-delete-confirm">Type DELETE to confirm</label><input id="permanent-delete-confirm" className="input mono" placeholder="DELETE" value={typed} autoFocus onChange={e => setTyped(e.target.value)} /></Modal>, document.body);
+  return <Modal title="Permanently delete files" subtitle={title} icon="trash" iconKind="risk" onClose={onClose} width={560} footer={[<button key="cancel" className="btn" onClick={onClose}>Cancel</button>, <button key="delete" className="btn danger" disabled={!armed || busy} onClick={onConfirm}>{busy ? "Queuing…" : "Permanently delete"}</button>]}><p>These {count} file(s) will be permanently removed by their local agent. This cannot be undone.</p><label className="field-label" htmlFor="permanent-delete-confirm">Type DELETE to confirm</label><input id="permanent-delete-confirm" className="input mono" placeholder="DELETE" value={typed} autoFocus onChange={e => setTyped(e.target.value)} /></Modal>;
 }
 
 export function QuarantineScreen({ go, toast }: ScreenProps) {

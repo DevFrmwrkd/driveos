@@ -3,6 +3,7 @@ export type AnalysisState = {
   catalogCurrent: boolean;
   lastRunAt: number | null;
   completedAt: number | null;
+  validatedAt?: number | null;
   error: string | null;
   maxFiles: number;
 };
@@ -29,9 +30,11 @@ export function scanRequestFeedback(queued: number): { message: string; kind: "a
 }
 
 function failedScanRecovered(job: ScanJob, analysis: AnalysisState | undefined, sessions: ScanSession[]): boolean {
-  if (analysis?.status !== "completed" || !analysis.catalogCurrent || analysis.lastRunAt === null ||
+  if (analysis?.status !== "completed" || !analysis.catalogCurrent ||
       !job.machineId || !job.result?.driveId) return false;
-  const analyzedAt = analysis.lastRunAt;
+  // A clean scan can validate current cached results without rerunning analysis.
+  const analyzedAt = analysis.validatedAt ?? analysis.lastRunAt;
+  if (analyzedAt === null) return false;
   const failedAt = job.completedAt ?? job.updatedAt ?? job.createdAt;
   if (failedAt === undefined) return false;
   const laterAttempts = sessions.filter(scan =>
@@ -47,10 +50,24 @@ function failedScanRecovered(job: ScanJob, analysis: AnalysisState | undefined, 
 
 export function scanAnalysisMessage(analysis: AnalysisState | undefined, jobs: ScanJob[], sessions: ScanSession[] = []): StatusMessage | null {
   const requests = jobs.filter(job => job.action === "scan" && job.result?.analyzeAfterScan === true);
-  const latestRequestAt = Math.max(...requests.map(job => job.createdAt || 0));
-  const latestRequest = requests.filter(job => (job.createdAt || 0) === latestRequestAt);
-  const scans = latestRequest.filter(job => ["approved", "queued", "running"].includes(job.status || ""));
-  const failed = latestRequest.find(job => job.status === "failed" && !failedScanRecovered(job, analysis, sessions));
+  const driveKey = (job: ScanJob) => job.machineId && job.result?.driveId
+    ? JSON.stringify([job.machineId, job.result.driveId]) : null;
+  const latestAttemptAt = new Map<string, number>();
+  for (const job of requests) {
+    const key = driveKey(job);
+    if (key !== null && job.createdAt !== undefined)
+      latestAttemptAt.set(key, Math.max(latestAttemptAt.get(key) ?? -Infinity, job.createdAt));
+  }
+  // Only a retry for the same owning drive supersedes an old failure. Missing
+  // identities or timestamps cannot prove recovery, and tied attempts all count.
+  const latestRequests = requests.filter(job => {
+    const key = driveKey(job);
+    return key === null || job.createdAt === undefined || job.createdAt === latestAttemptAt.get(key);
+  });
+  // An older request may still be waiting for an offline agent, even after a
+  // newer scan finishes. Keep every live request visible until it settles.
+  const scans = requests.filter(job => ["approved", "queued", "running"].includes(job.status || ""));
+  const failed = latestRequests.find(job => job.status === "failed" && !failedScanRecovered(job, analysis, sessions));
   if (failed) return {
     title: "Scan & Analyze failed",
     detail: (failed.result?.error || "A drive scan did not finish. Check its owning agent, reconnect the drive, and try Scan & Analyze again.") +

@@ -14,9 +14,10 @@ const modules = new Map();
 const internal = {
   scans: Object.fromEntries(["captureAnalysisGeneration", "claimManualAnalysisRun", "runManualAnalysis", "finishManualAnalysis", "claimAnalysisRun", "recordAnalysisComplete", "restoreAnalysisAfterFailure", "runPostScanAnalysis"]
     .map(name => [name, name])),
-  duplicates: { runDuplicateDetection: "runDuplicateDetection" },
-  recommendations: { generateRecommendations: "generateRecommendations" },
+  duplicates: Object.fromEntries(["runDuplicateDetection", "upsertClusters", "pageClusterKeys", "deleteClusters"].map(name => [name, name])),
+  recommendations: Object.fromEntries(["generateRecommendations", "listProjectsForAnalysis", "listOpenExactClusters", "replaceOpenRecommendations"].map(name => [name, name])),
   files: { pageForAnalysis: "pageForAnalysis" },
+  settings: { forAnalysis: "forAnalysis" },
 };
 function load(filename, cache = modules) {
   filename = path.resolve(filename);
@@ -53,6 +54,9 @@ function loadScans(enabled) {
 const scans = loadScans(true), scansOff = loadScans(false);
 const duplicates = load(path.join(repository, "convex/duplicates.ts"));
 const recommendations = load(path.join(repository, "convex/recommendations.ts"));
+const files = load(path.join(repository, "convex/files.ts"));
+const settings = load(path.join(repository, "convex/settings.ts"));
+const projects = load(path.join(repository, "convex/projects.ts"));
 const { catalogAnalysisIsCurrent } = load(path.join(repository, "convex/catalogAnalysis.ts"));
 
 function fixture(generation = 1, analyzedGeneration = 0, handlers = scans) {
@@ -63,7 +67,7 @@ function fixture(generation = 1, analyzedGeneration = 0, handlers = scans) {
   const cluster = { _id: "duplicateClusters:1", tenantId, status: "open", fileIds: [live._id, deleted._id], recommendedKeepFileId: live._id, wastedBytes: 10 };
   const rec = { _id: "recommendations:1", tenantId, status: "open", affectedFileIds: [deleted._id], affectedBytes: 10 };
   const session = { _id: "scanSessions:1", tenantId, machineId: "machines:1", rootPath: "/review", status: "running", filesScanned: 0, bytesScanned: 0 };
-  const tables = { analysisState: [state], files: [live, deleted], duplicateClusters: [cluster], recommendations: [rec], auditLogs: [], scanSessions: [session] };
+  const tables = { analysisState: [state], files: [live, deleted], duplicateClusters: [cluster], recommendations: [rec], auditLogs: [], scanSessions: [session], projects: [], workspaceSettings: [] };
   const documents = new Map(Object.values(tables).flat().map(row => [row._id, row]));
   const reads = [], scheduled = [];
   const jobs = new Map();
@@ -71,6 +75,11 @@ function fixture(generation = 1, analyzedGeneration = 0, handlers = scans) {
     normalizeId: (table, id) => id.startsWith(`${table}:`) ? id : null,
     get: async id => structuredClone(documents.get(id) ?? null),
     patch: async (id, patch) => Object.assign(documents.get(id), structuredClone(patch)),
+    delete: async id => {
+      const row = documents.get(id), table = id.split(":")[0];
+      tables[table].splice(tables[table].indexOf(row), 1);
+      documents.delete(id);
+    },
     insert: async (table, row) => { const id = `${table}:${tables[table].length + 1}`; const doc = { ...structuredClone(row), _id: id }; tables[table].push(doc); documents.set(id, doc); return id; },
     system: { get: async id => structuredClone(jobs.get(id) ?? null) },
     query(table) {
@@ -85,6 +94,10 @@ function fixture(generation = 1, analyzedGeneration = 0, handlers = scans) {
         take: async count => structuredClone((tables[table] ?? []).filter(row => filters.every(filter => filter(row))).slice(0, count)),
         first: async () => (await chain.take(1))[0] ?? null,
         collect: async () => chain.take(Infinity),
+        paginate: async ({ cursor, numItems }) => {
+          const rows = await chain.take(Infinity), offset = Number(cursor || 0);
+          return { page: rows.slice(offset, offset + numItems), isDone: offset + numItems >= rows.length, continueCursor: String(offset + numItems) };
+        },
       };
       return chain;
     },
@@ -110,6 +123,34 @@ function fixture(generation = 1, analyzedGeneration = 0, handlers = scans) {
       catch (error) { job.state = { kind: "failed" }; throw error; }
     },
   };
+}
+
+function useActualAnalysisConsumers(f, handlers = scansOff) {
+  const actions = [], catalogReads = [];
+  Object.assign(f.live, { classification: "CACHE", modifiedAtFile: 123, storageTier: "hot", riskLevel: "green" });
+  const dispatch = async (reference, args) => {
+    const definition = handlers[reference] || duplicates[reference] || recommendations[reference] || files[reference] || settings[reference];
+    assert.ok(definition, `Unknown analysis function ${reference}`);
+    return definition.handler(f.ctx, args);
+  };
+  f.ctx.runQuery = async (reference, args) => {
+    if (reference === "pageForAnalysis") catalogReads.push(Date.now());
+    return dispatch(reference, args);
+  };
+  f.ctx.runMutation = dispatch;
+  f.ctx.runAction = async (reference, args) => {
+    actions.push([reference, args, Date.now()]);
+    return dispatch(reference, args);
+  };
+  return { actions, catalogReads };
+}
+
+function addProject(f, patch = {}) {
+  const project = { _id: "projects:1", tenantId: f.ctx.tenantId, ownerId: "qa", name: "QA Project",
+    status: "active", tier: "warm", storageHealthScore: 50, cleanupRules: { ...settings.DEFAULT_CLEANUP_RULES }, ...patch };
+  f.tables.projects.push(project);
+  f.documents.set(project._id, project);
+  return project;
 }
 
 test("legacy analysis remains readable until a catalog generation invalidates it", () => {
@@ -408,6 +449,238 @@ test("explicit completed scans analyze empty and unchanged catalogs with automat
   }
 });
 
+test("repeated unchanged scans reuse recent actual analysis without catalog reads or fabricated worker timestamps", async t => {
+  const time = clock(t), f = fixture(12, 12, scansOff);
+  Object.assign(f.state, { scheduled: false, dirtyCount: 0 });
+  const { actions, catalogReads } = useActualAnalysisConsumers(f);
+  successfulSession(f);
+  await requestScanAnalysis(f);
+  time.set(time.now + 1000);
+  await f.runScheduled(0);
+  const first = await scansOff.analysisStatus.handler(f.ctx, {});
+  assert.equal(actions.length, 2);
+  assert.equal(catalogReads.length, 2);
+  assert.equal(first.validatedAt, first.completedAt);
+
+  time.set(time.now + 1000);
+  const secondSession = successfulSession(f, "scanSessions:2");
+  const runId = f.state.analysisRunId;
+  assert.equal((await scansOff.requestAnalysis.handler(f.ctx, {})).scheduled, false);
+  const reused = await requestScanAnalysis(f, secondSession);
+  assert.equal(reused.scheduled, false);
+  assert.equal(reused.status, "completed");
+  assert.match(reused.message, /reused/);
+  const second = await scansOff.analysisStatus.handler(f.ctx, {});
+  assert.equal(second.lastRunAt, first.lastRunAt);
+  assert.equal(second.completedAt, first.completedAt);
+  assert.equal(second.validatedAt, secondSession.completedAt);
+  assert.equal(f.state.analysisRunId, runId);
+  assert.equal(f.state.scanAnalysisResolvedVersion, 2);
+  assert.equal(secondSession.analysisRequested, true);
+  assert.equal(f.scheduled.length, 1);
+  assert.equal(actions.length, 2);
+  assert.equal(catalogReads.length, 2);
+  assert.equal((await recommendations.list.handler(f.ctx, {})).length, 1);
+
+  // Reuse must not slide the freshness window indefinitely.
+  time.set(first.completedAt + 5 * MINUTE);
+  const thirdSession = successfulSession(f, "scanSessions:3");
+  assert.equal((await requestScanAnalysis(f, thirdSession)).scheduled, true);
+  assert.equal(f.scheduled.length, 2);
+  assert.equal(f.scheduled[1][0], 1000);
+  // Replayed receipts never arm work even if a later catalog edit invalidates it.
+  f.state.catalogGeneration++;
+  assert.equal((await requestScanAnalysis(f, secondSession)).status, "queued");
+  assert.equal(f.scheduled.length, 2);
+});
+
+test("changed scans coalesce during the cooldown and automatically analyze the latest generation", async t => {
+  const time = clock(t), f = fixture(1, 0, scansOff);
+  f.state.scheduled = false;
+  const { actions, catalogReads } = useActualAnalysisConsumers(f);
+  successfulSession(f);
+  await requestScanAnalysis(f);
+  time.set(time.now + 1000);
+  await f.runScheduled(0);
+  const firstStartedAt = f.state.lastRunAt;
+
+  time.set(time.now + 1000);
+  f.state.catalogGeneration++;
+  f.state.dirtyCount++;
+  assert.equal((await requestScanAnalysis(f, successfulSession(f, "scanSessions:2"))).scheduled, true);
+  const pending = f.jobs.get(f.state.analysisFunctionId);
+  assert.equal(pending.scheduledTime, firstStartedAt + 5 * MINUTE);
+  assert.equal((await scansOff.analysisStatus.handler(f.ctx, {})).status, "queued");
+  assert.equal(catalogAnalysisIsCurrent(f.state), false);
+  assert.deepEqual(await recommendations.list.handler(f.ctx, {}), []);
+  assert.equal(actions.length, 2);
+
+  f.state.catalogGeneration++;
+  f.state.dirtyCount++;
+  assert.equal((await requestScanAnalysis(f, successfulSession(f, "scanSessions:3"))).scheduled, false);
+  assert.equal(f.scheduled.length, 2);
+  assert.equal(f.jobs.get(f.state.analysisFunctionId).scheduledTime, pending.scheduledTime);
+  time.set(pending.scheduledTime);
+  await f.runScheduled(1);
+  assert.equal(actions.length, 4);
+  assert.equal(catalogReads.length, 4);
+  assert.equal(f.state.analyzedGeneration, 3);
+  assert.equal(f.state.scanAnalysisResolvedVersion, 3);
+  assert.equal(f.state.scheduled, false);
+  assert.equal((await scansOff.analysisStatus.handler(f.ctx, {})).status, "completed");
+});
+
+test("new scan retries after failed analysis wait for the tenant cooldown even when the catalog was unchanged", async t => {
+  const time = clock(t);
+  for (const analyzedGeneration of [0, 1]) {
+    const f = fixture(1, analyzedGeneration, scansOff);
+    f.state.scheduled = false;
+    successfulSession(f);
+    await requestScanAnalysis(f);
+    time.set(time.now + 1000);
+    f.ctx.runAction = async () => { throw new Error("fixture analysis failure"); };
+    await assert.rejects(f.runScheduled(0), /fixture analysis failure/);
+    const failedAt = f.state.lastRunAt;
+    assert.equal(f.state.analysisStatus, "failed");
+    assert.equal((await requestScanAnalysis(f)).status, "failed");
+    assert.equal(f.scheduled.length, 1);
+
+    time.set(time.now + 1000);
+    const retry = successfulSession(f, "scanSessions:2");
+    assert.equal((await requestScanAnalysis(f, retry)).scheduled, true);
+    const pending = f.jobs.get(f.state.analysisFunctionId);
+    assert.equal(pending.scheduledTime, failedAt + 5 * MINUTE);
+    assert.equal((await requestScanAnalysis(f, retry)).scheduled, false);
+    assert.equal(f.scheduled.length, 2);
+    f.ctx.runAction = async () => {};
+    time.set(pending.scheduledTime);
+    await f.runScheduled(1);
+    assert.equal(f.state.analysisStatus, "completed");
+    assert.equal(f.state.scanAnalysisResolvedVersion, 2);
+  }
+});
+
+test("project delivery invalidates recent results and an unchanged scan queues fresh proxy recommendations", async t => {
+  const time = clock(t), f = fixture(1, 0, scansOff);
+  f.state.scheduled = false;
+  useActualAnalysisConsumers(f);
+  const project = addProject(f);
+  Object.assign(f.live, { classification: "PROXY", projectId: project._id, path: "/review/04_PROXIES/proxy.mov" });
+  successfulSession(f);
+  await requestScanAnalysis(f);
+  time.set(time.now + 1000);
+  await f.runScheduled(0);
+  assert.equal((await recommendations.list.handler(f.ctx, {})).length, 0);
+  const firstStartedAt = f.state.lastRunAt;
+
+  await projects.updateStatus.handler(f.ctx, { projectId: project._id, status: "delivered" });
+  assert.equal(f.state.catalogGeneration, 2);
+  assert.equal(catalogAnalysisIsCurrent(f.state), false);
+  assert.equal((await scansOff.analysisStatus.handler(f.ctx, {})).status, "stale");
+  // An identical status write does not invalidate the same inputs twice.
+  await projects.updateStatus.handler(f.ctx, { projectId: project._id, status: "delivered" });
+  assert.equal(f.state.catalogGeneration, 2);
+
+  time.set(time.now + 1000);
+  assert.equal((await requestScanAnalysis(f, successfulSession(f, "scanSessions:2"))).scheduled, true);
+  assert.equal(f.jobs.get(f.state.analysisFunctionId).scheduledTime, firstStartedAt + 5 * MINUTE);
+  time.set(f.jobs.get(f.state.analysisFunctionId).scheduledTime);
+  await f.runScheduled(1);
+  assert.equal(f.state.analyzedGeneration, 2);
+  assert.ok((await recommendations.list.handler(f.ctx, {})).some(rec => rec.type === "delete_proxies"));
+});
+
+test("cleanup rule changes invalidate cached suggestions while retention and identical rules preserve them", async t => {
+  const time = clock(t), f = fixture(1, 0, scansOff);
+  f.state.scheduled = false;
+  useActualAnalysisConsumers(f);
+  successfulSession(f);
+  await requestScanAnalysis(f);
+  time.set(time.now + 1000);
+  await f.runScheduled(0);
+  assert.ok((await recommendations.list.handler(f.ctx, {})).some(rec => rec.type === "delete_cache"));
+  const firstStartedAt = f.state.lastRunAt;
+
+  await settings.update.handler(f.ctx, { retentionDays: 21 });
+  await settings.update.handler(f.ctx, { cleanupRules: { ...settings.DEFAULT_CLEANUP_RULES } });
+  assert.equal(f.state.catalogGeneration, 1);
+  assert.equal(catalogAnalysisIsCurrent(f.state), true);
+  await settings.update.handler(f.ctx, { cleanupRules: { ...settings.DEFAULT_CLEANUP_RULES, cacheDelete: false } });
+  assert.equal(f.state.catalogGeneration, 2);
+  assert.equal(catalogAnalysisIsCurrent(f.state), false);
+  assert.deepEqual(await recommendations.list.handler(f.ctx, {}), []);
+
+  time.set(time.now + 1000);
+  assert.equal((await requestScanAnalysis(f, successfulSession(f, "scanSessions:2"))).scheduled, true);
+  assert.equal(f.jobs.get(f.state.analysisFunctionId).scheduledTime, firstStartedAt + 5 * MINUTE);
+  time.set(f.jobs.get(f.state.analysisFunctionId).scheduledTime);
+  await f.runScheduled(1);
+  assert.equal(f.state.analyzedGeneration, 2);
+  assert.deepEqual(await recommendations.list.handler(f.ctx, {}), []);
+  await settings.update.handler(f.ctx, { cleanupRules: { ...settings.DEFAULT_CLEANUP_RULES, cacheDelete: false, proxyDelete: false } });
+  assert.equal(f.state.catalogGeneration, 3);
+});
+
+test("project creation and health changes fence analysis without invalidating unrelated statistics", async () => {
+  for (const missingState of [false, true]) {
+    const f = fixture(8, 8, scansOff);
+    Object.assign(f.state, { dirtyCount: 0, scheduled: false });
+    if (missingState) {
+      f.tables.analysisState.length = 0;
+      f.documents.delete(f.state._id);
+    }
+    const projectId = await projects.create.handler(f.ctx, {
+      name: "New project", client: "QA", ownerId: "qa", status: "delivered", tier: "hot",
+    });
+    const state = f.tables.analysisState[0];
+    assert.equal(state.catalogGeneration, missingState ? 1 : 9);
+    assert.equal(state.dirtyCount, 1);
+    assert.equal(catalogAnalysisIsCurrent(state), false);
+    assert.ok(f.documents.has(projectId));
+    assert.equal(f.reads.includes("files"), false);
+  }
+
+  const f = fixture(8, 8, scansOff), project = addProject(f, { status: "delivered" });
+  Object.assign(f.state, { dirtyCount: 0, scheduled: false });
+  const stats = { projectId: project._id, totalBytes: 100, duplicateBytes: 20, safeCleanupBytes: 30, riskyBytes: 5, storageHealthScore: 50 };
+  await projects.updateStats.handler(f.ctx, stats);
+  assert.equal(f.state.catalogGeneration, 8);
+  await projects.updateStats.handler(f.ctx, { ...stats, storageHealthScore: 80 });
+  assert.equal(f.state.catalogGeneration, 9);
+  assert.equal(f.state.dirtyCount, 1);
+});
+
+test("in-flight analysis cannot publish over project or cleanup rule changes and follows up after cooldown", async t => {
+  const time = clock(t);
+  for (const change of ["project", "rules"]) {
+    const f = fixture(5, 4, scansOff);
+    f.state.scheduled = false;
+    const project = addProject(f);
+    successfulSession(f);
+    await requestScanAnalysis(f);
+    time.set(time.now + 1000);
+    f.ctx.runAction = async reference => {
+      if (reference !== "generateRecommendations") return;
+      if (change === "project") await projects.updateStatus.handler(f.ctx, { projectId: project._id, status: "delivered" });
+      else await settings.update.handler(f.ctx, { cleanupRules: { ...settings.DEFAULT_CLEANUP_RULES, proxyDelete: false } });
+    };
+    await f.runScheduled(0);
+    assert.equal(f.state.catalogGeneration, 6);
+    assert.equal(f.state.analyzedGeneration, 4);
+    assert.equal(catalogAnalysisIsCurrent(f.state), false);
+    assert.deepEqual(await recommendations.list.handler(f.ctx, {}), []);
+    assert.equal(f.state.scanAnalysisFollowUps, 0);
+    assert.equal(f.scheduled.length, 2);
+    assert.equal(f.jobs.get(f.state.analysisFunctionId).scheduledTime, f.state.lastRunAt + 5 * MINUTE);
+    f.ctx.runAction = async () => {};
+    time.set(f.jobs.get(f.state.analysisFunctionId).scheduledTime);
+    await f.runScheduled(1);
+    assert.equal(f.state.analyzedGeneration, 6);
+    assert.equal(f.state.scheduled, false);
+    assert.equal(f.scheduled.length, 2);
+  }
+});
+
 test("scan analysis rejects unknown, foreign, other-machine and unfinished scan receipts", async () => {
   for (const patch of [{ _id: "scanSessions:missing" }, { tenantId: "tenant-other" }, { machineId: "machines:other" },
     { status: "failed" }, { status: "partial" }, { status: "running" }]) {
@@ -444,7 +717,7 @@ test("concurrent completed roots share one pending or current-generation running
 });
 
 test("catalog changes during explicit analysis get one bounded follow-up without another scan", async t => {
-  clock(t);
+  const time = clock(t);
   const f = fixture(3, 0, scansOff);
   f.state.scheduled = false;
   successfulSession(f);
@@ -459,10 +732,12 @@ test("catalog changes during explicit analysis get one bounded follow-up without
   await f.runScheduled(0);
   assert.equal(f.scheduled.length, 2);
   assert.equal(f.scheduled[1][1], "runManualAnalysis");
+  assert.equal(f.jobs.get(f.state.analysisFunctionId).scheduledTime, f.state.lastRunAt + 5 * MINUTE);
   assert.equal(f.state.scanAnalysisFollowUps, 0);
   assert.equal((await scansOff.analysisStatus.handler(f.ctx, {})).status, "queued");
   assert.equal(catalogAnalysisIsCurrent(f.state), false);
   f.ctx.runAction = async () => {};
+  time.set(f.jobs.get(f.state.analysisFunctionId).scheduledTime);
   await f.runScheduled(1);
   assert.equal(f.state.analyzedGeneration, 4);
   assert.equal(f.state.scanAnalysisResolvedVersion, 2);
