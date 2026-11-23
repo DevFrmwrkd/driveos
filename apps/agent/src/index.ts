@@ -89,7 +89,7 @@ interface FileMetadata {
   forceObservation?: boolean;
 }
 
-const AGENT_VERSION = "1.2.3";
+const AGENT_VERSION = "1.2.4";
 const ONE_MB = 1024 * 1024;
 // Metadata for sub-megabyte generic files costs more than the records are
 // worth and cache trees can contain millions of them. This floor is enforced

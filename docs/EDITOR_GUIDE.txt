@@ -128,9 +128,10 @@ and approve quarantine before they move.
 Delete and Empty expired require an admin to type DELETE.
 Expiry by itself does not permanently delete files.
 
-This flow requires the updated backend, dashboard, and agent.
-Existing 1.2.3 installers keep their previous scan behavior
-until an updated agent is released and installed.
+This flow requires the updated backend and dashboard plus
+DriveOS Agent 1.2.4 or later. Install it on each computer.
+Existing 1.2.3 installations keep their previous scan behavior
+until upgraded.
 
 TO LOG IN THE FIRST TIME:
    - Enter your email (the one your admin added for you).
