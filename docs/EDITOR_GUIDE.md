@@ -85,9 +85,9 @@ approve quarantine before anything moves. Cancel
 the confirmation to leave files in place. **Delete** and **Empty expired**
 require admin access and typing `DELETE`; expiry alone does not delete files.
 
-This combined flow requires the updated backend, dashboard, and agent. Existing
-1.2.3 installers keep their previous scan behavior until an updated agent is
-released and installed.
+This combined flow requires the updated backend and dashboard plus DriveOS Agent
+1.2.4 or later. Install the updated agent on each computer; existing 1.2.3
+installations keep their previous scan behavior until upgraded.
 
 To log in the first time: enter your **email** (the one your admin added) and
 **pick a password** — that becomes your password from then on.
