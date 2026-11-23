@@ -16,6 +16,7 @@ const internal = {
     .map(name => [name, name])),
   duplicates: { runDuplicateDetection: "runDuplicateDetection" },
   recommendations: { generateRecommendations: "generateRecommendations" },
+  files: { pageForAnalysis: "pageForAnalysis" },
 };
 function load(filename, cache = modules) {
   filename = path.resolve(filename);
@@ -100,7 +101,7 @@ function fixture(generation = 1, analyzedGeneration = 0, handlers = scans) {
   ctx.runQuery = async (reference, args) => handlers[reference].handler(ctx, args);
   ctx.runMutation = async (reference, args) => handlers[reference].handler(ctx, args);
   ctx.runAction = async () => {};
-  return { ctx, state, cluster, rec, live, deleted, session, reads, scheduled, jobs,
+  return { ctx, state, cluster, rec, live, deleted, session, tables, documents, reads, scheduled, jobs,
     setHandlers: next => { handlers = next; },
     async runScheduled(index) {
       const [, reference, args, id] = scheduled[index], job = jobs.get(id);
@@ -359,4 +360,227 @@ test("canceling an active owner cannot overlap another run, and an orphan remain
   const current = structuredClone(f.state);
   await scans.finishManualAnalysis.handler(f.ctx, { ...old[2], success: true, catalogGeneration: 1 });
   assert.deepEqual(f.state, current);
+});
+
+function successfulSession(f, id = f.session._id) {
+  const session = { ...f.session, _id: id, status: "completed", completedAt: Date.now(), analysisRequested: undefined };
+  if (id === f.session._id) Object.assign(f.session, session);
+  else f.tables.scanSessions.push(session);
+  f.documents.set(id, id === f.session._id ? f.session : session);
+  return id === f.session._id ? f.session : session;
+}
+function requestScanAnalysis(f, session = f.session, handlers = scansOff) {
+  return handlers.requestScanAnalysis.handler(f.ctx, {
+    tenantId: f.ctx.tenantId, machineId: "machines:1", sessionId: session._id,
+  });
+}
+
+test("explicit completed scans analyze empty and unchanged catalogs with automatic analysis disabled", async t => {
+  clock(t);
+  for (const empty of [false, true]) {
+    const f = fixture(0, 0, scansOff);
+    f.state.scheduled = false;
+    f.state.dirtyCount = 0;
+    if (empty) f.tables.files.length = 0;
+    successfulSession(f);
+    assert.equal((await requestScanAnalysis(f)).scheduled, true);
+    assert.equal((await scansOff.analysisStatus.handler(f.ctx, {})).status, "queued");
+    const calls = [];
+    f.ctx.runAction = async (reference, args) => {
+      calls.push(reference);
+      assert.equal((await scansOff.analysisStatus.handler(f.ctx, {})).status, "running");
+      assert.equal(args.maxFiles, 250000);
+    };
+    await f.runScheduled(0);
+    assert.deepEqual(calls, ["runDuplicateDetection", "generateRecommendations"]);
+    const status = await scansOff.analysisStatus.handler(f.ctx, {});
+    assert.equal(status.status, "completed");
+    assert.equal(status.catalogCurrent, true);
+    assert.equal(status.error, null);
+    assert.equal(status.completedAt, Date.now());
+    assert.equal(f.state.scheduled, false);
+    assert.equal(f.state.scanAnalysisResolvedVersion, 1);
+    assert.equal((await requestScanAnalysis(f)).status, "completed");
+    // A delayed receipt retry must not arm another run after catalog changes.
+    f.state.catalogGeneration++;
+    assert.equal((await requestScanAnalysis(f)).status, "stale");
+    assert.equal(f.scheduled.length, 1);
+  }
+});
+
+test("scan analysis rejects unknown, foreign, other-machine and unfinished scan receipts", async () => {
+  for (const patch of [{ _id: "scanSessions:missing" }, { tenantId: "tenant-other" }, { machineId: "machines:other" },
+    { status: "failed" }, { status: "partial" }, { status: "running" }]) {
+    const f = fixture(1, 0, scansOff);
+    f.state.scheduled = false;
+    successfulSession(f);
+    const args = { sessionId: f.session._id, tenantId: f.ctx.tenantId, machineId: "machines:1" };
+    if (patch._id) args.sessionId = patch._id;
+    else Object.assign(f.session, patch);
+    await assert.rejects(scansOff.requestScanAnalysis.handler(f.ctx, args), /Unknown scan|successfully completed/);
+    assert.equal(f.session.analysisRequested, undefined);
+    assert.equal(f.scheduled.length, 0);
+  }
+});
+
+test("concurrent completed roots share one pending or current-generation running analyzer", async t => {
+  clock(t);
+  for (const active of [false, true]) {
+    const f = fixture(2, 0, scansOff);
+    f.state.scheduled = false;
+    successfulSession(f);
+    const other = successfulSession(f, "scanSessions:2");
+    assert.equal((await requestScanAnalysis(f)).scheduled, true);
+    if (!active) assert.equal((await requestScanAnalysis(f, other)).scheduled, false);
+    else f.ctx.runAction = async reference => {
+      if (reference === "runDuplicateDetection") assert.equal((await requestScanAnalysis(f, other)).status, "running");
+    };
+    await f.runScheduled(0);
+    assert.equal(f.state.scanAnalysisRequestVersion, 2);
+    assert.equal(f.state.scanAnalysisResolvedVersion, 2);
+    assert.equal(f.state.scheduled, false);
+    assert.equal(f.scheduled.length, 1);
+  }
+});
+
+test("catalog changes during explicit analysis get one bounded follow-up without another scan", async t => {
+  clock(t);
+  const f = fixture(3, 0, scansOff);
+  f.state.scheduled = false;
+  successfulSession(f);
+  await requestScanAnalysis(f);
+  f.ctx.runAction = async reference => {
+    if (reference !== "runDuplicateDetection") return;
+    f.state.catalogGeneration++;
+    f.state.dirtyCount++;
+    const other = successfulSession(f, "scanSessions:2");
+    assert.equal((await requestScanAnalysis(f, other)).scheduled, false);
+  };
+  await f.runScheduled(0);
+  assert.equal(f.scheduled.length, 2);
+  assert.equal(f.scheduled[1][1], "runManualAnalysis");
+  assert.equal(f.state.scanAnalysisFollowUps, 0);
+  assert.equal((await scansOff.analysisStatus.handler(f.ctx, {})).status, "queued");
+  assert.equal(catalogAnalysisIsCurrent(f.state), false);
+  f.ctx.runAction = async () => {};
+  await f.runScheduled(1);
+  assert.equal(f.state.analyzedGeneration, 4);
+  assert.equal(f.state.scanAnalysisResolvedVersion, 2);
+  assert.equal(f.state.scheduled, false);
+  assert.equal(f.scheduled.length, 2);
+});
+
+test("continuous catalog churn stops explicit follow-ups with a visible stale result", async t => {
+  clock(t);
+  for (const handlers of [scansOff, scans]) {
+    const f = fixture(1, 0, handlers);
+    f.state.scheduled = false;
+    successfulSession(f);
+    await requestScanAnalysis(f, f.session, handlers);
+    f.ctx.runAction = async reference => { if (reference === "runDuplicateDetection") { f.state.catalogGeneration++; f.state.dirtyCount++; } };
+    await f.runScheduled(0);
+    await f.runScheduled(1);
+    assert.equal(f.scheduled.length, 2);
+    assert.equal(f.state.scheduled, false);
+    const status = await handlers.analysisStatus.handler(f.ctx, {});
+    assert.equal(status.status, "stale");
+    assert.equal(status.catalogCurrent, false);
+    assert.match(status.error, /catalog changed/i);
+    assert.equal((await requestScanAnalysis(f, f.session, handlers)).status, "stale");
+    assert.equal(f.scheduled.length, 2);
+  }
+});
+
+test("oversized explicit analysis fails visibly without unbounded automatic retries", async t => {
+  clock(t);
+  for (const handlers of [scansOff, scans]) {
+    const f = fixture(1, 0, handlers);
+    f.state.scheduled = false;
+    successfulSession(f);
+    await requestScanAnalysis(f, f.session, handlers);
+    const query = f.ctx.runQuery;
+    f.ctx.runQuery = async (reference, args) => reference === "pageForAnalysis"
+      ? { files: new Array(250001).fill(f.live), isDone: true, continueCursor: "end" }
+      : query(reference, args);
+    f.ctx.runAction = async (_reference, args) => {
+      assert.equal(args.maxFiles, 250000);
+      return duplicates.runDuplicateDetection.handler(f.ctx, args);
+    };
+    await assert.rejects(f.runScheduled(0), /exceeds the explicit analysis limit/);
+    const status = await handlers.analysisStatus.handler(f.ctx, {});
+    assert.equal(status.status, "failed");
+    assert.match(status.error, /250000/);
+    assert.equal(f.state.scheduled, false);
+    assert.equal(f.scheduled.length, 1);
+    assert.equal(f.state.scanAnalysisResolvedVersion, 1);
+    assert.equal(catalogAnalysisIsCurrent(f.state), false);
+    assert.equal((await requestScanAnalysis(f, f.session, handlers)).status, "failed");
+    assert.equal(f.scheduled.length, 1);
+  }
+});
+
+test("explicit scan analysis replaces a pending daily timer and fences its stale completion", async t => {
+  const time = clock(t), f = fixture(1, 0, scans);
+  f.state.scheduled = false;
+  f.state.lastRunAt = time.now;
+  await completeScan(f);
+  const old = f.scheduled[0];
+  successfulSession(f);
+  assert.equal((await requestScanAnalysis(f, f.session, scans)).scheduled, true);
+  assert.equal(f.jobs.get(old[3]).state.kind, "canceled");
+  assert.equal(f.scheduled[1][1], "runManualAnalysis");
+  const state = structuredClone(f.state);
+  await scans.recordAnalysisComplete.handler(f.ctx, { ...old[2], catalogGeneration: 1 });
+  assert.deepEqual(f.state, state);
+  const calls = [];
+  f.ctx.runAction = async (reference, args) => { calls.push(reference); assert.equal(args.maxFiles, 250000); };
+  await f.runScheduled(1);
+  assert.equal(f.state.scheduled, false);
+  assert.deepEqual(calls, ["runDuplicateDetection", "generateRecommendations"]);
+  assert.equal(f.scheduled.length, 2);
+});
+
+test("analysis status exposes stopped and missing scheduler owners without mutating state", async t => {
+  clock(t);
+  for (const kind of ["failed", "canceled", "success", "missing"]) {
+    const f = fixture(1, 0, scansOff);
+    f.state.scheduled = false;
+    successfulSession(f);
+    await requestScanAnalysis(f);
+    if (kind === "missing") f.jobs.delete(f.state.analysisFunctionId);
+    else f.jobs.get(f.state.analysisFunctionId).state = { kind };
+    const before = structuredClone(f.state);
+    const status = await scansOff.analysisStatus.handler(f.ctx, {});
+    assert.equal(status.status, "failed");
+    assert.equal(status.catalogCurrent, false);
+    assert.match(status.error, /worker stopped/);
+    assert.deepEqual(f.state, before);
+  }
+});
+
+test("a first empty scan creates its bounded analysis state without requiring existing catalog rows", async t => {
+  clock(t);
+  const f = fixture(0, 0, scansOff);
+  f.tables.analysisState.length = 0;
+  f.documents.delete(f.state._id);
+  f.tables.files.length = 0;
+  successfulSession(f);
+  assert.equal((await requestScanAnalysis(f)).status, "queued");
+  await f.runScheduled(0);
+  const status = await scansOff.analysisStatus.handler(f.ctx, {});
+  assert.equal(status.status, "completed");
+  assert.equal(status.catalogCurrent, true);
+  assert.equal(f.scheduled.length, 1);
+});
+
+test("releasing a disabled legacy automatic owner preserves a pending explicit scan intent", async t => {
+  clock(t);
+  const f = fixture(1, 0, scansOff);
+  Object.assign(f.state, { scanAnalysisRequestVersion: 1, scanAnalysisFollowUps: 1 });
+  assert.equal((await scansOff.claimAnalysisRun.handler(f.ctx, { tenantId: f.ctx.tenantId })).shouldRun, false);
+  assert.equal(f.scheduled.length, 1);
+  assert.equal(f.scheduled[0][1], "runManualAnalysis");
+  await f.runScheduled(0);
+  assert.equal(f.state.scheduled, false);
+  assert.equal(f.state.scanAnalysisResolvedVersion, 1);
 });

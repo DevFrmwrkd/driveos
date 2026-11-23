@@ -113,6 +113,15 @@ post("completeScan", async (ctx, body, machine) => {
   return { success: true };
 });
 
+post("requestScanAnalysis", async (ctx, body, machine) => {
+  if (typeof body?.sessionId !== "string" || !body.sessionId)
+    return json({ error: "A completed scan session is required for analysis." }, 400);
+  const result = await ctx.runMutation(internal.scans.requestScanAnalysis, {
+    sessionId: body.sessionId, tenantId: machine.tenantId, machineId: machine.machineId,
+  });
+  return { success: true, ...result };
+});
+
 post("uploadBatch", async (ctx, body, machine) => {
   if (!Array.isArray(body?.files) || body.files.length < 1 || body.files.length > 100) {
     return json({ error: "uploadBatch requires between 1 and 100 files." }, 400);

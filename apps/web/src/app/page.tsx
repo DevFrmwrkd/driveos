@@ -4,6 +4,8 @@ import React, { useState, useEffect, useRef, useCallback, Fragment } from "react
 import { DB } from "@/data";
 import { Icon } from "@/components/icons";
 import { Avatar, useToast } from "@/components/components";
+import { ScanAnalysisStatus } from "@/components/scan-analysis-status";
+import { scanRequestFeedback } from "@/lib/scan-analysis";
 import { useQuery, useMutation, Authenticated, Unauthenticated, AuthLoading } from "convex/react";
 import { useAuthActions } from "@convex-dev/auth/react";
 import { api } from "@/convexApi";
@@ -224,7 +226,7 @@ function TopBar({ go, route, requestScan, busy, memberId }: TopBarProps) {
         <button className="btn ghost icon" title="Notifications" onClick={() => go("settings")}>
           <Icon name="bell" size={17} />
         </button>
-        <button className="btn ghost icon" title="Request scans from all agents" disabled={busy || DB.drives.length === 0} onClick={() => void requestScan()}>
+        <button className="btn ghost icon" title="Scan & Analyze all tracked drives" disabled={busy || DB.drives.length === 0} onClick={() => void requestScan()}>
           <Icon name="refresh" size={16} />
         </button>
         <div style={{ width: 1, height: 22, background: "var(--line)" }} />
@@ -420,15 +422,16 @@ function Workspace() {
     setActionBusy(true);
     try {
       const result = await queueScan(driveId ? { driveId } : {});
-      push(result.queued ? "Queued " + result.queued + " scan request(s). Connected agents run them on their next poll." : "No tracked drives are available for scanning.", "refresh", result.queued ? "ok" : "warn");
-    } catch (error: any) { push(error?.data || error?.message || "Could not request a scan", "alert", "risk"); }
+      const feedback = scanRequestFeedback(result.queued);
+      push(feedback.message, "refresh", feedback.kind);
+    } catch (error: any) { push(error?.data || error?.message || "Could not queue Scan & Analyze", "alert", "risk"); }
     finally { setActionBusy(false); }
   }, [queueScan, push]);
   const requestAnalysis = useCallback(async () => {
     setActionBusy(true);
     try {
       const result = await queueAnalysis({});
-      push(result.message || (result.scheduled ? "Analysis queued" : "Analysis is already queued"), "cpu", "ok");
+      push(result.message || (result.scheduled ? "Analysis queued" : "Analysis was not queued"), "cpu", result.scheduled ? "accent" : "warn");
     } catch (error: any) { push(error?.data || error?.message || "Could not request analysis", "alert", "risk"); }
     finally { setActionBusy(false); }
   }, [queueAnalysis, push]);
@@ -490,6 +493,7 @@ function Workspace() {
       <div className="main">
         <TopBar go={go} route={route} requestScan={requestScan} busy={actionBusy} memberId={convexContext?.member?.email} />
         <div className="page" ref={pageRef}>
+          {!dataLoading && <ScanAnalysisStatus jobs={convexJobs || []} scans={convexScans || []} />}
           <div key={route.screen + (route.params.id || "")} className="fade-up">
             {dataLoading ? <div className="page-inner"><div className="card card-pad muted" role="status">Loading workspace…</div></div> : Screen ? <Screen {...props} /> : <Placeholder title={route.screen} />}
           </div>

@@ -24,9 +24,9 @@ YOUR FILES ARE SAFE:
    - DriveOS only looks at file INFO (names, sizes, dates).
      It NEVER uploads your actual videos or footage.
 
-   - It NEVER deletes anything on its own. When you clean up,
-     files are moved to a recoverable "quarantine" first.
-     Nothing is ever gone for good.
+   - Scanning and analysis do not move or delete files.
+     Quarantine needs your approval. An admin can permanently
+     delete files after typing DELETE; that cannot be undone.
 
    - It runs quietly in the background and checks about
      once an hour.
@@ -82,9 +82,11 @@ STEP 3: USING THE APP
 
 The main screen has a few simple buttons:
 
-   SCAN NOW
-      Check your drives right now, instead of waiting for
-      the hourly scan.
+   SCAN & ANALYZE
+      Scan tracked drives, tag files automatically, then find
+      duplicates and cleanup recommendations. Analysis starts
+      after all drives and scan passes finish successfully.
+      No separate analysis click or manual tagging is needed.
 
    ADD DRIVE
       Choose a folder or drive you want DriveOS to keep
@@ -114,8 +116,15 @@ Everything DriveOS finds also shows up on the DriveOS website.
 Your admin will give you the link and your login.
 
 There you can see drive space, duplicates, large files, and
-cleanup suggestions. It is safe to look around - nothing on
-the website can delete your files.
+cleanup suggestions. Browsing and analysis leave files alone.
+Scan & Analyze sends the combined request to the owning agent.
+Review selected files and approve quarantine before they move.
+Delete and Empty expired require an admin to type DELETE.
+Expiry by itself does not permanently delete files.
+
+This flow requires the updated backend, dashboard, and agent.
+Existing 1.2.3 installers keep their previous scan behavior
+until an updated agent is released and installed.
 
 TO LOG IN THE FIRST TIME:
    - Enter your email (the one your admin added for you).
@@ -136,8 +145,10 @@ A: Never. Only file info (names and sizes), never the
    actual videos.
 
 Q: Can it delete my files?
-A: No. Cleanup only moves files to a recoverable quarantine.
-   You can always restore them.
+A: Yes, after explicit admin confirmation. Quarantine allows
+   restore while the files remain available. Permanently
+   deleted files cannot be restored through DriveOS.
+   Scanning, automatic tags, and analysis never approve cleanup.
 
 Q: It says a drive isn't found. Is something broken?
 A: No. That just means a drive is unplugged. DriveOS skips

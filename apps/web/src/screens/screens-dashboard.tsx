@@ -360,7 +360,7 @@ function ActivityRail({ go }: ScreenProps) {
 // ============================================================
 function Dashboard({ go, toast, requestScan, actionBusy }: ScreenProps) {
   const actions = [
-    { label: "Scan Drive", icon: "refresh", onClick: () => void requestScan(), disabled: actionBusy || DB.drives.length === 0 },
+    { label: "Scan & Analyze", icon: "refresh", onClick: () => void requestScan(), disabled: actionBusy || DB.drives.length === 0 },
     { label: "Create Project", icon: "plus", primary: true, onClick: () => go("wizard") },
     { label: "Review Duplicates", icon: "copy", onClick: () => go("duplicates") },
     { label: "Clean Up Safely", icon: "broom", onClick: () => go("cleanup") },
@@ -376,7 +376,7 @@ function Dashboard({ go, toast, requestScan, actionBusy }: ScreenProps) {
           h("b", { className: "hi" }, (DB.drives || []).length + (DB.drives && DB.drives.length === 1 ? " drive" : " drives")), " and ",
           h("b", { className: "hi" }, (DB.projects || []).length + (DB.projects && DB.projects.length === 1 ? " project" : " projects")), ".")),
       h("div", { className: "page-head-actions" },
-        h("button", { className: "btn", disabled: actions[0].disabled, onClick: actions[0].onClick }, h(Icon, { name: "refresh", size: 15 }), "Scan Drive"),
+        h("button", { className: "btn", disabled: actions[0].disabled, onClick: actions[0].onClick }, h(Icon, { name: "refresh", size: 15 }), "Scan & Analyze"),
         h("button", { className: "btn primary", onClick: () => go("wizard") }, h(Icon, { name: "plus", size: 16 }), "Create Project"))),
 
     h("div", { className: "card card-pad", style: { display: "flex", gap: 10, marginBottom: 18, flexWrap: "wrap", alignItems: "center" } },

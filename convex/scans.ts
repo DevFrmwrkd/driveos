@@ -3,33 +3,56 @@ import { internalAction, internalMutation, internalQuery, mutation, query } from
 import { internal } from "./_generated/api";
 import { requireMember, requireRole } from "./access";
 import { analysisStateForTenant, canPublishAnalysis, catalogGeneration, catalogAnalysisIsCurrent,
-  analysisFollowUpDelay, ownsAnalysisRun, ANALYSIS_MIN_INTERVAL_MS } from "./catalogAnalysis";
+  analysisFollowUpDelay, hasRequestedScanAnalysis, ownsAnalysisRun, ANALYSIS_MIN_INTERVAL_MS } from "./catalogAnalysis";
 
 const configuredManualLimit = Number(process.env.DRIVEOS_MANUAL_ANALYSIS_MAX_FILES || 250000);
 const MANUAL_ANALYSIS_MAX_FILES = Math.min(1000000, Math.max(1000,
   Number.isFinite(configuredManualLimit) ? Math.floor(configuredManualLimit) : 250000));
 const MANUAL_ANALYSIS_COOLDOWN_MS = 5 * 60 * 1000;
+const SCAN_ANALYSIS_DEBOUNCE_MS = 1000;
 const AUTO_ANALYSIS_ENABLED = process.env.DRIVEOS_AUTO_ANALYSIS === "true";
 // A canceled action can still finish its running code. Keep that owner fenced
 // longer than Convex's maximum action duration before repairing an orphan.
 const ANALYSIS_OWNER_GRACE_MS = 60 * 60 * 1000;
 
-async function enqueueAnalysis(ctx: any, state: any, manual = false, context: any = {}) {
+async function enqueueAnalysis(ctx: any, state: any, manual = false, context: any = {}, scan = false) {
   const analysisRunId = (state.analysisRunId ?? 0) + 1;
-  const analysisFunctionId = await ctx.scheduler.runAfter(manual ? 0 : analysisFollowUpDelay(state.lastRunAt, Date.now()),
+  const analysisFunctionId = await ctx.scheduler.runAfter(scan ? SCAN_ANALYSIS_DEBOUNCE_MS : manual ? 0 : analysisFollowUpDelay(state.lastRunAt, Date.now()),
     manual ? internal.scans.runManualAnalysis : internal.scans.runPostScanAnalysis,
     { tenantId: state.tenantId, ...context, analysisRunId });
-  await ctx.db.patch(state._id, { scheduled: true, analysisRunId, analysisFunctionId, analysisClaimed: false });
+  await ctx.db.patch(state._id, { scheduled: true, analysisRunId, analysisFunctionId, analysisClaimed: false,
+    analysisMode: scan ? "scan" : manual ? "manual" : "automatic", analysisStatus: "queued", analysisError: undefined });
 }
 
-async function releaseAnalysis(ctx: any, state: any, patch: any = {}) {
+async function releaseAnalysis(ctx: any, state: any, patch: any = {}, options: { scanFollowUp?: boolean; suppressAutomatic?: boolean } = {}) {
   if (state.analysisFunctionId) {
     const job = await ctx.db.system.get(state.analysisFunctionId);
     if (job?.state.kind === "pending") await ctx.scheduler.cancel(state.analysisFunctionId);
   }
   const next = { ...state, ...patch, scheduled: false, analysisFunctionId: undefined, analysisClaimed: false };
   await ctx.db.patch(state._id, { ...patch, scheduled: false, analysisFunctionId: undefined, analysisClaimed: false });
-  if (AUTO_ANALYSIS_ENABLED && next.dirtyCount > 0) await enqueueAnalysis(ctx, next);
+  if (options.scanFollowUp || (!options.suppressAutomatic && hasRequestedScanAnalysis(next)))
+    await enqueueAnalysis(ctx, next, true, {}, true);
+  else if (!options.suppressAutomatic && AUTO_ANALYSIS_ENABLED && next.dirtyCount > 0) await enqueueAnalysis(ctx, next);
+}
+
+// An explicit scan can share an in-flight analyzer. Only a current generation
+// satisfies that intent; catalog churn gets one bounded follow-up, not a loop.
+async function finishAnalysis(ctx: any, state: any, success: boolean, generation?: number, error?: string, patch: any = {}) {
+  const current = success && canPublishAnalysis(state, generation);
+  const requested = hasRequestedScanAnalysis(state);
+  const common = { ...patch, ...(current ? { dirtyCount: 0, analyzedGeneration: generation } : {}),
+    analysisStatus: current ? "completed" : success ? "stale" : "failed",
+    analysisError: current ? undefined : success ? "The catalog changed during analysis. Run Scan & Analyze again to refresh the results." : error || "Analysis failed. Try analysis again.",
+    analysisCompletedAt: Date.now() };
+  if (requested && success && !current && (state.scanAnalysisFollowUps ?? 0) > 0) {
+    await releaseAnalysis(ctx, state, { ...common, scanAnalysisFollowUps: state.scanAnalysisFollowUps - 1 }, { scanFollowUp: true });
+    return { current, followingUp: true };
+  }
+  await releaseAnalysis(ctx, state, { ...common,
+    ...(requested ? { scanAnalysisResolvedVersion: state.scanAnalysisRequestVersion } : {}) },
+  { suppressAutomatic: requested || state.analysisMode === "scan" });
+  return { current, followingUp: false };
 }
 
 // A pending canceled/failed job must not leave the public manual action locked
@@ -47,9 +70,25 @@ async function recoverAnalysisOwner(ctx: any, state: any): Promise<{ state: any;
     return { state, active: true };
   }
   const patch = { scheduled: false, analysisFunctionId: undefined, analysisClaimed: false,
-    dirtyCount: !catalogAnalysisIsCurrent(state) ? Math.max(1, state.dirtyCount) : state.dirtyCount };
+    dirtyCount: !catalogAnalysisIsCurrent(state) ? Math.max(1, state.dirtyCount) : state.dirtyCount,
+    analysisStatus: "failed" as const, analysisError: "The previous analysis worker stopped before it finished. Run analysis again.",
+    ...(hasRequestedScanAnalysis(state) ? { scanAnalysisResolvedVersion: state.scanAnalysisRequestVersion } : {}) };
   await ctx.db.patch(state._id, patch);
   return { state: { ...state, ...patch }, active: false };
+}
+
+async function analysisStatusForState(ctx: any, state: any) {
+  const current = catalogAnalysisIsCurrent(state);
+  const job = state?.analysisFunctionId ? await ctx.db.system.get(state.analysisFunctionId) : null;
+  const stopped = state?.scheduled && (job ? ["failed", "canceled", "success"].includes(job.state.kind)
+    : state.analysisFunctionId || state.lastRunAt + ANALYSIS_OWNER_GRACE_MS <= Date.now());
+  const status = stopped ? "failed" : state?.scheduled ? state.analysisClaimed ? "running" : "queued"
+    : state?.analysisStatus === "completed" && !current ? "stale" : state?.analysisStatus ?? (current ? "idle" : "stale");
+  return { status, catalogCurrent: current, lastRunAt: state?.lastRunAt || null,
+    completedAt: state?.analysisCompletedAt ?? null,
+    error: stopped ? "The analysis worker stopped before it finished. Run analysis again."
+      : state?.analysisError ?? (status === "stale" ? "The catalog has changed since the last analysis." : null),
+    maxFiles: MANUAL_ANALYSIS_MAX_FILES };
 }
 
 // Explicit dashboard requests never enable the expensive automatic scanner.
@@ -76,6 +115,60 @@ export const requestAnalysis = mutation({
   },
 });
 
+// This is reached only through the authenticated agent HTTP route after an
+// explicit scan/cycle succeeds. Background scans never call this endpoint.
+export const requestScanAnalysis = internalMutation({
+  args: { sessionId: v.string(), tenantId: v.optional(v.string()), machineId: v.string() },
+  handler: async (ctx, args) => {
+    const tenantId = args.tenantId || "";
+    const id = ctx.db.normalizeId("scanSessions", args.sessionId);
+    const session = id ? await ctx.db.get(id) : null;
+    if (!tenantId || !session || session.tenantId !== tenantId || session.machineId !== args.machineId)
+      throw new ConvexError("Unknown scan session for this machine.");
+    if (session.status !== "completed") throw new ConvexError("Analysis requires a successfully completed scan.");
+    if (session.analysisRequested) {
+      const previous = await analysisStatusForState(ctx, await analysisStateForTenant(ctx, tenantId));
+      return { scheduled: false, status: previous.status, message: previous.status === "failed" || previous.status === "stale"
+        ? previous.error || "The previous analysis did not finish. Run analysis again."
+        : previous.status === "completed" ? "Analysis for this scan is already complete."
+          : "Analysis was already requested for this scan." };
+    }
+    const owner = await recoverAnalysisOwner(ctx, await analysisStateForTenant(ctx, tenantId));
+    let state = owner.state;
+    if (!state) {
+      const value = { tenantId, dirtyCount: 0, scheduled: false, lastRunAt: 0 };
+      state = { ...value, _id: await ctx.db.insert("analysisState", value) };
+    }
+    const patch = { scanAnalysisRequestVersion: (state.scanAnalysisRequestVersion ?? 0) + 1,
+      scanAnalysisFollowUps: 1, analysisError: undefined };
+    await ctx.db.patch(session._id, { analysisRequested: true });
+    await ctx.db.patch(state._id, patch);
+    state = { ...state, ...patch };
+    if (owner.active) {
+      const job: any = state.analysisFunctionId ? await ctx.db.system.get(state.analysisFunctionId) : null;
+      // A daily automatic timer must not make an explicit user request wait
+      // until tomorrow. A claimed owner, however, remains strictly fenced.
+      if (job?.state.kind === "pending" && !state.analysisClaimed && job.name.endsWith(":runPostScanAnalysis")) {
+        await ctx.scheduler.cancel(state.analysisFunctionId);
+        await enqueueAnalysis(ctx, state, true, {}, true);
+        return { scheduled: true, status: "queued", message: "Scan completed. Duplicate and cleanup analysis queued." };
+      }
+      return { scheduled: false, status: (await analysisStatusForState(ctx, state)).status,
+        message: "Scan completed. Analysis is already queued or running." };
+    }
+    await enqueueAnalysis(ctx, state, true, {}, true);
+    return { scheduled: true, status: "queued", message: "Scan completed. Duplicate and cleanup analysis queued." };
+  },
+});
+
+export const analysisStatus = query({
+  args: {},
+  handler: async (ctx) => {
+    const { tenantId } = await requireMember(ctx);
+    return analysisStatusForState(ctx, await analysisStateForTenant(ctx, tenantId));
+  },
+});
+
 export const captureAnalysisGeneration = internalQuery({
   args: { tenantId: v.string(), analysisRunId: v.optional(v.number()) },
   handler: async (ctx, args) => {
@@ -89,7 +182,7 @@ export const claimManualAnalysisRun = internalMutation({
   handler: async (ctx, args) => {
     const state = await analysisStateForTenant(ctx, args.tenantId);
     if (!ownsAnalysisRun(state, args.analysisRunId) || state.analysisClaimed) return null;
-    await ctx.db.patch(state._id, { analysisClaimed: true, lastRunAt: Date.now() });
+    await ctx.db.patch(state._id, { analysisClaimed: true, analysisStatus: "running", lastRunAt: Date.now() });
     return catalogGeneration(state);
   },
 });
@@ -117,11 +210,12 @@ export const finishManualAnalysis = internalMutation({
   handler: async (ctx, args) => {
     const state = await analysisStateForTenant(ctx, args.tenantId);
     if (!ownsAnalysisRun(state, args.analysisRunId)) return;
-    const current = args.success && canPublishAnalysis(state, args.catalogGeneration);
-    await releaseAnalysis(ctx, state, current ? { dirtyCount: 0, analyzedGeneration: args.catalogGeneration } : {});
+    const { current, followingUp } = await finishAnalysis(ctx, state, args.success, args.catalogGeneration, args.error);
     await ctx.db.insert("auditLogs", { tenantId: args.tenantId, action: args.success ? "analysis_complete" : "analysis_failed",
       entityType: "analysis", message: args.success
-        ? current ? "Duplicate detection and cleanup analysis completed." : "Analysis finished after the catalog changed; cached results remain hidden. Run analysis again."
+        ? current ? "Duplicate detection and cleanup analysis completed." : followingUp
+          ? "The catalog changed during analysis; one bounded follow-up is queued."
+          : "Analysis finished after the catalog changed; cached results remain hidden. Run analysis again."
         : `Analysis failed: ${args.error}`, createdAt: Date.now() });
   },
 });
@@ -284,6 +378,7 @@ export const claimAnalysisRun = internalMutation({
       scheduled: true,
       analysisRunId: state.analysisRunId ?? 1,
       analysisClaimed: true,
+      analysisStatus: "running",
       dirtyCount: 0,
       lastRunAt: now,
     });
@@ -292,14 +387,14 @@ export const claimAnalysisRun = internalMutation({
 });
 
 export const restoreAnalysisAfterFailure = internalMutation({
-  args: { tenantId: v.string(), claimedDirtyCount: v.number(), analysisRunId: v.optional(v.number()) },
+  args: { tenantId: v.string(), claimedDirtyCount: v.number(), analysisRunId: v.optional(v.number()), error: v.optional(v.string()) },
   handler: async (ctx, args) => {
     const state = await ctx.db
       .query("analysisState")
       .withIndex("by_tenant", (q) => q.eq("tenantId", args.tenantId))
       .first();
     if (!state || !ownsAnalysisRun(state, args.analysisRunId)) return;
-    await releaseAnalysis(ctx, state, { dirtyCount: state.dirtyCount + args.claimedDirtyCount });
+    await finishAnalysis(ctx, state, false, undefined, args.error, { dirtyCount: state.dirtyCount + args.claimedDirtyCount });
   },
 });
 
@@ -335,6 +430,7 @@ export const runPostScanAnalysis = internalAction({
         tenantId: args.tenantId,
         claimedDirtyCount: claim.claimedDirtyCount,
         analysisRunId: claim.analysisRunId,
+        error: String(err),
       });
       throw err;
     }
@@ -353,8 +449,7 @@ export const recordAnalysisComplete = internalMutation({
   handler: async (ctx, args) => {
     const state = await analysisStateForTenant(ctx, args.tenantId || "");
     if (!ownsAnalysisRun(state, args.analysisRunId)) return;
-    const current = canPublishAnalysis(state, args.catalogGeneration);
-    await releaseAnalysis(ctx, state, current ? { analyzedGeneration: args.catalogGeneration } : {});
+    const { current, followingUp } = await finishAnalysis(ctx, state, true, args.catalogGeneration);
     await ctx.db.insert("auditLogs", {
       tenantId: args.tenantId || "",
       machineId: args.machineId,
@@ -362,7 +457,8 @@ export const recordAnalysisComplete = internalMutation({
       entityType: "scanSession",
       entityId: args.scanSessionId,
       message: current ? "Auto-ran duplicate detection and recommendations after scan."
-        : "Catalog changed during automatic analysis; cached results remain hidden until analysis runs again.",
+        : followingUp ? "The catalog changed during analysis; one bounded follow-up is queued."
+          : "Catalog changed during automatic analysis; cached results remain hidden until analysis runs again.",
       createdAt: Date.now(),
     });
   },

@@ -5,10 +5,16 @@ interface CatalogAnalysisState {
   scheduled?: boolean;
   analysisRunId?: number;
   analysisFunctionId?: string;
+  scanAnalysisRequestVersion?: number;
+  scanAnalysisResolvedVersion?: number;
 }
 
 export const ANALYSIS_DEBOUNCE_MS = 5 * 60 * 1000;
 export const ANALYSIS_MIN_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+export function hasRequestedScanAnalysis(state: CatalogAnalysisState | null | undefined): boolean {
+  return (state?.scanAnalysisRequestVersion ?? 0) > (state?.scanAnalysisResolvedVersion ?? 0);
+}
 
 export function analysisFollowUpDelay(lastRunAt: number, now: number): number {
   return Math.max(ANALYSIS_DEBOUNCE_MS, lastRunAt + ANALYSIS_MIN_INTERVAL_MS - now);

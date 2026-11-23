@@ -92,12 +92,19 @@ export async function scanNow(): Promise<{ ok: boolean; message: string }> {
   const { stdout, stderr, code } = await runAgent(["scan-now"], 2 * 60 * 60 * 1000);
   const lines = `${stdout}\n${stderr}`.split("\n").map(line => line.trim()).filter(Boolean);
   const finalCycle = lines.filter(line => /^\[Sync Cycle (Complete|Partial)\]/.test(line)).pop();
-  if (code === 0 && finalCycle?.startsWith("[Sync Cycle Complete]")) {
-    return { ok: true, message: finalCycle };
+  const analysisQueued = lines.filter(line => /^\[Analysis Queued\]/.test(line)).pop();
+  const analysisFailed = lines.filter(line => /^\[Analysis Failed\]/.test(line)).pop();
+  if (code === 0 && finalCycle?.startsWith("[Sync Cycle Complete]") && analysisQueued && !analysisFailed) {
+    return { ok: true, message: `${finalCycle}\n${analysisQueued}` };
   }
   const partial = finalCycle?.startsWith("[Sync Cycle Partial]") ? finalCycle : undefined;
+  if (partial) return { ok: false, message: partial };
+  if (analysisFailed) return { ok: false, message: analysisFailed };
+  if (code === 0 && finalCycle?.startsWith("[Sync Cycle Complete]")) {
+    return { ok: false, message: "Scan completed, but analysis was not confirmed. Check Recent activity or try Scan & Analyze again." };
+  }
   const reason = lines.filter(line => /failed|\berror\b|paused|No folders are being tracked|already running|unavailable|Unauthorized/i.test(line)).pop();
-  return { ok: false, message: partial || reason || (code !== 0
+  return { ok: false, message: reason || (code !== 0
     ? "Scan failed or was interrupted. Check Recent activity for details."
     : "Scan did not complete. Check Recent activity for details.") };
 }

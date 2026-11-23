@@ -114,6 +114,9 @@ export default defineSchema({
     bytesScanned: v.number(),
     errorsCount: v.number(),
     agentVersion: v.string(),
+    // Receipt for an explicit scan-and-analyze request. Retried transport must
+    // not arm another analyzer for the same successful scan.
+    analysisRequested: v.optional(v.boolean()),
   }).index("by_tenant", ["tenantId"]),
 
   // One row per tenant: gates the expensive post-scan analysis (duplicate
@@ -127,6 +130,13 @@ export default defineSchema({
     analysisRunId: v.optional(v.number()),
     analysisFunctionId: v.optional(v.id("_scheduled_functions")),
     analysisClaimed: v.optional(v.boolean()),
+    analysisMode: v.optional(v.union(v.literal("manual"), v.literal("scan"), v.literal("automatic"))),
+    analysisStatus: v.optional(v.union(v.literal("queued"), v.literal("running"), v.literal("completed"), v.literal("failed"), v.literal("stale"))),
+    analysisError: v.optional(v.string()),
+    analysisCompletedAt: v.optional(v.number()),
+    scanAnalysisRequestVersion: v.optional(v.number()),
+    scanAnalysisResolvedVersion: v.optional(v.number()),
+    scanAnalysisFollowUps: v.optional(v.number()),
     dirtyCount: v.number(), // files inserted/materially changed since last run
     scheduled: v.boolean(), // an analysis run is already queued
     lastRunAt: v.number(), // when analysis last STARTED (0 = never)

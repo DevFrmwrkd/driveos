@@ -22,7 +22,8 @@ test("real one-shot CLI commands exit naturally and reject unfinished redirect r
   const children = new Set<ChildProcess>();
   const catalogs = new Map<string, Map<string, any>>();
   const driveIds = new Map<string, string>();
-  const completed: { driveId: string; status: string }[] = [];
+  const completed: { sessionId: string; driveId: string; status: string }[] = [];
+  const analysisRequests: { sessionId: string; completedCount: number }[] = [];
   const sessions = new Map<string, string>();
   const failures: string[] = [];
   let sessionSequence = 0;
@@ -99,8 +100,13 @@ test("real one-shot CLI commands exit naturally and reject unfinished redirect r
         return json(200, { success: true, receipts });
       }
       if (endpoint === "/api/completeScan") {
-        completed.push({ driveId: sessions.get(payload.sessionId)!, status: payload.status });
+        completed.push({ sessionId: payload.sessionId, driveId: sessions.get(payload.sessionId)!, status: payload.status });
         return json(200, { success: true });
+      }
+      if (endpoint === "/api/requestScanAnalysis") {
+        assert.ok(completed.some(scan => scan.sessionId === payload.sessionId && scan.status === "completed"), "Analysis must follow an acknowledged successful scan.");
+        analysisRequests.push({ sessionId: payload.sessionId, completedCount: completed.length });
+        return json(200, { success: true, message: "Duplicate and cleanup analysis queued. File operations require approval." });
       }
       if (endpoint === "/api/pollPendingJobs") return json(200, queuedScanJob && ["approved", "queued", "running"].includes(queuedScanJob.status) ? [queuedScanJob] : []);
       if (endpoint === "/api/updateJobStatus") {
@@ -207,6 +213,55 @@ test("real one-shot CLI commands exit naturally and reject unfinished redirect r
       const once = await agent(home, args);
       assert.equal(once.code, 0, once.output); assert.match(once.output, /Sync Cycle Complete/); assertUnlocked(home); assertMetadata("normal");
     }
+  });
+
+  await t.test("one explicit cycle queues analysis once after every root and progressive pass, while scheduled scans stay scan-only", async () => {
+    const home = await initialize("scan-analysis"), configPath = path.join(home, "driveos-config.json");
+    const secondRoot = path.join(root, "second-root"); fs.mkdirSync(secondRoot);
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    fs.writeFileSync(configPath, JSON.stringify({ ...config, scanRoots: [path.dirname(media), secondRoot] }));
+    const beforeRequests = analysisRequests.length, beforeCompleted = completed.length;
+    const result = await agent(home, ["scan-now"]);
+    assert.equal(result.code, 0, result.output);
+    assert.equal(completed.length, beforeCompleted + 4, "Both roots must finish both progressive passes.");
+    assert.equal(analysisRequests.length, beforeRequests + 1);
+    assert.equal(analysisRequests.at(-1)!.completedCount, beforeCompleted + 4);
+    assert.equal(analysisRequests.at(-1)!.sessionId, completed.at(-1)!.sessionId);
+    assert.match(result.output, /\[Analysis Queued\]/);
+    assert.ok(result.output.indexOf("[Analysis Queued]") > result.output.indexOf("[Sync Cycle Complete]"));
+    assertUnlocked(home);
+    const scheduled = await agent(home, ["sync", "--once"]);
+    assert.equal(scheduled.code, 0, scheduled.output);
+    assert.equal(analysisRequests.length, beforeRequests + 1, "Background scheduling must not enable explicit analysis.");
+    assert.doesNotMatch(scheduled.output, /\[Analysis Queued\]/);
+  });
+
+  for (const status of [500, 307, 429]) {
+    await t.test(`analysis request HTTP ${status} is visible and unsuccessful after a completed scan`, async () => {
+      const name = `analysis-request-${status}`, home = await initialize(name);
+      if (status === 307) redirectEndpoint = "/api/requestScanAnalysis";
+      else { failureEndpoint = "/api/requestScanAnalysis"; failureStatus = status; }
+      let result;
+      try { result = await agent(home, ["scan-now", "--full-hash"]); }
+      finally { redirectEndpoint = undefined; failureEndpoint = undefined; }
+      assert.equal(result.code, 1, result.output);
+      assert.match(result.output, /\[Sync Cycle Complete\]/);
+      assert.match(result.output, /\[Analysis Failed\]/);
+      assert.doesNotMatch(result.output, /\[Analysis Queued\]/);
+      assertMetadata(name); assertUnlocked(home);
+      const retry = await agent(home, ["scan-now"]);
+      assert.equal(retry.code, 0, retry.output); assert.match(retry.output, /\[Analysis Queued\]/);
+    });
+  }
+
+  await t.test("missing explicit roots remain partial and never queue analysis on an incomplete cycle", async () => {
+    const home = await initialize("missing-analysis-root"), configPath = path.join(home, "driveos-config.json");
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    fs.writeFileSync(configPath, JSON.stringify({ ...config, scanRoots: [...config.scanRoots, path.join(root, "not-mounted")] }));
+    const beforeRequests = analysisRequests.length;
+    const result = await agent(home, ["scan-now"]);
+    assert.equal(result.code, 1, result.output); assert.match(result.output, /\[Sync Cycle Partial\]/);
+    assert.equal(analysisRequests.length, beforeRequests); assertUnlocked(home);
   });
 
   await t.test("completeScan redirect exits unsuccessfully without following or inventing scan completion, then releases its lock", async () => {

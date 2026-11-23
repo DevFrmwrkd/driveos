@@ -38,7 +38,7 @@ function bridge(reply) {
 
 test("desktop scan accepts only a successful final cycle, not an individual root", async () => {
   for (const [stdout, error, ok] of [
-    ["[Scan Complete] root — errors: 0\n[Sync Cycle Complete] 1 file(s) — 1 uploaded", null, true],
+    ["[Scan Complete] root — errors: 0\n[Sync Cycle Complete] 1 file(s) — 1 uploaded\n[Analysis Queued] Automatic analysis will run after scanning.", null, true],
     ["[Scan Complete] root — errors: 1\n[Sync Cycle Partial] 1 file(s) — errors: 1", { code: 1 }, false],
     ["[Scan Complete] root — errors: 0\n[Sync Cycle Partial] Upload budget exhausted; errors: 0", { code: 1 }, false],
     ["[Sync Cycle Complete] old cycle\n[Sync Cycle Partial] final cycle", null, false],
@@ -48,7 +48,11 @@ test("desktop scan accepts only a successful final cycle, not an individual root
     const result = await agent.scanNow();
     assert.equal(result.ok, ok, stdout);
     if (stdout.includes("[Sync Cycle Partial]")) assert.match(result.message, /^\[Sync Cycle Partial\]/);
-    if (ok) assert.match(result.message, /^\[Sync Cycle Complete\]/);
+    if (ok) {
+      assert.match(result.message, /^\[Sync Cycle Complete\]/);
+      assert.match(result.message, /\[Analysis Queued\]/);
+      assert.doesNotMatch(result.message, /Analysis complete/i);
+    }
     assert.equal(calls[0].args.at(-1), "scan-now");
     assert.equal(calls[0].options.timeout, 2 * 60 * 60 * 1000);
   }
@@ -60,7 +64,7 @@ for (const [reason, error] of [
   ["output limit", { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }],
 ]) {
   test(`desktop scan rejects ${reason} even after completion output`, async () => {
-    const { agent } = bridge({ stdout: "[Scan Complete] one root — errors: 0\n[Sync Cycle Complete] all roots", error });
+    const { agent } = bridge({ stdout: "[Scan Complete] one root — errors: 0\n[Sync Cycle Complete] all roots\n[Analysis Queued] Waiting for the worker.", error });
     const result = await agent.scanNow();
     assert.equal(result.ok, false);
     assert.match(result.message, /failed|interrupted/i);
@@ -125,14 +129,14 @@ test("scan result is live, remains pending until completion, and displays partia
   const pending = ui.click();
   assert.equal(ui.elements.get("scan-btn").disabled, true);
   assert.equal(ui.elements.get("scan-btn").textContent, "Scanning…");
-  assert.equal(ui.elements.get("scan-msg").textContent, "Scanning…");
+  assert.equal(ui.elements.get("scan-msg").textContent, "Scanning files. Analysis will be queued after the scan succeeds.");
   await Promise.resolve();
   assert.equal(ui.elements.get("scan-btn").disabled, true);
   const message = "[Sync Cycle Partial] 1 root failed; 0 uploaded.";
   finish({ ok: false, message });
   await pending;
   assert.equal(ui.elements.get("scan-btn").disabled, false);
-  assert.equal(ui.elements.get("scan-btn").textContent, "Scan Now");
+  assert.equal(ui.elements.get("scan-btn").textContent, "Scan & Analyze");
   assert.equal(ui.elements.get("scan-msg").textContent, message);
   assert.equal(ui.elements.get("scan-msg").className, "msg err");
 });
@@ -141,7 +145,7 @@ test("scan IPC rejection is visible and always resets the button", async () => {
   const ui = renderer(async () => { throw new Error("The agent IPC connection closed."); });
   await ui.click();
   assert.equal(ui.elements.get("scan-btn").disabled, false);
-  assert.equal(ui.elements.get("scan-btn").textContent, "Scan Now");
+  assert.equal(ui.elements.get("scan-btn").textContent, "Scan & Analyze");
   assert.match(ui.elements.get("scan-msg").textContent, /failed.*IPC connection closed/i);
   assert.equal(ui.elements.get("scan-msg").className, "msg err");
 });
@@ -157,7 +161,7 @@ test("scan errors stay visible through a status IPC outage and periodic retries,
   assert.equal(ui.elements.get("s-machine").textContent, "initial");
   await ui.click();
   const message = ui.elements.get("scan-msg").textContent;
-  assert.match(message, /Scan failed.*IPC connection closed/i);
+  assert.match(message, /Scan & Analyze failed.*IPC connection closed/i);
   assert.equal(ui.elements.get("scan-btn").disabled, false);
   assert.equal(ui.elements.get("status-view").classList.contains("hidden"), false);
   assert.equal(ui.elements.get("connect-view").classList.contains("hidden"), true);
@@ -179,9 +183,32 @@ test("an unavailable initial status preserves the disconnected HTML view", async
 });
 
 test("successful scans display the completion message and clear the pending state", async () => {
-  const ui = renderer(async () => ({ ok: true, message: "[Sync Cycle Complete] 1 file uploaded." }));
+  const message = "[Sync Cycle Complete] 1 file uploaded.\n[Analysis Queued] Waiting for the worker.";
+  const ui = renderer(async () => ({ ok: true, message }));
   await ui.click();
   assert.equal(ui.elements.get("scan-btn").disabled, false);
   assert.equal(ui.elements.get("scan-msg").className, "msg ok");
-  assert.equal(ui.elements.get("scan-msg").textContent, "[Sync Cycle Complete] 1 file uploaded.");
+  assert.equal(ui.elements.get("scan-msg").textContent, message);
+  assert.doesNotMatch(ui.elements.get("scan-msg").textContent, /Analysis complete/i);
+});
+
+test("desktop Scan & Analyze requires analysis acknowledgment after a complete scan", async () => {
+  const { agent } = bridge({ stdout: "[Sync Cycle Complete] All files scanned." });
+  const result = await agent.scanNow();
+  assert.equal(result.ok, false);
+  assert.match(result.message, /Scan completed.*analysis was not confirmed/);
+});
+
+test("desktop Scan & Analyze reports analysis failure and never hides a partial scan", async () => {
+  for (const code of [0, 1]) {
+    const { agent } = bridge({ stdout: "[Sync Cycle Complete] All files scanned.",
+      stderr: "[Analysis Failed] Backend is unavailable; retry Scan & Analyze.", error: code ? { code } : null });
+    const result = await agent.scanNow();
+    assert.equal(result.ok, false);
+    assert.match(result.message, /^\[Analysis Failed\]/);
+  }
+  const { agent } = bridge({ stdout: "[Sync Cycle Partial] One root failed.\n[Analysis Queued] Worker pending." });
+  const result = await agent.scanNow();
+  assert.equal(result.ok, false);
+  assert.match(result.message, /^\[Sync Cycle Partial\]/);
 });

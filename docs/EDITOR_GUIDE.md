@@ -13,8 +13,9 @@ clean up** — without anyone having to dig through folders manually.
 **Important — your files are safe:**
 - DriveOS only looks at file **info** (names, sizes, dates). It **never uploads
   your actual videos or footage.**
-- It **never deletes anything** on its own. Cleanup always moves files to a
-  recoverable "quarantine" first — nothing is gone for good.
+- Scanning and analysis **do not move or delete files**. Quarantine requires
+  explicit approval. An admin can permanently delete approved files after
+  typing `DELETE`; permanent deletion cannot be undone.
 - It runs quietly in the background and checks about **once an hour**.
 
 ---
@@ -48,7 +49,7 @@ That's it — you're set up. It now scans automatically every hour.
 
 | Button | What it does |
 |--------|--------------|
-| **Scan Now** | Checks your drives right now instead of waiting for the hourly scan. |
+| **Scan & Analyze** | Scans tracked drives, tags files automatically, then generates duplicate results and cleanup recommendations. No separate analysis click is needed. |
 | **Add drive…** | Pick a folder or drive you want DriveOS to keep track of. |
 | **Pause / Resume** | Temporarily stop the hourly scans (e.g. during a big render). Resume when ready. |
 | **Start automatically at login** | Tick this so DriveOS opens by itself when you turn on your computer. |
@@ -59,6 +60,11 @@ The screen also shows:
 - **Tracked folders** — the drives/folders it's watching
 - **Recent activity** — a plain-language log of what it's been doing
 
+Keep the agent running and the drives connected. Analysis starts after every
+drive and scan pass finishes successfully. A partial scan or failed analysis
+shows an error instead of claiming the whole flow completed. Background scans
+continue on their existing schedule; they do not enable automatic cleanup.
+
 ---
 
 ## The dashboard (website)
@@ -66,6 +72,16 @@ The screen also shows:
 Everything DriveOS finds shows up on the **web dashboard** (your admin will give
 you the link and your login). There you can see drive space, duplicates, large
 files, and cleanup suggestions — all read-only and safe to browse.
+
+The dashboard's **Scan & Analyze** button sends the same combined request to the
+owning computer. Once analysis completes, review Cleanup or Duplicate Center.
+Confirm the selected files and approve quarantine before anything moves. Cancel
+the confirmation to leave files in place. **Delete** and **Empty expired**
+require admin access and typing `DELETE`; expiry alone does not delete files.
+
+This combined flow requires the updated backend, dashboard, and agent. Existing
+1.2.3 installers keep their previous scan behavior until an updated agent is
+released and installed.
 
 To log in the first time: enter your **email** (the one your admin added) and
 **pick a password** — that becomes your password from then on.
@@ -80,8 +96,9 @@ background. You can **Pause** it anytime.
 **Will it upload my footage?** Never. Only file info (names/sizes), never the
 videos themselves.
 
-**Can it delete my files?** No. Cleanup only moves files to a recoverable
-quarantine — you can always restore them.
+**Can it delete my files?** Yes, after explicit admin confirmation. Quarantined
+files can be restored while still available; permanently deleted files cannot.
+Scanning, automatic tagging, and analysis never approve cleanup on your behalf.
 
 **It says the drive isn't found?** That just means a drive is unplugged. DriveOS
 skips it safely and keeps the last info it had. Plug it back in and it resumes.
