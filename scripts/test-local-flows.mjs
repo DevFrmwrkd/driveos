@@ -124,7 +124,13 @@ try {
   await assert.rejects(mutation("cleanup", "queueQuarantine", { fileIds: [files.find(f => f.path === raw)._id] }));
   record("empty and protected-file cleanup requests are rejected");
   const analysis = await mutation("scans", "requestAnalysis");
-  assert.ok(analysis.scheduled || analysis.message === "Analysis is already queued or running.", analysis.message);
+  // The scan-triggered analysis may still be running or may already have
+  // finished inside the five-minute manual cooldown; analysisComplete() below
+  // proves the catalog analysis is completed and current either way.
+  assert.ok(analysis.scheduled || [
+    "Analysis is already queued or running.",
+    "Analysis was run recently. Try again in five minutes."
+  ].includes(analysis.message), analysis.message);
   await analysisComplete();
   const recommendations = await poll(() => query("recommendations", "list"), recs => recs.some(r => r.type === "delete_cache"), "cleanup analysis");
   if (process.env.DRIVEOS_TEST_PREPARE_BROWSER === "1") {
