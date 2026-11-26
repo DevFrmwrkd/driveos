@@ -1,6 +1,8 @@
 // Functional regression checks against an already running disposable local backend.
 // Run after building the agent: node scripts/test-local-flows.mjs
 // Never accepts a hosted deployment URL. Leaves its synthetic data for UI testing.
+// Explicit agent scans queue their own analysis, so the run waits through the
+// real five-minute analysis cooldown before checking cleanup recommendations.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -48,6 +50,20 @@ async function poll(read, ready, label) {
     await new Promise(resolve => setTimeout(resolve, 200));
   } while (Date.now() < until);
   throw new Error(`Timed out waiting for ${label}`);
+}
+// The scans above already queued analysis behind the tenant cooldown; a manual
+// request is refused while that run waits. Either way the real scheduled
+// analyzer must publish a current catalog.
+async function analysisComplete() {
+  const until = Date.now() + 330000;
+  let status;
+  do {
+    status = await query("scans", "analysisStatus");
+    if (status.status === "completed" && status.catalogCurrent) return status;
+    assert.notEqual(status.status, "failed", status.error || "Analysis failed");
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  } while (Date.now() < until);
+  throw new Error(`Analysis did not complete: ${JSON.stringify(status)}`);
 }
 function write(relative, fill) {
   const filename = path.join(media, relative);
@@ -108,7 +124,8 @@ try {
   await assert.rejects(mutation("cleanup", "queueQuarantine", { fileIds: [files.find(f => f.path === raw)._id] }));
   record("empty and protected-file cleanup requests are rejected");
   const analysis = await mutation("scans", "requestAnalysis");
-  assert.equal(analysis.scheduled, true);
+  assert.ok(analysis.scheduled || analysis.message === "Analysis is already queued or running.", analysis.message);
+  await analysisComplete();
   const recommendations = await poll(() => query("recommendations", "list"), recs => recs.some(r => r.type === "delete_cache"), "cleanup analysis");
   if (process.env.DRIVEOS_TEST_PREPARE_BROWSER === "1") {
     fs.writeFileSync(path.join(fixture, "summary.json"), JSON.stringify({ fixture, email, context, results, browserFixtureOnly: true }, null, 2));
@@ -164,10 +181,19 @@ try {
   const keepFile = (await query("files", "list", { limit: 200 })).find(f => f._id === duplicate.recommendedKeepFileId);
   assert.equal(fs.existsSync(keepFile.path), true);
   assert.equal(hash(keepFile.path), hash(duplicateItem.quarantinePath));
+  record("duplicate cleanup retains a live keep copy and pending files cannot authorize deleting it");
   await mutation("cleanup", "requestRestore", { quarantineId: duplicateItem._id });
   agent(["run-jobs"], "duplicate-restore");
-  await mutation("duplicates", "updateStatus", { clusterId: duplicate._id, status: "open" });
-  record("duplicate cleanup retains a live keep copy and pending files cannot authorize deleting it");
+  // No manual reopen: the completed restore alone must make the group visible.
+  const restoredDuplicate = (await query("duplicates", "list")).find(cluster => cluster._id === duplicate._id);
+  assert.ok(restoredDuplicate, "A restored duplicate must reappear in Duplicate Center without a manual reset.");
+  assert.equal(restoredDuplicate.status, "open");
+  assert.deepEqual([...restoredDuplicate.fileIds].sort(), [...duplicate.fileIds].sort());
+  assert.deepEqual(restoredDuplicate.locations.map(location => location.fileId).sort(), [...duplicate.fileIds].sort());
+  assert.equal(restoredDuplicate.fileCount, duplicate.fileCount);
+  assert.equal(restoredDuplicate.totalBytes, duplicate.totalBytes);
+  assert.equal(restoredDuplicate.wastedBytes, duplicate.wastedBytes);
+  record("restored duplicate rejoins Duplicate Center with every copy and its original totals");
   const drive = (await query("drives", "list"))[0];
   const scansBefore = (await query("scans", "list")).length;
   const requestedScan = await mutation("drives", "requestScan", { driveId: drive._id });

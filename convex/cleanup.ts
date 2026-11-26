@@ -6,6 +6,7 @@ import { workspaceSettings } from "./settings";
 import { classifyFile } from "../packages/shared/src/index";
 import { decideJobLease, jobAvailableToAgent, withoutClaimToken } from "./jobLease";
 import { cleanupPathIdentity, KEEP_COPY_PROTOCOL, KEEP_COPY_REVIEW, keepCopyReservedIds, purgeItemMetadata, requiresKeepCopy, validKeepCopyProof } from "./keepCopy";
+import { CLEANUP_RESOLUTION, cleanupMayResolve, resolvedByCleanup, unmarkedUserDecision, USER_RESOLUTION } from "./duplicateResolution";
 
 const EDITORS = ["admin", "producer", "editor", "assistant_editor"];
 const ACTIVE_QUARANTINE = new Set(["quarantined", "pending_restore", "pending_purge"]);
@@ -572,13 +573,37 @@ export const pollPendingJobs = internalMutation({ args: { machineId: v.string(),
   return result;
 }});
 
+// A restored file is a live duplicate again. Rejoin its exact cluster so the
+// Duplicate Center shows every copy with matching totals, and reopen a cluster
+// that cleanup (not a user) resolved. A cluster that analysis already dropped
+// is recreated by the next analysis run.
+async function rejoinDuplicateCluster(ctx: any, file: any, tenantId: string, now: number) {
+  if (!file.fullHash) return;
+  const cluster = await ctx.db.query("duplicateClusters").withIndex("by_tenant_hashKey", (q: any) =>
+    q.eq("tenantId", tenantId).eq("hashKey", file.fullHash)).first();
+  if (!cluster || cluster.type !== "exact") return;
+  const fileId = String(file._id);
+  const fileIds: string[] = cluster.fileIds.includes(fileId) ? cluster.fileIds : [...cluster.fileIds, fileId];
+  const reopen = resolvedByCleanup(cluster) && fileIds.length >= 2;
+  await ctx.db.patch(cluster._id, {
+    fileIds, fileCount: fileIds.length,
+    totalBytes: file.sizeBytes * fileIds.length, wastedBytes: file.sizeBytes * Math.max(0, fileIds.length - 1),
+    projectIds: file.projectId && !cluster.projectIds.includes(file.projectId) ? [...cluster.projectIds, file.projectId] : cluster.projectIds,
+    recommendedKeepFileId: fileIds.includes(cluster.recommendedKeepFileId ?? "") ? cluster.recommendedKeepFileId : fileIds[0],
+    ...(reopen ? { status: "open", resolution: undefined } : {}), updatedAt: now,
+  });
+}
+
 async function finishRestore(ctx: any, item: any, tenantId: string) {
   if (!ACTIVE_QUARANTINE.has(item.status) || item.status === "pending_purge") throw new ConvexError("The quarantine item is not restorable.");
   const now = Date.now();
   await ctx.db.patch(item._id, { status: "restored", restoredAt: now });
   const fid = ctx.db.normalizeId("files", item.fileId);
   const file = fid ? inTenant(await ctx.db.get(fid), tenantId) : null;
-  if (file) await ctx.db.patch(file._id, { deletedAt: undefined, lastSeenAt: now, observationRevision: (file.observationRevision ?? 0) + 1 });
+  if (file) {
+    await ctx.db.patch(file._id, { deletedAt: undefined, lastSeenAt: now, observationRevision: (file.observationRevision ?? 0) + 1 });
+    await rejoinDuplicateCluster(ctx, file, tenantId, now);
+  }
   await ctx.db.insert("auditLogs", { tenantId, action: "quarantine_restore", entityType: "quarantineItem", entityId: item._id,
     message: `Restored quarantined file ${item.originalPath}`, createdAt: now });
 }
@@ -660,10 +685,15 @@ export const updateJobStatus = internalMutation({ args: {
         if (cluster?.fileIds.includes(qf.fileId)) {
           const remaining = cluster.fileIds.filter(id => id !== qf.fileId);
           const perFileBytes = cluster.fileCount ? cluster.totalBytes / cluster.fileCount : file.sizeBytes;
+          // Ignored/intentional clusters keep the user's decision; only an
+          // undecided cluster is auto-resolved and marked as reopenable.
+          const autoResolve = remaining.length < 2 && cleanupMayResolve(cluster.status);
+          const decision = autoResolve ? { status: "resolved", resolution: CLEANUP_RESOLUTION }
+            : unmarkedUserDecision(cluster) ? { resolution: USER_RESOLUTION } : {};
           await ctx.db.patch(cluster._id, { fileIds: remaining, fileCount: remaining.length,
             totalBytes: perFileBytes * remaining.length, wastedBytes: perFileBytes * Math.max(0, remaining.length - 1),
             recommendedKeepFileId: remaining.includes(cluster.recommendedKeepFileId ?? "") ? cluster.recommendedKeepFileId : remaining[0],
-            status: remaining.length < 2 ? "resolved" : cluster.status, updatedAt: now });
+            ...decision, updatedAt: now });
         }
       }
     }
@@ -736,7 +766,8 @@ export const updateJobStatus = internalMutation({ args: {
       for (const clusterId of clusterIds) {
         const cid = ctx.db.normalizeId("duplicateClusters", clusterId);
         const cluster = cid ? inTenant(await ctx.db.get(cid), tenantId) : null;
-        if (cluster && cluster.status === "queued") await ctx.db.patch(cluster._id, { status: cluster.fileCount < 2 ? "resolved" : "open", updatedAt: now });
+        if (cluster && cluster.status === "queued") await ctx.db.patch(cluster._id, cluster.fileCount < 2
+          ? { status: "resolved", resolution: CLEANUP_RESOLUTION, updatedAt: now } : { status: "open", updatedAt: now });
       }
     }
   }

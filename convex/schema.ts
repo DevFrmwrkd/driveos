@@ -256,6 +256,9 @@ export default defineSchema({
     riskLevel: v.string(), // "green" | "yellow" | "red" | "unknown"
     explanation: v.string(),
     status: v.string(), // "open" | "ignored" | "quarantined" | "resolved"
+    // Who resolved the cluster: "cleanup" (automatic, reopened when copies
+    // return) or "user" (explicit decision, preserved). Missing on legacy rows.
+    resolution: v.optional(v.string()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })

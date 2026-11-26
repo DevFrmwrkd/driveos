@@ -4,6 +4,7 @@ import { internal } from "./_generated/api";
 import { requireMember, inTenant } from "./access";
 import { protectedFile } from "./jobUtils";
 import { cachedAnalysisIsCurrent } from "./catalogAnalysis";
+import { resolvedByCleanup, USER_RESOLUTION } from "./duplicateResolution";
 
 // Mirrors the agent-side protection list: these classifications are never auto-quarantined.
 const PROTECTED_CLASSIFICATIONS = new Set(["RAW", "EXPORT_FINAL", "PROJECT_FILE", "ADMIN", "ARCHIVE_MANIFEST"]);
@@ -271,6 +272,9 @@ export const upsertClusters = internalMutation({
         .first();
 
       if (existing) {
+        // Copies returned to a cluster that cleanup resolved (for example after
+        // a restore): show it again. Ignored/intentional decisions persist.
+        const reopen = resolvedByCleanup(existing) && cluster.fileCount >= 2;
         await ctx.db.patch(existing._id, {
           fileIds: cluster.fileIds,
           projectIds: cluster.projectIds,
@@ -279,6 +283,7 @@ export const upsertClusters = internalMutation({
           fileCount: cluster.fileCount,
           recommendedKeepFileId: cluster.recommendedKeepFileId,
           explanation: cluster.explanation,
+          ...(reopen ? { status: "open", resolution: undefined } : {}),
           updatedAt: args.timestamp,
         });
       } else {
@@ -307,6 +312,8 @@ export const updateStatus = mutation({
     if (!cluster) return;
     await ctx.db.patch(id, {
       status: args.status,
+      // Any explicit choice other than reopening is a user decision to preserve.
+      resolution: args.status === "open" ? undefined : USER_RESOLUTION,
       updatedAt: Date.now(),
     });
   },

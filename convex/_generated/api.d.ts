@@ -23,6 +23,7 @@ import type * as compaction from "../compaction.js";
 import type * as crons from "../crons.js";
 import type * as demoSeedPolicy from "../demoSeedPolicy.js";
 import type * as drives from "../drives.js";
+import type * as duplicateResolution from "../duplicateResolution.js";
 import type * as duplicates from "../duplicates.js";
 import type * as emails from "../emails.js";
 import type * as files from "../files.js";
@@ -62,6 +63,7 @@ declare const fullApi: ApiFromModules<{
   crons: typeof crons;
   demoSeedPolicy: typeof demoSeedPolicy;
   drives: typeof drives;
+  duplicateResolution: typeof duplicateResolution;
   duplicates: typeof duplicates;
   emails: typeof emails;
   files: typeof files;
