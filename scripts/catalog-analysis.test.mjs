@@ -859,3 +859,275 @@ test("releasing a disabled legacy automatic owner preserves a pending explicit s
   assert.equal(f.state.scheduled, false);
   assert.equal(f.state.scanAnalysisResolvedVersion, 1);
 });
+
+// Restore-triggered analysis: the trusted helper called by a confirmed restore.
+const requestRestoreAnalysis = (f, handlers = scansOff) => handlers.requestRestoreAnalysis(f.ctx, f.ctx.tenantId);
+const pendingJobs = f => [...f.jobs.values()].filter(job => job.state.kind === "pending");
+
+test("restore analysis creates absent or legacy state and analyzes after the cooldown with automatic analysis on or off", async t => {
+  const time = clock(t);
+  for (const handlers of [scansOff, scans]) for (const legacy of [false, true]) {
+    const f = fixture(0, 0, handlers);
+    if (legacy) {
+      Object.assign(f.state, { scheduled: false, dirtyCount: 0, lastRunAt: time.now - MINUTE });
+      delete f.state.catalogGeneration;
+      delete f.state.analyzedGeneration;
+    } else {
+      f.tables.analysisState.length = 0;
+      f.documents.delete(f.state._id);
+    }
+    await requestRestoreAnalysis(f, handlers);
+    const state = f.tables.analysisState[0];
+    assert.equal(state.catalogGeneration, 1);
+    assert.equal(state.dirtyCount, 1);
+    assert.equal(state.restoreAnalysisRequestVersion, 1);
+    assert.equal(state.restoreAnalysisFollowUps, 1);
+    assert.equal(state.analysisMode, "restore");
+    assert.equal(state.analysisRunId, 1);
+    assert.equal(f.scheduled.length, 1);
+    assert.equal(f.scheduled[0][1], "runManualAnalysis");
+    assert.deepEqual(f.scheduled[0][2], { tenantId: f.ctx.tenantId, analysisRunId: 1 });
+    const job = f.jobs.get(state.analysisFunctionId);
+    assert.equal(job.scheduledTime, legacy ? time.now + 4 * MINUTE : time.now + 1000);
+    const queued = await handlers.analysisStatus.handler(f.ctx, {});
+    assert.equal(queued.status, "queued");
+    assert.equal(queued.catalogCurrent, false);
+    assert.deepEqual(await recommendations.list.handler(f.ctx, {}), []);
+    time.set(job.scheduledTime);
+    const calls = [];
+    f.ctx.runAction = async (reference, args) => { calls.push(reference); assert.equal(args.maxFiles, 250000); };
+    await f.runScheduled(0);
+    assert.deepEqual(calls, ["runDuplicateDetection", "generateRecommendations"]);
+    assert.equal(state.analyzedGeneration, 1);
+    assert.equal(state.restoreAnalysisResolvedVersion, 1);
+    assert.equal(state.scheduled, false);
+    assert.equal(f.scheduled.length, 1, "A published restore analysis queues no automatic retry.");
+    const completed = await handlers.analysisStatus.handler(f.ctx, {});
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.catalogCurrent, true);
+  }
+});
+
+test("restore analysis waits exactly for the explicit cooldown boundary", async t => {
+  const time = clock(t);
+  for (const [lastRunAgo, delay] of [[0, 5 * MINUTE], [MINUTE, 4 * MINUTE], [5 * MINUTE - 1, 1000], [5 * MINUTE, 1000], [DAY, 1000]]) {
+    const f = fixture(2, 2, scansOff);
+    Object.assign(f.state, { scheduled: false, dirtyCount: 0, lastRunAt: time.now - lastRunAgo });
+    await requestRestoreAnalysis(f);
+    assert.equal(f.scheduled[0][0], delay, `last run ${lastRunAgo}ms ago`);
+    assert.equal(f.jobs.get(f.state.analysisFunctionId).scheduledTime, time.now + delay);
+  }
+});
+
+test("many restores and an explicit scan share one pending worker until it publishes", async t => {
+  const time = clock(t), f = fixture(3, 3, scansOff);
+  Object.assign(f.state, { scheduled: false, dirtyCount: 0, lastRunAt: time.now - 2 * MINUTE });
+  const deadline = f.state.lastRunAt + 5 * MINUTE;
+  for (let i = 0; i < 3; i++) {
+    await requestRestoreAnalysis(f);
+    time.set(time.now + 1000);
+  }
+  successfulSession(f);
+  assert.equal((await requestScanAnalysis(f)).scheduled, false);
+  const manual = await scansOff.requestAnalysis.handler(f.ctx, {});
+  assert.equal(manual.scheduled, false);
+  assert.match(manual.message, /already queued or running/);
+  assert.equal(f.scheduled.length, 1);
+  assert.equal(pendingJobs(f).length, 1);
+  assert.equal(f.state.analysisRunId, 1);
+  assert.equal(f.state.restoreAnalysisRequestVersion, 3);
+  assert.equal(f.state.scanAnalysisRequestVersion, 1);
+  assert.equal(f.state.catalogGeneration, 6);
+  assert.equal(f.state.dirtyCount, 3);
+  assert.equal(f.jobs.get(f.state.analysisFunctionId).scheduledTime, deadline);
+  time.set(deadline);
+  await f.runScheduled(0);
+  assert.equal(f.state.analyzedGeneration, 6);
+  assert.equal(f.state.dirtyCount, 0);
+  assert.equal(f.state.restoreAnalysisResolvedVersion, 3);
+  assert.equal(f.state.scanAnalysisResolvedVersion, 1);
+  assert.equal(f.state.scheduled, false);
+  assert.equal(f.scheduled.length, 1);
+});
+
+test("a pending daily timer is promoted to one explicit restore worker and its late completion is fenced", async t => {
+  const time = clock(t);
+  for (const handlers of [scans, scansOff]) {
+    const f = fixture(1, 0, scans);
+    f.state.scheduled = false;
+    f.state.lastRunAt = time.now;
+    await completeScan(f);
+    const old = f.scheduled[0];
+    assert.equal(f.jobs.get(old[3]).scheduledTime, time.now + DAY);
+    f.setHandlers(handlers);
+    await requestRestoreAnalysis(f, handlers);
+    assert.equal(f.jobs.get(old[3]).state.kind, "canceled");
+    assert.equal(f.scheduled.length, 2);
+    assert.equal(f.scheduled[1][1], "runManualAnalysis");
+    assert.equal(f.state.analysisRunId, old[2].analysisRunId + 1);
+    assert.equal(f.state.analysisMode, "restore");
+    assert.equal(f.jobs.get(f.state.analysisFunctionId).scheduledTime, f.state.lastRunAt + 5 * MINUTE);
+    assert.equal(pendingJobs(f).length, 1);
+    const state = structuredClone(f.state);
+    await handlers.recordAnalysisComplete.handler(f.ctx, { ...old[2], catalogGeneration: 2 });
+    await handlers.restoreAnalysisAfterFailure.handler(f.ctx, { ...old[2], claimedDirtyCount: 10 });
+    assert.deepEqual(f.state, state);
+    time.set(f.jobs.get(f.state.analysisFunctionId).scheduledTime);
+    await f.runScheduled(1);
+    assert.equal(f.state.analyzedGeneration, 2);
+    assert.equal(f.state.restoreAnalysisResolvedVersion, 1);
+    assert.equal(f.state.scheduled, false);
+    assert.equal(f.scheduled.length, 2);
+    time.set(time.now + DAY);
+  }
+});
+
+test("a restore during a claimed older-generation run gets one follow-up that publishes the restored catalog", async t => {
+  const time = clock(t);
+  for (const kind of ["manual", "automatic"]) {
+    const handlers = kind === "automatic" ? scans : scansOff;
+    const f = fixture(2, 0, handlers);
+    Object.assign(f.state, { scheduled: false, lastRunAt: 0 });
+    if (kind === "manual") await scansOff.requestAnalysis.handler(f.ctx, {});
+    else await completeScan(f, scans);
+    const first = f.scheduled[0];
+    const runId = f.state.analysisRunId;
+    time.set(f.jobs.get(first[3]).scheduledTime);
+    f.ctx.runAction = async reference => {
+      if (reference !== "runDuplicateDetection") return;
+      assert.equal(f.state.analysisClaimed, true);
+      await requestRestoreAnalysis(f, handlers);
+      // The claimed owner is never replaced while its code can still run.
+      assert.equal(f.scheduled.length, 1);
+      assert.equal(f.state.analysisRunId, runId);
+      assert.equal(f.state.catalogGeneration, 3);
+    };
+    await f.runScheduled(0);
+    assert.equal(f.state.analyzedGeneration, 0, `${kind}: the pre-restore snapshot must not publish`);
+    assert.deepEqual(await recommendations.list.handler(f.ctx, {}), []);
+    assert.equal(f.scheduled.length, 2);
+    assert.equal(f.scheduled[1][1], "runManualAnalysis");
+    assert.equal(f.state.analysisMode, "restore");
+    assert.equal(f.state.restoreAnalysisFollowUps, 0);
+    assert.equal(f.state.restoreAnalysisResolvedVersion, undefined);
+    assert.equal(f.jobs.get(f.state.analysisFunctionId).scheduledTime, f.state.lastRunAt + 5 * MINUTE);
+    assert.equal((await handlers.analysisStatus.handler(f.ctx, {})).status, "queued");
+    f.ctx.runAction = async () => {};
+    time.set(f.jobs.get(f.state.analysisFunctionId).scheduledTime);
+    await f.runScheduled(1);
+    assert.equal(f.state.analyzedGeneration, 3);
+    assert.equal(f.state.restoreAnalysisResolvedVersion, 1);
+    assert.equal(f.state.scheduled, false);
+    assert.equal(f.scheduled.length, 2);
+    assert.equal((await recommendations.list.handler(f.ctx, {})).length, 1);
+  }
+});
+
+test("canceled pending work is replaced by a restore and its stale completion cannot settle or release the replacement", async t => {
+  clock(t);
+  const f = fixture(1, 0, scansOff);
+  f.state.scheduled = false;
+  await scansOff.requestAnalysis.handler(f.ctx, {});
+  const old = f.scheduled[0];
+  await f.ctx.scheduler.cancel(old[3]);
+  await requestRestoreAnalysis(f);
+  assert.equal(f.scheduled.length, 2);
+  assert.notEqual(f.state.analysisRunId, old[2].analysisRunId);
+  const current = structuredClone(f.state);
+  await scansOff.finishManualAnalysis.handler(f.ctx, { ...old[2], success: true, catalogGeneration: 2 });
+  await scansOff.restoreAnalysisAfterFailure.handler(f.ctx, { ...old[2], claimedDirtyCount: 100 });
+  assert.deepEqual(f.state, current);
+  assert.equal(await scansOff.captureAnalysisGeneration.handler(f.ctx, old[2]), null);
+  assert.equal(f.state.restoreAnalysisResolvedVersion, undefined);
+});
+
+test("simultaneous scan and restore intents consume one shared follow-up and then settle as stale", async t => {
+  const time = clock(t), f = fixture(1, 0, scansOff);
+  f.state.scheduled = false;
+  successfulSession(f);
+  await requestScanAnalysis(f);
+  let runs = 0;
+  f.ctx.runAction = async reference => {
+    if (reference !== "runDuplicateDetection") return;
+    if (runs++ === 0) await requestRestoreAnalysis(f);
+    else { f.state.catalogGeneration++; f.state.dirtyCount++; }
+  };
+  time.set(f.jobs.get(f.state.analysisFunctionId).scheduledTime);
+  await f.runScheduled(0);
+  assert.equal(f.scheduled.length, 2);
+  assert.equal(pendingJobs(f).length, 1);
+  assert.equal(f.state.scanAnalysisFollowUps, 0);
+  assert.equal(f.state.restoreAnalysisFollowUps, 0);
+  assert.equal(f.state.analysisMode, "restore");
+  time.set(f.jobs.get(f.state.analysisFunctionId).scheduledTime);
+  await f.runScheduled(1);
+  assert.equal(f.scheduled.length, 2, "Exhausted shared budgets stop without another follow-up.");
+  assert.equal(f.state.scheduled, false);
+  assert.equal(f.state.scanAnalysisResolvedVersion, 1);
+  assert.equal(f.state.restoreAnalysisResolvedVersion, 1);
+  const status = await scansOff.analysisStatus.handler(f.ctx, {});
+  assert.equal(status.status, "stale");
+  assert.equal(status.catalogCurrent, false);
+  assert.match(status.error, /catalog changed/i);
+  // A new distinct restore receives its own request and budget.
+  await requestRestoreAnalysis(f);
+  assert.equal(f.state.restoreAnalysisRequestVersion, 2);
+  assert.equal(f.state.restoreAnalysisFollowUps, 1);
+  assert.equal(f.scheduled.length, 3);
+});
+
+test("failed and oversized restore analysis report failure without automatic retry loops", async t => {
+  const time = clock(t);
+  for (const handlers of [scansOff, scans]) for (const oversized of [false, true]) {
+    const f = fixture(1, 1, handlers);
+    Object.assign(f.state, { scheduled: false, dirtyCount: 0 });
+    await requestRestoreAnalysis(f, handlers);
+    if (oversized) {
+      const query = f.ctx.runQuery;
+      f.ctx.runQuery = async (reference, args) => reference === "pageForAnalysis"
+        ? { files: new Array(250001).fill(f.live), isDone: true, continueCursor: "end" } : query(reference, args);
+      f.ctx.runAction = async (_reference, args) => duplicates.runDuplicateDetection.handler(f.ctx, args);
+    } else f.ctx.runAction = async () => { throw new Error("restore analysis fixture failure"); };
+    time.set(f.jobs.get(f.state.analysisFunctionId).scheduledTime);
+    await assert.rejects(f.runScheduled(0), oversized ? /exceeds the explicit analysis limit/ : /fixture failure/);
+    const status = await handlers.analysisStatus.handler(f.ctx, {});
+    assert.equal(status.status, "failed");
+    assert.match(status.error, oversized ? /250000/ : /fixture failure/);
+    assert.equal(status.catalogCurrent, false);
+    assert.equal(f.state.scheduled, false);
+    assert.equal(f.state.restoreAnalysisResolvedVersion, 1);
+    assert.equal(f.scheduled.length, 1);
+    assert.equal(f.state.dirtyCount, 1);
+  }
+});
+
+test("a stopped restore worker is recovered by the next restore while a canceled claimed owner stays fenced", async t => {
+  const time = clock(t);
+  const f = fixture(1, 1, scansOff);
+  Object.assign(f.state, { scheduled: false, dirtyCount: 0 });
+  await requestRestoreAnalysis(f);
+  f.jobs.get(f.state.analysisFunctionId).state = { kind: "failed" };
+  assert.equal((await scansOff.analysisStatus.handler(f.ctx, {})).status, "failed");
+  await requestRestoreAnalysis(f);
+  assert.equal(f.state.restoreAnalysisResolvedVersion, 1, "The stopped worker's request is settled, not silently dropped.");
+  assert.equal(f.state.restoreAnalysisRequestVersion, 2);
+  assert.equal(f.scheduled.length, 2);
+  assert.equal(f.state.analysisRunId, 2);
+
+  // A claimed owner that was canceled may still be running: never overlap it.
+  await scansOff.claimManualAnalysisRun.handler(f.ctx, f.scheduled[1][2]);
+  await f.ctx.scheduler.cancel(f.scheduled[1][3]);
+  await requestRestoreAnalysis(f);
+  assert.equal(f.scheduled.length, 2);
+  assert.equal(f.state.restoreAnalysisRequestVersion, 3);
+  assert.equal(f.state.analysisRunId, 2);
+  // Its late completion is stale and spends the one follow-up for the restores.
+  await scansOff.finishManualAnalysis.handler(f.ctx, { ...f.scheduled[1][2], success: true, catalogGeneration: 3 });
+  assert.equal(f.scheduled.length, 3);
+  time.set(f.jobs.get(f.state.analysisFunctionId).scheduledTime);
+  await f.runScheduled(2);
+  assert.equal(f.state.analyzedGeneration, 4);
+  assert.equal(f.state.restoreAnalysisResolvedVersion, 3);
+  assert.equal(f.state.scheduled, false);
+  assert.equal(f.scheduled.length, 3);
+});

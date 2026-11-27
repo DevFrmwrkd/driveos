@@ -18,7 +18,7 @@ function load(filename) {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const require = name => {
-    if (name.endsWith("/_generated/server")) return Object.fromEntries(["query", "mutation", "internalQuery", "internalMutation", "httpAction"].map(key => [key, value => value]));
+    if (name.endsWith("/_generated/server")) return Object.fromEntries(["query", "mutation", "internalQuery", "internalMutation", "internalAction", "httpAction"].map(key => [key, value => value]));
     if (name.endsWith("/_generated/api")) return { internal: reference([]) };
     if (name === "convex/server") return { httpRouter: () => ({ routes: [], route(route) { this.routes.push(route); } }) };
     if (name === "./auth") return { auth: { addHttpRoutes() {} } };
@@ -37,7 +37,7 @@ const { catalogPathWithin } = load(path.join(repository, "convex/catalogObservat
 
 function fixture() {
   let sequence = 0;
-  const tables = new Map(), documents = new Map(), writes = [], indexes = [], calls = [];
+  const tables = new Map(), documents = new Map(), writes = [], indexes = [], calls = [], scheduled = [];
   const add = (table, data) => {
     const row = { ...structuredClone(data), _id: `${table}:${++sequence}`, _creationTime: sequence };
     if (!tables.has(table)) tables.set(table, []);
@@ -53,6 +53,7 @@ function fixture() {
   const db = {
     normalizeId: (table, id) => typeof id === "string" && id.startsWith(`${table}:`) ? id : null,
     get: async id => structuredClone(documents.get(id) ?? null),
+    system: { get: async id => structuredClone(scheduled.find(job => job._id === id) ?? null) },
     insert: async (table, data) => { const row = add(table, data); writes.push(["insert", table]); return row._id; },
     patch: async (id, patch) => {
       const row = documents.get(id); assert.ok(row);
@@ -91,7 +92,14 @@ function fixture() {
   const member = add("teamMembers", { tenantId, name: "Synthetic QA", email: "qa@driveos.test", role: "admin" });
   const user = add("users", { tenantId, teamMemberId: member._id, email: member.email });
   const scope = { tenantId, machineId, driveId, scanSessionId };
-  const ctx = { db, auth: { getUserIdentity: async () => ({ subject: `${user._id}|session` }) } };
+  const scheduler = {
+    runAfter: async (delay, ref, args) => {
+      const job = { _id: `_scheduled_functions:${++sequence}`, name: String(ref), delay, args: [args], state: { kind: "pending" } };
+      scheduled.push(job); return job._id;
+    },
+    cancel: async id => { scheduled.find(job => job._id === id).state = { kind: "canceled" }; },
+  };
+  const ctx = { db, scheduler, auth: { getUserIdentity: async () => ({ subject: `${user._id}|session` }) } };
   const meta = (extra = {}) => ({ path: "/catalog/watched/Cache/preview.dat", name: "preview.dat", extension: "dat", sizeBytes: 2 * 1024 * 1024,
     createdAtFile: 1, modifiedAtFile: 20, quickHash: "synthetic-quick", fullHash: "a".repeat(64), classification: "CACHE", riskLevel: "green",
     isGenerated: true, isRaw: false, isFinal: false, isProjectFile: false, ...extra });
@@ -124,7 +132,7 @@ function fixture() {
     return target.handler(ctx, new Request(`https://synthetic.invalid/api/${route}`, { method: "POST",
       headers: { "Content-Type": "application/json", ...(authenticated ? { Authorization: "Bearer synthetic-token" } : {}) }, body: JSON.stringify(body) }));
   }
-  return { ctx, db, scope, add, rows, writes, indexes, calls, meta, upload, lookup, remove, fingerprint, job, request };
+  return { ctx, db, scope, add, rows, writes, indexes, calls, scheduled, meta, upload, lookup, remove, fingerprint, job, request };
 }
 
 test("acknowledged upload, legacy lookup and idempotent tombstone use exact stored observations", async () => {
@@ -247,6 +255,8 @@ test("watch unlink cannot erase quarantine receipts and restoration invalidates 
   await cleanup.updateJobStatus.handler(f.ctx, { ...scoped, jobId: restore.jobId, status: "completed", result: { restoredQuarantineIds: [item._id] } });
   assert.equal(item.status, "restored");
   assert.equal(f.rows("files")[0].deletedAt, undefined);
+  // The restored catalog row is re-analyzed for this tenant only.
+  assert.deepEqual(f.scheduled.map(job => [job.name, job.args[0].tenantId]), [["scans.runManualAnalysis", f.scope.tenantId]]);
   assert.equal((await f.remove([receipt])).receipts[0].status, "conflict");
 });
 

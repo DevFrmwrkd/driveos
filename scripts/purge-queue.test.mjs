@@ -21,7 +21,9 @@ function load(filename) {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const require = name => {
-    if (name.endsWith("/_generated/server")) return { mutation: register, query: register, internalMutation: register, internalQuery: register };
+    if (name.endsWith("/_generated/server")) return { mutation: register, query: register, internalMutation: register, internalQuery: register, internalAction: register };
+    // cleanup.ts schedules restore analysis through scans.ts; references only.
+    if (name.endsWith("/_generated/api")) return { internal: new Proxy({}, { get: (_, module) => new Proxy({}, { get: (_, fn) => `${String(module)}:${String(fn)}` }) }) };
     if (name === "./settings") return { workspaceSettings: async () => ({ retentionDays: 14, cleanupRules: {} }) };
     if (name.startsWith(".")) return load(path.resolve(path.dirname(filename), `${name}.ts`));
     return nodeRequire(name);
