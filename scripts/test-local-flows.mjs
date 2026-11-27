@@ -1,8 +1,8 @@
 // Functional regression checks against an already running disposable local backend.
 // Run after building the agent: node scripts/test-local-flows.mjs
 // Never accepts a hosted deployment URL. Leaves its synthetic data for UI testing.
-// Explicit agent scans queue their own analysis, so the run waits through the
-// real five-minute analysis cooldown before checking cleanup recommendations.
+// Explicit agent scans and confirmed restores queue their own analysis, so the
+// run waits through the real five-minute analysis cooldown several times.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -64,6 +64,34 @@ async function analysisComplete() {
     await new Promise(resolve => setTimeout(resolve, 1000));
   } while (Date.now() < until);
   throw new Error(`Analysis did not complete: ${JSON.stringify(status)}`);
+}
+// Old completed status can describe a run that predates the change under test.
+// Require a worker that started and completed after the receipt.
+async function analysisCompletedAfter(receipt, label) {
+  const until = Date.now() + 330000;
+  let status;
+  do {
+    status = await query("scans", "analysisStatus");
+    if (status.status === "completed" && status.catalogCurrent &&
+        (status.lastRunAt ?? 0) > (receipt.lastRunAt ?? 0) && (status.completedAt ?? 0) > (receipt.completedAt ?? 0)) return status;
+    assert.notEqual(status.status, "failed", status.error || `${label} analysis failed`);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  } while (Date.now() < until);
+  throw new Error(`${label} analysis did not complete: ${JSON.stringify(status)}`);
+}
+// Force a new explicit analysis, waiting out only the recognized cooldown and
+// active-owner refusals. Returns the status receipt taken before acceptance.
+async function requestNewAnalysis() {
+  const refusals = ["Analysis is already queued or running.", "Analysis was run recently. Try again in five minutes."];
+  const until = Date.now() + 330000;
+  do {
+    const receipt = await query("scans", "analysisStatus");
+    const request = await mutation("scans", "requestAnalysis");
+    if (request.scheduled) return receipt;
+    assert.ok(refusals.includes(request.message), `Unexpected analysis refusal: ${request.message}`);
+    await new Promise(resolve => setTimeout(resolve, 5000));
+  } while (Date.now() < until);
+  throw new Error("A new analysis request was not accepted within the cooldown window.");
 }
 function write(relative, fill) {
   const filename = path.join(media, relative);
@@ -162,6 +190,7 @@ try {
   await mutation("cleanup", "requestRestore", { quarantineId: restored._id });
   assert.equal((await query("cleanup", "listQuarantine")).find(i => i._id === restored._id).status, "pending_restore");
   assert.equal(fs.existsSync(sourceA), false);
+  const beforeCacheRestore = await query("scans", "analysisStatus");
   agent(["run-jobs"], "restore");
   assert.equal(hash(sourceA), beforeHashes.get(sourceA));
   assert.equal(fs.existsSync(restored.quarantinePath), false);
@@ -175,6 +204,9 @@ try {
   assert.equal((await query("cleanup", "listQuarantine")).length, 0);
   assert.equal(hash(sourceA), beforeHashes.get(sourceA));
   record("purged/restored items leave active quarantine and unrelated files remain intact");
+  const cacheRestoreAnalysis = await analysisCompletedAfter(beforeCacheRestore, "cache restore");
+  record("a confirmed restore queues and publishes analysis without another request", {
+    lastRunAt: cacheRestoreAnalysis.lastRunAt, completedAt: cacheRestoreAnalysis.completedAt });
   const duplicate = (await query("duplicates", "list")).find(cluster => cluster.type === "exact");
   assert.ok(duplicate, "Two unchanged music files must form an exact duplicate cluster.");
   const nonKeep = duplicate.fileIds.find(id => id !== duplicate.recommendedKeepFileId);
@@ -188,18 +220,39 @@ try {
   assert.equal(fs.existsSync(keepFile.path), true);
   assert.equal(hash(keepFile.path), hash(duplicateItem.quarantinePath));
   record("duplicate cleanup retains a live keep copy and pending files cannot authorize deleting it");
+  // QA timing: a new analysis between quarantine and restore prunes the group
+  // because only one live copy remains.
+  const beforePrune = await requestNewAnalysis();
+  const pruneAnalysis = await analysisCompletedAfter(beforePrune, "pre-restore");
+  assert.equal(await query("duplicates", "getCluster", { clusterId: duplicate._id }), null, "Analysis must delete the singleton group.");
+  const sameHash = cluster => cluster.type === "exact" && cluster.hashKey === duplicate.hashKey;
+  assert.deepEqual((await query("duplicates", "list")).filter(sameHash), []);
+  record("analysis between quarantine and restore prunes the single-copy duplicate group", {
+    lastRunAt: pruneAnalysis.lastRunAt, completedAt: pruneAnalysis.completedAt });
   await mutation("cleanup", "requestRestore", { quarantineId: duplicateItem._id });
+  const beforeDuplicateRestore = await query("scans", "analysisStatus");
   agent(["run-jobs"], "duplicate-restore");
-  // No manual reopen: the completed restore alone must make the group visible.
-  const restoredDuplicate = (await query("duplicates", "list")).find(cluster => cluster._id === duplicate._id);
-  assert.ok(restoredDuplicate, "A restored duplicate must reappear in Duplicate Center without a manual reset.");
+  const nonKeepFile = (await query("files", "list", { limit: 200 })).find(f => f._id === nonKeep);
+  assert.equal(nonKeepFile.deletedAt, undefined);
+  assert.equal(hash(nonKeepFile.path), hash(keepFile.path), "The restored copy keeps its original contents.");
+  assert.equal(fs.existsSync(duplicateItem.quarantinePath), false);
+  // No scan, analysis request or manual reopen after the restore: the restore
+  // alone queues the analysis that recreates the pruned group.
+  const restoreAnalysis = await analysisCompletedAfter(beforeDuplicateRestore, "restore-triggered");
+  const restoredGroups = (await query("duplicates", "list")).filter(sameHash);
+  assert.equal(restoredGroups.length, 1, "A restored duplicate must reappear exactly once without a manual reset.");
+  const [restoredDuplicate] = restoredGroups;
   assert.equal(restoredDuplicate.status, "open");
   assert.deepEqual([...restoredDuplicate.fileIds].sort(), [...duplicate.fileIds].sort());
   assert.deepEqual(restoredDuplicate.locations.map(location => location.fileId).sort(), [...duplicate.fileIds].sort());
+  assert.deepEqual(restoredDuplicate.locations.map(location => location.path).sort(), duplicate.locations.map(location => location.path).sort());
   assert.equal(restoredDuplicate.fileCount, duplicate.fileCount);
   assert.equal(restoredDuplicate.totalBytes, duplicate.totalBytes);
   assert.equal(restoredDuplicate.wastedBytes, duplicate.wastedBytes);
-  record("restored duplicate rejoins Duplicate Center with every copy and its original totals");
+  record("restored duplicate rejoins Duplicate Center with every copy and its original totals", {
+    originalClusterId: duplicate._id, restoredClusterId: restoredDuplicate._id, recreated: restoredDuplicate._id !== duplicate._id,
+    fileCount: restoredDuplicate.fileCount, totalBytes: restoredDuplicate.totalBytes, wastedBytes: restoredDuplicate.wastedBytes,
+    analysisLastRunAt: restoreAnalysis.lastRunAt, analysisCompletedAt: restoreAnalysis.completedAt });
   const drive = (await query("drives", "list"))[0];
   const scansBefore = (await query("scans", "list")).length;
   const requestedScan = await mutation("drives", "requestScan", { driveId: drive._id });

@@ -7,6 +7,7 @@ import { classifyFile } from "../packages/shared/src/index";
 import { decideJobLease, jobAvailableToAgent, withoutClaimToken } from "./jobLease";
 import { cleanupPathIdentity, KEEP_COPY_PROTOCOL, KEEP_COPY_REVIEW, keepCopyReservedIds, purgeItemMetadata, requiresKeepCopy, validKeepCopyProof } from "./keepCopy";
 import { CLEANUP_RESOLUTION, cleanupMayResolve, resolvedByCleanup, unmarkedUserDecision, USER_RESOLUTION } from "./duplicateResolution";
+import { requestRestoreAnalysis } from "./scans";
 
 const EDITORS = ["admin", "producer", "editor", "assistant_editor"];
 const ACTIVE_QUARANTINE = new Set(["quarantined", "pending_restore", "pending_purge"]);
@@ -576,7 +577,7 @@ export const pollPendingJobs = internalMutation({ args: { machineId: v.string(),
 // A restored file is a live duplicate again. Rejoin its exact cluster so the
 // Duplicate Center shows every copy with matching totals, and reopen a cluster
 // that cleanup (not a user) resolved. A cluster that analysis already dropped
-// is recreated by the next analysis run.
+// is recreated by the analysis this restore queues.
 async function rejoinDuplicateCluster(ctx: any, file: any, tenantId: string, now: number) {
   if (!file.fullHash) return;
   const cluster = await ctx.db.query("duplicateClusters").withIndex("by_tenant_hashKey", (q: any) =>
@@ -603,6 +604,9 @@ async function finishRestore(ctx: any, item: any, tenantId: string) {
   if (file) {
     await ctx.db.patch(file._id, { deletedAt: undefined, lastSeenAt: now, observationRevision: (file.observationRevision ?? 0) + 1 });
     await rejoinDuplicateCluster(ctx, file, tenantId, now);
+    // Readers hide cached groups until this tenant's queued analysis validates
+    // the restored catalog, so the group returns without another scan.
+    await requestRestoreAnalysis(ctx, tenantId);
   }
   await ctx.db.insert("auditLogs", { tenantId, action: "quarantine_restore", entityType: "quarantineItem", entityId: item._id,
     message: `Restored quarantined file ${item.originalPath}`, createdAt: now });

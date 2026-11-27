@@ -130,7 +130,7 @@ export default defineSchema({
     analysisRunId: v.optional(v.number()),
     analysisFunctionId: v.optional(v.id("_scheduled_functions")),
     analysisClaimed: v.optional(v.boolean()),
-    analysisMode: v.optional(v.union(v.literal("manual"), v.literal("scan"), v.literal("automatic"))),
+    analysisMode: v.optional(v.union(v.literal("manual"), v.literal("scan"), v.literal("restore"), v.literal("automatic"))),
     analysisStatus: v.optional(v.union(v.literal("queued"), v.literal("running"), v.literal("completed"), v.literal("failed"), v.literal("stale"))),
     analysisError: v.optional(v.string()),
     analysisCompletedAt: v.optional(v.number()),
@@ -140,6 +140,11 @@ export default defineSchema({
     scanAnalysisRequestVersion: v.optional(v.number()),
     scanAnalysisResolvedVersion: v.optional(v.number()),
     scanAnalysisFollowUps: v.optional(v.number()),
+    // A confirmed restore queues analysis through the explicit cooldown, so a
+    // group that analysis pruned before the restore returns automatically.
+    restoreAnalysisRequestVersion: v.optional(v.number()),
+    restoreAnalysisResolvedVersion: v.optional(v.number()),
+    restoreAnalysisFollowUps: v.optional(v.number()),
     dirtyCount: v.number(), // files or recommendation inputs changed since last run
     scheduled: v.boolean(), // an analysis run is already queued
     lastRunAt: v.number(), // when analysis last STARTED (0 = never)

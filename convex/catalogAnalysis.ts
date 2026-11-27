@@ -7,6 +7,8 @@ interface CatalogAnalysisState {
   analysisFunctionId?: string;
   scanAnalysisRequestVersion?: number;
   scanAnalysisResolvedVersion?: number;
+  restoreAnalysisRequestVersion?: number;
+  restoreAnalysisResolvedVersion?: number;
 }
 
 export const ANALYSIS_DEBOUNCE_MS = 5 * 60 * 1000;
@@ -14,6 +16,12 @@ export const ANALYSIS_MIN_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 export function hasRequestedScanAnalysis(state: CatalogAnalysisState | null | undefined): boolean {
   return (state?.scanAnalysisRequestVersion ?? 0) > (state?.scanAnalysisResolvedVersion ?? 0);
+}
+
+// A confirmed restore asks for the same explicit analysis as a scan. Missing
+// versions describe workspaces that never restored a file.
+export function hasRequestedRestoreAnalysis(state: CatalogAnalysisState | null | undefined): boolean {
+  return (state?.restoreAnalysisRequestVersion ?? 0) > (state?.restoreAnalysisResolvedVersion ?? 0);
 }
 
 export function analysisFollowUpDelay(lastRunAt: number, now: number): number {

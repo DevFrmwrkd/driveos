@@ -4,7 +4,7 @@ import { internal } from "./_generated/api";
 import { requireMember, inTenant } from "./access";
 import { protectedFile } from "./jobUtils";
 import { cachedAnalysisIsCurrent } from "./catalogAnalysis";
-import { resolvedByCleanup, USER_RESOLUTION } from "./duplicateResolution";
+import { resolvedByCleanup, unmarkedUserDecision, USER_RESOLUTION } from "./duplicateResolution";
 
 // Mirrors the agent-side protection list: these classifications are never auto-quarantined.
 const PROTECTED_CLASSIFICATIONS = new Set(["RAW", "EXPORT_FINAL", "PROJECT_FILE", "ADMIN", "ARCHIVE_MANIFEST"]);
@@ -238,7 +238,14 @@ export const deleteClusters = internalMutation({
       const id = ctx.db.normalizeId("duplicateClusters", clusterId);
       if (!id) continue;
       const doc = await ctx.db.get(id);
-      if (doc && doc.tenantId === (args.tenantId || "")) await ctx.db.delete(id);
+      if (!doc || doc.tenantId !== (args.tenantId || "")) continue;
+      // A quarantined copy can return. Keep ignored/intentional decisions (and
+      // record a legacy one's marker) so a later restore cannot reopen them.
+      if (doc.resolution === USER_RESOLUTION || doc.status === "ignored" || unmarkedUserDecision(doc)) {
+        if (doc.resolution !== USER_RESOLUTION) await ctx.db.patch(id, { resolution: USER_RESOLUTION });
+        continue;
+      }
+      await ctx.db.delete(id);
     }
   },
 });
